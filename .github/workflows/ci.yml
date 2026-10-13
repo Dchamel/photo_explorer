@@ -1,0 +1,43 @@
+name: CI
+
+# Автопроверка качества кода при пуше и в pull request.
+# Это НЕ деплой на сервер (приложение десктопное), а просто
+# автоматическая проверка: форматирование, линтер, сборка, тесты.
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Проверка кода (fmt + clippy + build + test)
+    runs-on: windows-latest
+
+    steps:
+      - name: Получить код
+        uses: actions/checkout@v4
+
+      - name: Установить Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Кэш Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Проверить форматирование
+        run: cargo fmt --all -- --check
+
+      - name: Линтер (clippy)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Сборка
+        run: cargo build --verbose
+
+      - name: Тесты
+        run: cargo test --verbose
