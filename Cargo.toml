@@ -8,8 +8,10 @@ repository = "https://github.com/dchamel/photo_explorer"
 authors = ["dchamel <dchamel@yandex.ru>"]
 
 [dependencies]
-# Зависимости будут добавляться по мере реализации модулей:
-# image, walkdir, rayon, argon2, windows, tracing, thiserror, anyhow, slint
+# Ядро
+thiserror = "1"
+# Сканер
+walkdir = "2"
 
 [profile.release]
 opt-level = 3
