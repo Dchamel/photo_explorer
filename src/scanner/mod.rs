@@ -3,7 +3,7 @@
 //! Использует `walkdir` для обхода файловой системы. Поддерживаемые форматы
 //! изображений определены в [`SUPPORTED_EXTENSIONS`].
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use walkdir::WalkDir;
 
@@ -79,17 +79,30 @@ fn photos_in_tree_recursive(root: &Path) -> Vec<Photo> {
         .collect()
 }
 
-/// Возвращает корни доступных дисков (Windows: `C:\`, `D:\` и т.д.).
-fn available_drives() -> Vec<PathBuf> {
-    let mut drives = Vec::new();
-    for letter in b'A'..=b'Z' {
-        let drive = PathBuf::from(format!("{}:\\", letter as char));
-        if drive.is_dir() {
-            drives.push(drive);
-        }
-    }
-    drives
-}
+// NOTE: режим AllDrives временно отключён по решению заказчика (медленный,
+// пока не нужен — KISS). Код ниже сохранён как задел на будущее.
+//
+// /// Возвращает корни доступных дисков (Windows: `C:\`, `D:\` и т.д.).
+// fn available_drives() -> Vec<PathBuf> {
+//     let mut drives = Vec::new();
+//     for letter in b'A'..=b'Z' {
+//         let drive = PathBuf::from(format!("{}:\\", letter as char));
+//         if drive.is_dir() {
+//             drives.push(drive);
+//         }
+//     }
+//     drives
+// }
+//
+// /// Сканирует все доступные диски рекурсивно.
+// ///
+// /// Ошибки обхода отдельных файлов/папок (нет прав доступа и т.п.) пропускаются.
+// fn scan_all_drives() -> Vec<Photo> {
+//     available_drives()
+//         .iter()
+//         .flat_map(|drive| photos_in_tree_recursive(drive))
+//         .collect()
+// }
 
 /// Адаптер сканера: реализация порта [`PhotoScanner`] поверх реальной ФС.
 pub struct FileSystemScanner;
@@ -110,7 +123,7 @@ impl Default for FileSystemScanner {
 impl PhotoScanner for FileSystemScanner {
     fn scan(&self, mode: &ScanMode) -> Result<Vec<Photo>, ScanError> {
         match mode {
-            ScanMode::AllDrives => Ok(scan_all_drives()),
+            // ScanMode::AllDrives => Ok(scan_all_drives()),
             ScanMode::SingleFolder(folder) => {
                 validate_folder(folder)?;
                 Ok(photos_in_dir_flat(folder))
@@ -121,14 +134,4 @@ impl PhotoScanner for FileSystemScanner {
             }
         }
     }
-}
-
-/// Сканирует все доступные диски рекурсивно.
-///
-/// Ошибки обхода отдельных файлов/папок (нет прав доступа и т.п.) пропускаются.
-fn scan_all_drives() -> Vec<Photo> {
-    available_drives()
-        .iter()
-        .flat_map(|drive| photos_in_tree_recursive(drive))
-        .collect()
 }

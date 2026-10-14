@@ -124,21 +124,8 @@ fn scan_returns_error_when_path_is_a_file() {
     fs::remove_dir_all(dir).ok();
 }
 
-/// Тяжёлый тест: сканирование всех дисков целиком.
-/// Помечен `#[ignore]`, чтобы не запускать в обычном `cargo test`
-/// (сканирование всего диска может занимать минуты).
-/// Запуск вручную: `cargo test -- --ignored all_drives`.
-#[test]
-#[ignore]
-fn all_drives_returns_a_list_without_panicking() {
-    let scanner = FileSystemScanner::new();
-    let result = scanner.scan(&ScanMode::AllDrives);
-    assert!(
-        result.is_ok(),
-        "скан всех дисков не должен возвращать ошибку"
-    );
-}
-
+// NOTE: тест all_drives удалён — режим AllDrives временно отключён по решению заказчика.
+// Когда режим вернётся, тест можно восстановить (он был помечен #[ignore]).
 #[test]
 fn photo_model_is_clone_and_eq() {
     let p1 = Photo {
