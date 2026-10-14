@@ -12,6 +12,9 @@ authors = ["dchamel <dchamel@yandex.ru>"]
 thiserror = "1"
 # Сканер
 walkdir = "2"
+# Миниатюры
+image = "0.25"
+rayon = "1"
 
 [profile.release]
 opt-level = 3

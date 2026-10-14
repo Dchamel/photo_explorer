@@ -28,3 +28,16 @@ pub enum ScanMode {
     /// Скан конкретной папки и всех её подпапок.
     FolderRecursive(PathBuf),
 }
+
+/// Миниатюра изображения (готова для показа в UI).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thumbnail {
+    /// Путь к исходному файлу (для связи с [`Photo`]).
+    pub source_path: PathBuf,
+    /// Ширина миниатюры в пикселях.
+    pub width: u32,
+    /// Высота миниатюры в пикселях.
+    pub height: u32,
+    /// Пиксельные данные в формате RGBA (4 байта на пиксель: R, G, B, A).
+    pub data: Vec<u8>,
+}
