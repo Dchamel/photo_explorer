@@ -11,38 +11,103 @@
 [![Language](https://img.shields.io/badge/Rust-🦀-orange)]()
 [![UI](https://img.shields.io/badge/UI-Slint-brightgreen)]()
 [![Platform](https://img.shields.io/badge/Platform-Windows%2011-blue)]()
+[![Architecture](https://img.shields.io/badge/Architecture-Hexagonal-purple)]()
 
 </div>
 
 ---
 
+## 📑 Навигация по документации
+
+| Документ | Что внутри |
+|----------|-----------|
+| 📐 [Архитектурный план](doc/dev_plans/00_architecture_plan.md) | Стек, модули, Hexagonal-архитектура, диаграммы, паттерны |
+| ⚙️ [Установка Rust на Windows](doc/dev_plans/01_rust_setup_windows.md) | Пошаговая настройка окружения для не-разработчика |
+| 📋 [Процесс разработки](doc/dev_plans/02_development_process.md) | Правила команды, роли, порядок работы, приёмка этапов |
+| 📖 [Учебный журнал](doc/dev_plans/03_dev_journal.md) | Подробный разбор каждого этапа «для человека, не знающего Rust» |
+| 🎤 [План презентации (курс AI)](doc/misc/presentation_ai_homework.md) | Учебное задание по проекту (STAR-формат) |
+
+---
+
 ## ✨ Возможности (MVP)
 
-- 🗂️ **Три режима сканирования:**
-  - все папки (по доступным дискам);
-  - только выбранная папка;
+- 🗂️ **Два режима сканирования:**
+  - только выбранная папка (без подпапок);
   - выбранная папка со всеми подпапками.
+  - *(режим «все диски» зарезервирован, пока отключён)*
 - 🖼️ **Сетка миниатюр** с кэшем на диске и параллельной генерацией — быстро даже на больших коллекциях.
 - 🔐 **Защита доступа:** вход по отпечатку пальца (Windows Hello) или PIN-коду.
 - 🔒 **Автоблокировка:** при блокировке Windows (Win+L) приложение тоже блокируется.
 
+**Поддерживаемые форматы:** JPG, JPEG, PNG, GIF, BMP, WEBP.
+
 > Планы на будущее: просмотр фото в полном размере, EXIF-метаданные, поиск и фильтры, шифрование хранилища.
+
+---
+
+## 📊 Статус разработки
+
+| Этап | Модуль | Статус |
+|------|--------|--------|
+| 1 | Фундамент (Cargo + CI) | ✅ Готово |
+| 2 | `core` — ядро (модели + порты) | ✅ Готово |
+| 2 | `scanner` — сканер папок | ✅ Готово |
+| 2 | `thumbnails` — миниатюры | ✅ Готово |
+| 2 | `security` — защита доступа | ⏳ В работе |
+| 3 | `ui` — интерфейс на Slint | 🔜 Запланировано |
 
 ---
 
 ## 🏗️ Архитектура
 
 Проект построен по принципам **SOLID / DRY / KISS** и архитектуре **Hexagonal (Ports & Adapters)**:
-ядро приложения не зависит от интерфейса, поэтому UI можно менять, не трогая бизнес-логику.
+ядро приложения не зависит от интерфейса и ОС, поэтому любой слой можно заменить, не трогая бизнес-логику.
 
-Подробности: [`doc/dev_plans/00_architecture_plan.md`](doc/dev_plans/00_architecture_plan.md).
+Подробности и все диаграммы: [`doc/dev_plans/00_architecture_plan.md`](doc/dev_plans/00_architecture_plan.md).
+
+### Граф архитектуры
+
+```mermaid
+graph TD
+    MAIN[main.rs - точка входа] --> APP[Слой app - сборка приложения]
+    APP --> UI[Слой ui - Slint]
+    APP --> CORE[Ядро core - модели и порты]
+
+    CORE --- PORTS[Порты-трейты: PhotoScanner, ThumbnailProvider, Authenticator]
+
+    SCANNER[Адаптер scanner] -. реализует .-> PORTS
+    THUMBS[Адаптер thumbnails] -. реализует .-> PORTS
+    SECURITY[Адаптер security] -. реализует .-> PORTS
+
+    SCANNER --> FS[Файловая система - walkdir]
+    THUMBS --> IMG[Обработка картинок - image + rayon]
+    SECURITY --> WIN[Windows API - Hello + блокировка]
+```
+
+**Как читать:** стрелки сверху вниз — зависимости. Ядро (`core`) в центре и ни от кого не зависит.
+Адаптеры (`scanner`, `thumbnails`, `security`) реализуют порты-трейты из ядра и общаются с внешним миром
+(файлы, картинки, Windows API). UI тоже работает через ядро.
+
+### Структура папок
 
 ```
 photo_explorer/
-├── src/           # исходный код (ядро + модули + UI)
-├── doc/           # документация и планы разработки
-├── tests/         # автотесты модулей
-└── .github/       # CI/CD пайплайны
+├── Cargo.toml              # манифест проекта
+├── README.md               # этот файл
+├── .gitignore
+├── .github/workflows/      # CI (автопроверка кода)
+├── doc/                    # вся документация
+│   ├── dev_plans/          # планы и учебный журнал
+│   └── misc/               # прочее (презентации)
+├── src/
+│   ├── main.rs             # точка входа
+│   ├── lib.rs              # библиотечный корень
+│   ├── core/               # ЯДРО: models.rs + ports.rs
+│   ├── scanner/            # адаптер сканера
+│   ├── thumbnails/         # адаптер миниатюр
+│   ├── security/           # адаптер защиты (в работе)
+│   └── ui/                 # интерфейс Slint (запланировано)
+└── tests/                  # автотесты по одному файлу на модуль
 ```
 
 ---
@@ -56,6 +121,7 @@ photo_explorer/
 | Изображения | crate `image` |
 | Обход файлов | crate `walkdir` |
 | Параллелизм | crate `rayon` |
+| Обработка ошибок | crate `thiserror` |
 | Безопасность | crate `windows` (Windows Hello), `argon2` (PIN) |
 
 ---
@@ -90,6 +156,7 @@ cargo test
 - Форматирование: `cargo fmt`
 - Линтер: `cargo clippy`
 - Все изменения проходят автоматическую проверку в CI (GitHub Actions).
+- Правила работы команды: [`doc/dev_plans/02_development_process.md`](doc/dev_plans/02_development_process.md).
 
 ---
 
