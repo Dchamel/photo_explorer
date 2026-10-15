@@ -5,4 +5,5 @@
 
 pub mod core;
 pub mod scanner;
+pub mod security;
 pub mod thumbnails;
