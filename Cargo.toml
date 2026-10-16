@@ -3,7 +3,7 @@ name = "photo_explorer"
 version = "0.1.0"
 edition = "2021"
 description = "Быстрый и безопасный эксплорер фотографий для Windows 11"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/dchamel/photo_explorer"
 authors = ["dchamel <dchamel@yandex.ru>"]
 
