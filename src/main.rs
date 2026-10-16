@@ -1,33 +1,29 @@
 //! Photo Explorer — точка входа приложения.
 //!
-//! На данном этапе (Этап 2) демонстрируется работа модуля сканера:
-//! сканируется папка проекта (рекурсивно) и выводится количество найденных
-//! изображений. Полный UI появится на Этапе 3.
+//! Этап 3: показываем экран блокировки. После успешного входа — заглушка
+//! «Доступ разрешён» (главный экран галереи будет на следующем под-шаге).
 
-use photo_explorer::core::models::ScanMode;
-use photo_explorer::core::ports::PhotoScanner;
-use photo_explorer::scanner::FileSystemScanner;
+use std::sync::Arc;
+
+use photo_explorer::ui::{run_lock_screen, LockController};
 
 fn main() {
-    println!("📷 Photo Explorer — Этап 2: модуль scanner");
+    println!("📷 Photo Explorer — запуск");
 
-    let scanner = FileSystemScanner::new();
-    let project_dir = std::env::current_dir().expect("не удалось получить текущую папку");
-    let mode = ScanMode::FolderRecursive(project_dir.clone());
+    // PIN хранится в temp-папке пользователя (KISS). В продакшене — рядом с приложением.
+    let pin_file = std::env::temp_dir().join("photo_explorer_pin.hash");
+    let controller = Arc::new(LockController::new(pin_file));
 
-    match scanner.scan(&mode) {
-        Ok(photos) => {
-            println!("Папка: {}", project_dir.display());
-            println!("Найдено изображений: {}", photos.len());
-            for photo in photos.iter().take(10) {
-                println!("  - {} ({} байт)", photo.file_name, photo.size_bytes);
-            }
-            if photos.len() > 10 {
-                println!("  ... и ещё {} файлов", photos.len() - 10);
+    match run_lock_screen(controller.clone()) {
+        Ok(()) => {
+            if controller.is_granted() {
+                println!("✅ Доступ разрешён. (Главный экран галереи — на следующем этапе.)");
+            } else {
+                println!("Окно закрыто без входа.");
             }
         }
-        Err(err) => {
-            eprintln!("Ошибка сканирования: {err}");
+        Err(e) => {
+            eprintln!("Ошибка интерфейса: {e}");
         }
     }
 }
