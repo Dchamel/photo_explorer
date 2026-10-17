@@ -1,14 +1,16 @@
 //! Слой интерфейса на Slint.
 //!
 //! Экран блокировки (одно окно): точки PIN + встроенная клавиатура + автовход.
-//! Биометрия вызывается из UI-потока (через Timer::single_shot), НЕ из фонового потока —
-//! иначе Windows Hello ломается (первое прикладывание уходит вхолостую).
+//! Биометрия запускается в ОТДЕЛЬНОМ потоке (op.get() блокирующий) и результат
+//! возвращается в UI-поток через slint::invoke_from_event_loop. Флаг «идёт» защищает
+//! от повторных запросов (иначе дедлок/зависание).
 
 slint::include_modules!();
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -40,7 +42,7 @@ impl LockController {
         self.service.has_pin()
     }
 
-    /// Проверка PIN (при входе).
+    /// Проверка PIN (при входе). Синхронная, но быстрая — можно в UI-потоке.
     pub fn verify_pin(&self, pin: &str) -> LockResult {
         match self.service.verify_pin(pin) {
             Ok(AuthOutcome::Granted) => {
@@ -56,7 +58,7 @@ impl LockController {
         self.service.set_pin(pin).map_err(|e| e.to_string())
     }
 
-    /// Биометрия (Windows Hello). Вызывать ТОЛЬКО из UI-потока.
+    /// Биометрия (Windows Hello). БЛОКИРУЮЩАЯ — вызывать только в отдельном потоке.
     pub fn biometric(&self) -> LockResult {
         match self.service.authenticate_biometric() {
             Ok(AuthOutcome::Granted) => {
@@ -91,6 +93,47 @@ pub fn run_lock_screen(controller: Arc<LockController>) -> Result<(), slint::Pla
     // Состояние ввода PIN (живёт в UI-потоке, Rc безопасен).
     let entered = Rc::new(RefCell::new(String::new()));
     let max_len = 4usize;
+
+    // Флаг «биометрия идёт» — защита от повторных запросов (дедлок).
+    let biometric_in_progress = Arc::new(AtomicBool::new(false));
+
+    /// Запускает биометрию в фоновом потоке; результат обрабатывается в UI-потоке.
+    /// Если проверка уже идёт — игнорирует вызов.
+    fn request_biometric(
+        controller: &Arc<LockController>,
+        ui_weak: slint::Weak<LockScreen>,
+        flag: &Arc<AtomicBool>,
+    ) {
+        // Защита от повторного запуска: если уже идёт — выходим.
+        if flag
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let controller = controller.clone();
+        let flag = flag.clone();
+        let ui_weak = ui_weak.clone();
+        std::thread::spawn(move || {
+            let result = controller.biometric();
+            // Возвращаем результат в UI-поток.
+            let ui_weak = ui_weak.clone();
+            let flag = flag.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                flag.store(false, Ordering::SeqCst);
+                if let Some(w) = ui_weak.upgrade() {
+                    match result {
+                        LockResult::Granted => {
+                            let _ = w.hide();
+                        }
+                        LockResult::Denied => {
+                            w.set_error_text("Биометрия отклонена или недоступна".into());
+                        }
+                    }
+                }
+            });
+        });
+    }
 
     // Колбэк «Войти по PIN» — показать встроенную клавиатуру.
     {
@@ -174,36 +217,26 @@ pub fn run_lock_screen(controller: Arc<LockController>) -> Result<(), slint::Pla
         });
     }
 
-    // Колбэк «Отпечаток пальца» — ручной повтор из UI-потока.
+    // Колбэк «Отпечаток пальца» — ручной повтор (уважает флаг «идёт»).
     {
         let ctrl = controller.clone();
         let ui_weak = ui.as_weak();
-        ui.on_biometric(move || match ctrl.biometric() {
-            LockResult::Granted => {
-                if let Some(w) = ui_weak.upgrade() {
-                    let _ = w.hide();
-                }
-            }
-            LockResult::Denied => {
-                if let Some(w) = ui_weak.upgrade() {
-                    w.set_error_text("Биометрия отклонена или недоступна".into());
-                }
-            }
+        let flag = biometric_in_progress.clone();
+        ui.on_biometric(move || {
+            request_biometric(&ctrl, ui_weak.clone(), &flag);
         });
     }
 
-    // Автозапрос биометрии при старте — из UI-потока через одноразовый таймер.
-    // НЕ из фонового потока: иначе Windows Hello ломается (первое прикладывание вхолостую).
+    // Автозапрос биометрии при старте — один раз, если PIN задан.
+    // Через короткую задержку, чтобы окно успело показаться.
     #[cfg(windows)]
     {
         let ctrl = controller.clone();
         let ui_weak = ui.as_weak();
+        let flag = biometric_in_progress.clone();
         slint::Timer::single_shot(Duration::from_millis(400), move || {
-            // Только если PIN уже задан (иначе сначала создаём PIN).
-            if ctrl.has_pin() && ctrl.biometric() == LockResult::Granted {
-                if let Some(w) = ui_weak.upgrade() {
-                    let _ = w.hide();
-                }
+            if ctrl.has_pin() {
+                request_biometric(&ctrl, ui_weak, &flag);
             }
         });
     }
