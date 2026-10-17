@@ -337,7 +337,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     use crate::scanner::FileSystemScanner;
     use crate::thumbnails::FileSystemThumbnailProvider;
 
+    /// LRU-кэш полных изображений в памяти: путь -> (RGBA-данные, ширина, высота).
+    type ViewerCache = lru::LruCache<std::path::PathBuf, (Vec<u8>, u32, u32)>;
+
     let ui = GalleryScreen::new()?;
+    // Полноэкранный режим на текущем мониторе.
+    ui.window().set_fullscreen(true);
 
     // Сканер и поставщик миниатюр. Кэш миниатюр — в temp.
     let cache_dir = std::env::temp_dir().join("photo_explorer_thumbs_cache");
@@ -347,20 +352,49 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // Список Photo (с путями к оригиналам) — нужен для viewer. Arc<Mutex> — доступ из потоков.
     let photos: Arc<Mutex<Vec<Photo>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // LRU-кэш полных изображений в памяти (быстрый повторный просмотр).
+    let viewer_cache: Arc<Mutex<ViewerCache>> =
+        Arc::new(Mutex::new(ViewerCache::new(20.try_into().unwrap())));
+
+    // Максимальная сторона изображения для viewer (downscale до размера экрана).
+    const VIEWER_MAX_SIZE: u32 = 2560;
+
     /// Загружает полное изображение по пути и возвращает сырые RGBA-данные (Send).
-    /// slint::Image НЕ Send, поэтому строим его в UI-потоке из этих данных.
-    fn load_full_image(path: std::path::PathBuf) -> Result<(Vec<u8>, u32, u32), String> {
+    /// Downscale до VIEWER_MAX_SIZE для скорости. Результат кэшируется.
+    fn load_full_image(
+        path: std::path::PathBuf,
+        cache: Arc<Mutex<ViewerCache>>,
+    ) -> Result<(Vec<u8>, u32, u32), String> {
+        // Проверяем кэш.
+        if let Some(cached) = cache.lock().unwrap().get(&path).cloned() {
+            return Ok(cached);
+        }
         let img = image::open(&path).map_err(|e| format!("Ошибка загрузки: {e}"))?;
+        // Downscale, если фото больше максимума (быстрый фильтр Triangle).
+        let img = if img.width() > VIEWER_MAX_SIZE || img.height() > VIEWER_MAX_SIZE {
+            img.resize(
+                VIEWER_MAX_SIZE,
+                VIEWER_MAX_SIZE,
+                image::imageops::FilterType::Triangle,
+            )
+        } else {
+            img
+        };
         let rgba = img.to_rgba8();
         let (w, h) = rgba.dimensions();
-        Ok((rgba.into_raw(), w, h))
+        let data = rgba.into_raw();
+        // Сохраняем в кэш.
+        cache.lock().unwrap().put(path, (data.clone(), w, h));
+        Ok((data, w, h))
     }
 
     /// Загружает полное изображение по индексу в фоновом потоке, результат — в UI.
+    /// Если уже в кэше — мгновенно. После — предзагружает соседей.
     fn load_viewer_image(
         photos: Arc<Mutex<Vec<Photo>>>,
         index: i32,
         ui_weak: slint::Weak<GalleryScreen>,
+        cache: Arc<Mutex<ViewerCache>>,
     ) {
         let idx = index as usize;
         let path = {
@@ -370,18 +404,35 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 None => return,
             }
         };
+        // Быстрая проверка кэша — если есть, показываем сразу (без потока).
+        if let Some(cached) = cache.lock().unwrap().get(&path).cloned() {
+            if let Some(w) = ui_weak.upgrade() {
+                let (data, w_px, h_px) = cached;
+                let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w_px, h_px);
+                let pixels = buf.make_mut_slice();
+                for (dst, chunk) in pixels.iter_mut().zip(data.as_chunks::<4>().0) {
+                    dst.r = chunk[0];
+                    dst.g = chunk[1];
+                    dst.b = chunk[2];
+                    dst.a = chunk[3];
+                }
+                w.set_viewer_image(slint::Image::from_rgba8(buf));
+            }
+            // Предзагрузка соседей в фоне.
+            preload_neighbors(photos.clone(), index, cache.clone());
+            return;
+        }
         if let Some(w) = ui_weak.upgrade() {
             w.set_viewer_loading(true);
         }
         std::thread::spawn(move || {
-            let result = load_full_image(path);
+            let result = load_full_image(path, cache.clone());
             let ui_weak = ui_weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(w) = ui_weak.upgrade() {
                     w.set_viewer_loading(false);
                     match result {
                         Ok((data, w_px, h_px)) => {
-                            // Строим slint::Image в UI-потоке (Image не Send).
                             let mut buf =
                                 slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w_px, h_px);
                             let pixels = buf.make_mut_slice();
@@ -397,7 +448,42 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     }
                 }
             });
+            // Предзагрузка соседей в фоне (после текущего).
+            preload_neighbors(photos, index, cache);
         });
+    }
+
+    /// Предзагружает соседние фото (index-1, index+1) в кэш в фоновом потоке.
+    fn preload_neighbors(
+        photos: Arc<Mutex<Vec<Photo>>>,
+        index: i32,
+        cache: Arc<Mutex<ViewerCache>>,
+    ) {
+        let count = photos.lock().unwrap().len() as i32;
+        if count == 0 {
+            return;
+        }
+        let neighbors = [index - 1, index + 1];
+        for ni in neighbors {
+            if ni < 0 || ni >= count {
+                continue;
+            }
+            let path = {
+                let p = photos.lock().unwrap();
+                match p.get(ni as usize) {
+                    Some(ph) => ph.path.clone(),
+                    None => continue,
+                }
+            };
+            // Уже в кэше — пропускаем.
+            if cache.lock().unwrap().contains(&path) {
+                continue;
+            }
+            let cache = cache.clone();
+            std::thread::spawn(move || {
+                let _ = load_full_image(path, cache);
+            });
+        }
     }
 
     /// Запускает выбор папки + скан + генерацию миниатюр в фоновом потоке.
@@ -527,12 +613,13 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     {
         let photos = photos.clone();
         let ui_weak = ui.as_weak();
+        let viewer_cache = viewer_cache.clone();
         ui.on_open_viewer(move |index| {
             if let Some(w) = ui_weak.upgrade() {
                 w.set_viewer_index(index);
                 w.set_show_viewer(true);
             }
-            load_viewer_image(photos.clone(), index, ui_weak.clone());
+            load_viewer_image(photos.clone(), index, ui_weak.clone(), viewer_cache.clone());
         });
     }
     // Закрыть viewer.
@@ -548,6 +635,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     {
         let photos = photos.clone();
         let ui_weak = ui.as_weak();
+        let viewer_cache = viewer_cache.clone();
         ui.on_viewer_next(move || {
             if let Some(w) = ui_weak.upgrade() {
                 let count = photos.lock().unwrap().len() as i32;
@@ -561,13 +649,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 w.set_viewer_index(idx);
             }
             let idx = ui_weak.upgrade().map(|w| w.get_viewer_index()).unwrap_or(0);
-            load_viewer_image(photos.clone(), idx, ui_weak.clone());
+            load_viewer_image(photos.clone(), idx, ui_weak.clone(), viewer_cache.clone());
         });
     }
     // Предыдущее фото.
     {
         let photos = photos.clone();
         let ui_weak = ui.as_weak();
+        let viewer_cache = viewer_cache.clone();
         ui.on_viewer_prev(move || {
             if let Some(w) = ui_weak.upgrade() {
                 let count = photos.lock().unwrap().len() as i32;
@@ -581,7 +670,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 w.set_viewer_index(idx);
             }
             let idx = ui_weak.upgrade().map(|w| w.get_viewer_index()).unwrap_or(0);
-            load_viewer_image(photos.clone(), idx, ui_weak.clone());
+            load_viewer_image(photos.clone(), idx, ui_weak.clone(), viewer_cache.clone());
         });
     }
 

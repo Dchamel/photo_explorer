@@ -400,8 +400,9 @@ export component GalleryScreen inherits Window {
             }
         }
 
-        // Клавиатура: Esc — закрыть, ←/→ — листать
+        // Клавиатура: Esc — закрыть, ←/→ — листать. Фокус сразу при показе.
         FocusScope {
+            init => { self.focus(); }
             key-pressed(e) => {
                 if e.text == Key.Escape {
                     root.close-viewer();

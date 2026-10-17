@@ -25,6 +25,8 @@ slint = { version = "1.8", features = ["raw-window-handle-06"] }
 raw-window-handle = "0.6"
 # Системный диалог выбора папки
 rfd = "0.14"
+# LRU-кэш полных изображений в памяти (для быстрого viewer)
+lru = "0.12"
 
 # Windows-специфика: только под Windows
 [target.'cfg(windows)'.dependencies]
