@@ -1,6 +1,6 @@
-// Экраны блокировки Photo Explorer.
+// Экран блокировки Photo Explorer (UX v3).
 // Тёмная тема, акцент синий — см. doc/dev_plans/00_architecture_plan.md раздел 7.1.
-// Оба компонента (LockScreen и PinPad) в одном файле, чтобы slint-build компилировал их вместе.
+// Всё в одном окне: точки PIN + встроенная клавиатура (не отдельное окно).
 
 export global Theme {
     in-out property <color> background: #1E1E1E;
@@ -11,12 +11,11 @@ export global Theme {
     in-out property <color> error: #EF4444;
 }
 
-// Кнопка клавиатуры (объявлена ПЕРВой, чтобы использовать в PinPad ниже).
 component KeyButton inherits Rectangle {
     in property <string> label;
     callback clicked();
     background: Theme.panel;
-    height: 56px;
+    height: 52px;
     border-radius: 10px;
     TouchArea { clicked => { root.clicked(); } }
     Text {
@@ -28,117 +27,51 @@ component KeyButton inherits Rectangle {
     }
 }
 
-// --- Основной экран блокировки ---
 export component LockScreen inherits Window {
     title: "Photo Explorer — вход";
     background: Theme.background;
-    preferred-width: 420px;
-    preferred-height: 360px;
+    preferred-width: 360px;
+    // Высота растёт, когда клавиатура показана.
+    preferred-height: root.show-keyboard ? 560px : 320px;
 
+    // --- Свойства ---
     in-out property <string> status-text: "Photo Explorer";
     in-out property <string> error-text: "";
     in-out property <bool> biometric-available: false;
     in-out property <bool> has-pin: false;
-
-    callback enter-pin();
-    callback biometric();
-
-    VerticalLayout {
-        alignment: center;
-        padding: 32px;
-        spacing: 20px;
-
-        Text {
-            text: "🔒";
-            font-size: 56px;
-            horizontal-alignment: center;
-            color: Theme.text-primary;
-        }
-        Text {
-            text: status-text;
-            font-size: 20px;
-            font-weight: 700;
-            horizontal-alignment: center;
-            color: Theme.text-primary;
-        }
-
-        Rectangle {
-            background: Theme.accent;
-            height: 48px;
-            border-radius: 8px;
-            TouchArea { clicked => { root.enter-pin(); } }
-            Text {
-                text: "Войти по PIN";
-                color: white;
-                font-size: 16px;
-                font-weight: 600;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-        }
-
-        if root.biometric-available : Rectangle {
-            background: Theme.panel;
-            height: 48px;
-            border-radius: 8px;
-            border-width: 1px;
-            border-color: Theme.accent;
-            TouchArea { clicked => { root.biometric(); } }
-            Text {
-                text: "👆 Отпечаток пальца";
-                color: Theme.accent;
-                font-size: 15px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-        }
-
-        if root.error-text != "" : Text {
-            text: root.error-text;
-            color: Theme.error;
-            font-size: 13px;
-            horizontal-alignment: center;
-        }
-    }
-}
-
-// --- Экранная клавиатура для ввода PIN (отдельное окно) ---
-export component PinPad inherits Window {
-    title: "Photo Explorer — ввод PIN";
-    background: Theme.background;
-    preferred-width: 320px;
-    preferred-height: 480px;
-
     in-out property <int> entered-count: 0;
-    in-out property <string> error-text: "";
-    in-out property <bool> is-creating-pin: false;
-    in-out property <string> status-text: "Введите PIN";
+    // Показывать встроенную клавиатуру.
+    in-out property <bool> show-keyboard: false;
 
+    // --- Колбэки ---
+    callback enter-pin();      // запросить показ клавиатуры
+    callback biometric();      // отпечаток
     callback digit-pressed(int);
     callback backspace();
 
     VerticalLayout {
         alignment: center;
-        padding: 24px;
-        spacing: 16px;
+        padding: 28px;
+        spacing: 18px;
 
         Text {
             text: "🔒";
-            font-size: 36px;
+            font-size: 48px;
             horizontal-alignment: center;
             color: Theme.text-primary;
         }
         Text {
             text: status-text;
-            font-size: 14px;
+            font-size: 18px;
+            font-weight: 700;
             horizontal-alignment: center;
-            color: Theme.text-secondary;
+            color: Theme.text-primary;
         }
 
-        // Точки-индикаторы (4 шт.)
+        // Точки-индикаторы PIN (4 шт.) — всегда видны.
         HorizontalLayout {
             alignment: center;
-            spacing: 12px;
+            spacing: 14px;
             for i in 4 : Rectangle {
                 width: 14px;
                 height: 14px;
@@ -154,8 +87,41 @@ export component PinPad inherits Window {
             horizontal-alignment: center;
         }
 
-        // Клавиатура 1-9, 0, ⌫
-        GridLayout {
+        // Кнопка «Войти по PIN» — показывает клавиатуру.
+        if !root.show-keyboard : Rectangle {
+            background: Theme.accent;
+            height: 46px;
+            border-radius: 8px;
+            TouchArea { clicked => { root.enter-pin(); } }
+            Text {
+                text: "Войти по PIN";
+                color: white;
+                font-size: 16px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Кнопка биометрии (только если клавиатура скрыта и биометрия доступна).
+        if !root.show-keyboard && root.biometric-available : Rectangle {
+            background: Theme.panel;
+            height: 46px;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Theme.accent;
+            TouchArea { clicked => { root.biometric(); } }
+            Text {
+                text: "👆 Отпечаток пальца";
+                color: Theme.accent;
+                font-size: 15px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Встроенная клавиатура (показывается по show-keyboard).
+        if root.show-keyboard : GridLayout {
             spacing: 8px;
             Row {
                 KeyButton { label: "1"; clicked => { root.digit-pressed(1); } }
