@@ -254,31 +254,53 @@ export component GalleryScreen inherits Window {
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-            Flickable {
+            // Адаптивная сетка миниатюр: карточки позиционируются по индексу.
+            grid := Flickable {
+                property <length> card-w: 180px;
+                property <length> card-h: 200px;
+                property <length> gap: 12px;
+                property <int> columns: max(1, floor((self.width - 16px) / (self.card-w + self.gap)));
+                property <int> rows: ceil(root.thumbnails.length / self.columns);
                 content-width: self.width;
-                content-height: self.preferred-height;
-                VerticalLayout {
-                    spacing: 8px;
-                    padding: 8px;
-                    for thumb[i] in root.thumbnails : Rectangle {
-                        background: Theme.panel;
-                        height: 120px;
-                        border-radius: 8px;
-                        HorizontalLayout {
-                            padding: 8px;
-                            spacing: 10px;
+                content-height: 16px + self.rows * (self.card-h + self.gap);
+
+                for thumb[i] in root.thumbnails : Rectangle {
+                    x: 8px + mod(i, grid.columns) * (grid.card-w + grid.gap);
+                    y: 8px + floor(i / grid.columns) * (grid.card-h + grid.gap);
+                    width: grid.card-w;
+                    height: grid.card-h;
+                    background: Theme.panel;
+                    border-radius: 10px;
+                    clip: true;
+                    border-width: ta.has-hover ? 2px : 0px;
+                    border-color: Theme.accent;
+
+                    VerticalLayout {
+                        Rectangle {
+                            height: 160px;
+                            clip: true;
                             Image {
                                 source: thumb.image;
-                                width: 104px;
-                                height: 104px;
-                                image-fit: contain;
-                            }
-                            Text {
-                                text: thumb.file-name;
-                                color: Theme.text-primary;
-                                font-size: 14px;
+                                width: parent.width;
+                                height: parent.height;
+                                image-fit: cover;
+                                horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
+                        }
+                        Text {
+                            text: thumb.file-name;
+                            color: Theme.text-primary;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+
+                    ta := TouchArea {
+                        clicked => {
+                            // Открытие viewer будет в под-этапе 4.2; пока — заглушка.
                         }
                     }
                 }
