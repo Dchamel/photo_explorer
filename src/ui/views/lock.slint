@@ -1,5 +1,6 @@
-// Экран блокировки Photo Explorer.
+// Экраны блокировки Photo Explorer.
 // Тёмная тема, акцент синий — см. doc/dev_plans/00_architecture_plan.md раздел 7.1.
+// Оба компонента (LockScreen и PinPad) в одном файле, чтобы slint-build компилировал их вместе.
 
 export global Theme {
     in-out property <color> background: #1E1E1E;
@@ -10,30 +11,43 @@ export global Theme {
     in-out property <color> error: #EF4444;
 }
 
+// Кнопка клавиатуры (объявлена ПЕРВой, чтобы использовать в PinPad ниже).
+component KeyButton inherits Rectangle {
+    in property <string> label;
+    callback clicked();
+    background: Theme.panel;
+    height: 56px;
+    border-radius: 10px;
+    TouchArea { clicked => { root.clicked(); } }
+    Text {
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: 22px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// --- Основной экран блокировки ---
 export component LockScreen inherits Window {
     title: "Photo Explorer — вход";
     background: Theme.background;
     preferred-width: 420px;
-    preferred-height: 520px;
+    preferred-height: 360px;
 
-    // --- Свойства (доступны из Rust) ---
-    in-out property <string> pin-text: "";
+    in-out property <string> status-text: "Photo Explorer";
     in-out property <string> error-text: "";
-    in-out property <bool> is-creating-pin: false;
     in-out property <bool> biometric-available: false;
-    in-out property <string> status-text: "Введите PIN";
+    in-out property <bool> has-pin: false;
 
-    // --- Колбэки (вызываются из UI, обрабатываются в Rust) ---
-    callback login();
-    callback create-pin();
+    callback enter-pin();
     callback biometric();
 
     VerticalLayout {
         alignment: center;
         padding: 32px;
-        spacing: 16px;
+        spacing: 20px;
 
-        // Иконка-замок + заголовок
         Text {
             text: "🔒";
             font-size: 56px;
@@ -41,9 +55,76 @@ export component LockScreen inherits Window {
             color: Theme.text-primary;
         }
         Text {
-            text: "Photo Explorer";
-            font-size: 24px;
+            text: status-text;
+            font-size: 20px;
             font-weight: 700;
+            horizontal-alignment: center;
+            color: Theme.text-primary;
+        }
+
+        Rectangle {
+            background: Theme.accent;
+            height: 48px;
+            border-radius: 8px;
+            TouchArea { clicked => { root.enter-pin(); } }
+            Text {
+                text: "Войти по PIN";
+                color: white;
+                font-size: 16px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        if root.biometric-available : Rectangle {
+            background: Theme.panel;
+            height: 48px;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Theme.accent;
+            TouchArea { clicked => { root.biometric(); } }
+            Text {
+                text: "👆 Отпечаток пальца";
+                color: Theme.accent;
+                font-size: 15px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        if root.error-text != "" : Text {
+            text: root.error-text;
+            color: Theme.error;
+            font-size: 13px;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+// --- Экранная клавиатура для ввода PIN (отдельное окно) ---
+export component PinPad inherits Window {
+    title: "Photo Explorer — ввод PIN";
+    background: Theme.background;
+    preferred-width: 320px;
+    preferred-height: 480px;
+
+    in-out property <int> entered-count: 0;
+    in-out property <string> error-text: "";
+    in-out property <bool> is-creating-pin: false;
+    in-out property <string> status-text: "Введите PIN";
+
+    callback digit-pressed(int);
+    callback backspace();
+
+    VerticalLayout {
+        alignment: center;
+        padding: 24px;
+        spacing: 16px;
+
+        Text {
+            text: "🔒";
+            font-size: 36px;
             horizontal-alignment: center;
             color: Theme.text-primary;
         }
@@ -54,73 +135,48 @@ export component LockScreen inherits Window {
             color: Theme.text-secondary;
         }
 
-        // Поле ввода PIN
-        Rectangle {
-            background: Theme.panel;
-            height: 48px;
-            border-radius: 8px;
-            HorizontalLayout {
-                padding: 12px;
-                spacing: 8px;
-                Text {
-                    text: "🔑";
-                    font-size: 18px;
-                    vertical-alignment: center;
-                    color: Theme.text-secondary;
-                }
-                TextInput {
-                    text <=> root.pin-text;
-                    font-size: 18px;
-                    color: Theme.text-primary;
-                    vertical-alignment: center;
-                    accepted => { if (root.is-creating-pin) { root.create-pin(); } else { root.login(); } }
-                }
+        // Точки-индикаторы (4 шт.)
+        HorizontalLayout {
+            alignment: center;
+            spacing: 12px;
+            for i in 4 : Rectangle {
+                width: 14px;
+                height: 14px;
+                border-radius: 7px;
+                background: i < root.entered-count ? Theme.accent : Theme.panel;
             }
         }
 
-        // Кнопка "Войти" / "Создать PIN"
-        Rectangle {
-            background: Theme.accent;
-            height: 44px;
-            border-radius: 8px;
-            TouchArea {
-                clicked => { if (root.is-creating-pin) { root.create-pin(); } else { root.login(); } }
-            }
-            Text {
-                text: root.is-creating-pin ? "Создать PIN" : "Войти";
-                color: white;
-                font-size: 16px;
-                font-weight: 600;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-        }
-
-        // Кнопка биометрии (только если доступна)
-        if root.biometric-available : Rectangle {
-            background: Theme.panel;
-            height: 44px;
-            border-radius: 8px;
-            border-width: 1px;
-            border-color: Theme.accent;
-            TouchArea {
-                clicked => { root.biometric(); }
-            }
-            Text {
-                text: "👆 Отпечаток пальца";
-                color: Theme.accent;
-                font-size: 15px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-        }
-
-        // Строка ошибки (скрыта, если пусто)
         if root.error-text != "" : Text {
             text: root.error-text;
             color: Theme.error;
             font-size: 13px;
             horizontal-alignment: center;
+        }
+
+        // Клавиатура 1-9, 0, ⌫
+        GridLayout {
+            spacing: 8px;
+            Row {
+                KeyButton { label: "1"; clicked => { root.digit-pressed(1); } }
+                KeyButton { label: "2"; clicked => { root.digit-pressed(2); } }
+                KeyButton { label: "3"; clicked => { root.digit-pressed(3); } }
+            }
+            Row {
+                KeyButton { label: "4"; clicked => { root.digit-pressed(4); } }
+                KeyButton { label: "5"; clicked => { root.digit-pressed(5); } }
+                KeyButton { label: "6"; clicked => { root.digit-pressed(6); } }
+            }
+            Row {
+                KeyButton { label: "7"; clicked => { root.digit-pressed(7); } }
+                KeyButton { label: "8"; clicked => { root.digit-pressed(8); } }
+                KeyButton { label: "9"; clicked => { root.digit-pressed(9); } }
+            }
+            Row {
+                Rectangle { background: transparent; }
+                KeyButton { label: "0"; clicked => { root.digit-pressed(0); } }
+                KeyButton { label: "⌫"; clicked => { root.backspace(); } }
+            }
         }
     }
 }

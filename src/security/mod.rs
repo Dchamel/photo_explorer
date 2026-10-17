@@ -37,6 +37,9 @@ impl SecurityService {
 
 impl Authenticator for SecurityService {
     fn set_pin(&self, pin: &str) -> Result<(), SecurityError> {
+        // PIN задаётся один раз при установке; сброс — только удалением файла.
+        // Валидация: ровно 4 цифры. Пустой/короткий/с буквами не принимается.
+        pin::validate_pin(pin)?;
         let hashed = pin::hash_pin(pin)?;
         std::fs::write(&self.pin_file, hashed.as_bytes())
             .map_err(|e| SecurityError::IoError(e.to_string()))

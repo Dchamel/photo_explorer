@@ -11,6 +11,30 @@ use rand_core::OsRng;
 
 use crate::core::ports::{AuthOutcome, SecurityError};
 
+/// Ожидаемая длина PIN (цифр).
+pub const PIN_LENGTH: usize = 4;
+
+/// Проверяет, что PIN состоит ровно из [`PIN_LENGTH`] цифр (0-9).
+///
+/// Возвращает `Ok(())` для корректного PIN и `Err` с понятным сообщением иначе.
+pub fn validate_pin(pin: &str) -> Result<(), SecurityError> {
+    if pin.is_empty() {
+        return Err(SecurityError::HashError("PIN пустой".into()));
+    }
+    if pin.len() != PIN_LENGTH {
+        return Err(SecurityError::HashError(format!(
+            "PIN должен содержать ровно {PIN_LENGTH} цифры, введено {}",
+            pin.len()
+        )));
+    }
+    if !pin.chars().all(|c| c.is_ascii_digit()) {
+        return Err(SecurityError::HashError(
+            "PIN должен состоять только из цифр".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Хеширует PIN и возвращает строку в PHC-формате (с солью и параметрами).
 ///
 /// Соль генерируется случайно при каждом вызове, поэтому два одинаковых PIN
@@ -79,5 +103,30 @@ mod tests {
     fn malformed_hash_returns_error() {
         let result = verify_pin("1234", "not-a-valid-argon2-hash");
         assert!(result.is_err(), "битый хеш должен дать ошибку, а не Denied");
+    }
+
+    #[test]
+    fn validate_accepts_four_digits() {
+        assert!(validate_pin("1234").is_ok());
+        assert!(validate_pin("0000").is_ok());
+        assert!(validate_pin("9999").is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty() {
+        assert!(validate_pin("").is_err(), "пустой PIN недопустим");
+    }
+
+    #[test]
+    fn validate_rejects_wrong_length() {
+        assert!(validate_pin("123").is_err(), "3 цифры недопустимы");
+        assert!(validate_pin("12345").is_err(), "5 цифр недопустимы");
+    }
+
+    #[test]
+    fn validate_rejects_non_digits() {
+        assert!(validate_pin("12a4").is_err(), "буквы недопустимы");
+        assert!(validate_pin("12 4").is_err(), "пробелы недопустимы");
+        assert!(validate_pin("1.34").is_err(), "точки недопустимы");
     }
 }
