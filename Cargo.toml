@@ -23,6 +23,8 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # Интерфейс
 slint = { version = "1.8", features = ["raw-window-handle-06"] }
 raw-window-handle = "0.6"
+# Системный диалог выбора папки
+rfd = "0.14"
 
 # Windows-специфика: только под Windows
 [target.'cfg(windows)'.dependencies]

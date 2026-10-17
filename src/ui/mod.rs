@@ -329,3 +329,124 @@ pub fn run_lock_screen(controller: Arc<LockController>) -> Result<(), slint::Pla
 
     ui.run()
 }
+
+/// Запускает главный экран галереи.
+pub fn run_gallery() -> Result<(), slint::PlatformError> {
+    use crate::core::models::ScanMode;
+    use crate::core::ports::{PhotoScanner, ThumbnailProvider};
+    use crate::scanner::FileSystemScanner;
+    use crate::thumbnails::FileSystemThumbnailProvider;
+
+    let ui = GalleryScreen::new()?;
+
+    // Сканер и поставщик миниатюр. Кэш миниатюр — в temp.
+    let cache_dir = std::env::temp_dir().join("photo_explorer_thumbs_cache");
+    let scanner = Arc::new(FileSystemScanner::new());
+    let thumbs = Arc::new(FileSystemThumbnailProvider::new(cache_dir, 160));
+
+    /// Запускает выбор папки + скан + генерацию миниатюр в фоновом потоке.
+    fn scan_and_show(
+        scanner: Arc<FileSystemScanner>,
+        thumbs: Arc<FileSystemThumbnailProvider>,
+        ui_weak: slint::Weak<GalleryScreen>,
+        recursive: bool,
+    ) {
+        // Показываем индикатор сканирования.
+        if let Some(w) = ui_weak.upgrade() {
+            w.set_scanning(true);
+            w.set_error_text("".into());
+        }
+        std::thread::spawn(move || {
+            // Системный диалог выбора папки (блокирующий — в фоновом потоке).
+            let folder = rfd::FileDialog::new()
+                .set_title("Выберите папку с фотографиями")
+                .pick_folder();
+
+            let result: Result<Vec<crate::core::models::Thumbnail>, String> = (|| {
+                let folder = folder.ok_or("Папка не выбрана")?;
+                let mode = if recursive {
+                    ScanMode::FolderRecursive(folder)
+                } else {
+                    ScanMode::SingleFolder(folder)
+                };
+                let photos = scanner
+                    .scan(&mode)
+                    .map_err(|e| format!("Ошибка скана: {e}"))?;
+                let thumb_results = thumbs.thumbnails(&photos);
+                // Собираем успешные миниатюры, ошибки пропускаем.
+                let out: Vec<_> = thumb_results.into_iter().flatten().collect();
+                Ok(out)
+            })();
+
+            // Возвращаем результат в UI-поток.
+            let ui_weak = ui_weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(w) = ui_weak.upgrade() {
+                    w.set_scanning(false);
+                    match result {
+                        Ok(thumbs) => {
+                            let count = thumbs.len();
+                            let items: Vec<ThumbItem> = thumbs
+                                .into_iter()
+                                .map(|t| {
+                                    // Создаём SharedPixelBuffer и копируем RGBA-данные миниатюры.
+                                    let mut buf =
+                                        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
+                                            t.width, t.height,
+                                        );
+                                    let pixels = buf.make_mut_slice();
+                                    for (dst, chunk) in
+                                        pixels.iter_mut().zip(t.data.as_chunks::<4>().0)
+                                    {
+                                        dst.r = chunk[0];
+                                        dst.g = chunk[1];
+                                        dst.b = chunk[2];
+                                        dst.a = chunk[3];
+                                    }
+                                    ThumbItem {
+                                        file_name: t
+                                            .source_path
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_default()
+                                            .into(),
+                                        image: slint::Image::from_rgba8(buf),
+                                    }
+                                })
+                                .collect();
+                            // Slint: set_thumbnails принимает ModelRc; оборачиваем Vec в VecModel.
+                            let model = slint::VecModel::from(items);
+                            w.set_thumbnails(slint::ModelRc::new(model));
+                            w.set_status_text(format!("Найдено фото: {count}").into());
+                        }
+                        Err(e) => {
+                            w.set_error_text(e.into());
+                            w.set_status_text("Готово".into());
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    // Колбэк «Выбрать папку» (без подпапок).
+    {
+        let scanner = scanner.clone();
+        let thumbs = thumbs.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_pick_folder_flat(move || {
+            scan_and_show(scanner.clone(), thumbs.clone(), ui_weak.clone(), false);
+        });
+    }
+    // Колбэк «Папка с подпапками».
+    {
+        let scanner = scanner.clone();
+        let thumbs = thumbs.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_pick_folder_recursive(move || {
+            scan_and_show(scanner.clone(), thumbs.clone(), ui_weak.clone(), true);
+        });
+    }
+
+    ui.run()
+}

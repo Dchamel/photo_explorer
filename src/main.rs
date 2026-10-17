@@ -1,11 +1,10 @@
 //! Photo Explorer — точка входа приложения.
 //!
-//! Этап 3: показываем экран блокировки. После успешного входа — заглушка
-//! «Доступ разрешён» (главный экран галереи будет на следующем под-шаге).
+//! Этап 3: показываем экран блокировки. После успешного входа — главный экран галереи.
 
 use std::sync::Arc;
 
-use photo_explorer::ui::{run_lock_screen, LockController};
+use photo_explorer::ui::{run_gallery, run_lock_screen, LockController};
 
 fn main() {
     println!("📷 Photo Explorer — запуск");
@@ -17,13 +16,16 @@ fn main() {
     match run_lock_screen(controller.clone()) {
         Ok(()) => {
             if controller.is_granted() {
-                println!("✅ Доступ разрешён. (Главный экран галереи — на следующем этапе.)");
+                println!("✅ Доступ разрешён. Открываю галерею.");
+                if let Err(e) = run_gallery() {
+                    eprintln!("Ошибка галереи: {e}");
+                }
             } else {
                 println!("Окно закрыто без входа.");
             }
         }
         Err(e) => {
-            eprintln!("Ошибка интерфейса: {e}");
+            eprintln!("Ошибка интерфейса блокировки: {e}");
         }
     }
 }
