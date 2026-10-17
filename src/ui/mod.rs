@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crate::core::ports::{AuthOutcome, Authenticator};
 use crate::security::SecurityService;
@@ -263,19 +262,11 @@ pub fn run_lock_screen(controller: Arc<LockController>) -> Result<(), slint::Pla
         });
     }
 
-    // Автозапрос биометрии при старте — один раз, если PIN задан.
-    // Через короткую задержку, чтобы окно успело показаться.
-    #[cfg(windows)]
-    {
-        let ctrl = controller.clone();
-        let ui_weak = ui.as_weak();
-        let flag = biometric_in_progress.clone();
-        slint::Timer::single_shot(Duration::from_millis(400), move || {
-            if ctrl.has_pin() {
-                request_biometric(&ctrl, ui_weak, &flag);
-            }
-        });
-    }
+    // Автозапрос биометрии при старте УБРАН намеренно: SetForegroundWindow из фона
+    // блокируется Windows (защита от кражи фокуса), и системный диалог Hello всплывал бы в фоне.
+    // Биометрия запускается только по клику пользователя по кнопке «Отпечаток пальца» —
+    // тогда наше окно уже активно (input-driven foreground), и Hello всплывает поверх активным.
+    // UX: «Запустил → Кликнул Отпечаток → Приложил → Зашёл».
 
     ui.run()
 }
