@@ -48,6 +48,7 @@ export component LockScreen inherits Window {
     callback biometric();      // отпечаток
     callback digit-pressed(int);
     callback backspace();
+    callback back-to-main();   // спрятать клавиатуру, вернуться на главный экран блокировки
 
     VerticalLayout {
         alignment: center;
@@ -139,7 +140,7 @@ export component LockScreen inherits Window {
                 KeyButton { label: "9"; clicked => { root.digit-pressed(9); } }
             }
             Row {
-                Rectangle { background: transparent; }
+                KeyButton { label: "←"; clicked => { root.back-to-main(); } }
                 KeyButton { label: "0"; clicked => { root.digit-pressed(0); } }
                 KeyButton { label: "⌫"; clicked => { root.backspace(); } }
             }

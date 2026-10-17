@@ -10,7 +10,7 @@ slint::include_modules!();
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::core::ports::{AuthOutcome, Authenticator};
@@ -25,8 +25,11 @@ use crate::security::SecurityService;
 fn bring_window_to_foreground(ui: &LockScreen) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
     use windows::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, SetForegroundWindow, ShowWindow, SW_SHOW,
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+        ShowWindow, SW_SHOW,
     };
 
     let handle = ui.window().window_handle();
@@ -38,8 +41,32 @@ fn bring_window_to_foreground(ui: &LockScreen) {
         let hwnd = HWND(win32.hwnd.get() as *mut _);
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOW);
+
+            // Трюк AttachThreadInput: временно «подключаем» ввод нашего потока
+            // к потоку текущего переднего окна, чтобы SetForegroundWindow прошёл.
+            let our_thread = GetCurrentThreadId();
+            let fg = GetForegroundWindow();
+            let mut fg_pid = 0u32;
+            let fg_thread = if fg.0.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(fg, Some(&mut fg_pid as *mut u32))
+            };
+
+            let attached = if fg_thread != 0 && fg_thread != our_thread {
+                AttachThreadInput(our_thread, fg_thread, true).as_bool()
+            } else {
+                false
+            };
+
             let _ = BringWindowToTop(hwnd);
             let _ = SetForegroundWindow(hwnd);
+            let _ = SetActiveWindow(hwnd);
+            let _ = SetFocus(Some(hwnd));
+
+            if attached {
+                let _ = AttachThreadInput(our_thread, fg_thread, false);
+            }
         }
     }
 }
@@ -181,11 +208,16 @@ pub fn run_lock_screen(controller: Arc<LockController>) -> Result<(), slint::Pla
         });
     }
 
+    // Счётчик неверных попыток PIN. После 3 — приложение закрывается.
+    let failed_attempts = Arc::new(AtomicU32::new(0));
+    const MAX_ATTEMPTS: u32 = 3;
+
     // Колбэк нажатия цифры — накопление + автовход на 4-й цифре.
     {
         let ctrl = controller.clone();
         let ui_weak = ui.as_weak();
         let entered = entered.clone();
+        let failed_attempts = failed_attempts.clone();
         ui.on_digit_pressed(move |digit| {
             let mut buf = entered.borrow_mut();
             if buf.len() < max_len {
@@ -221,13 +253,25 @@ pub fn run_lock_screen(controller: Arc<LockController>) -> Result<(), slint::Pla
                 } else {
                     match ctrl.verify_pin(&pin) {
                         LockResult::Granted => {
+                            // Успех — сбрасываем счётчик неверных попыток.
+                            failed_attempts.store(0, Ordering::SeqCst);
                             if let Some(w) = ui_weak.upgrade() {
                                 let _ = w.hide();
                             }
                         }
                         LockResult::Denied => {
-                            if let Some(w) = ui_weak.upgrade() {
-                                w.set_error_text("Неверный PIN".into());
+                            let attempts = failed_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                            let left = MAX_ATTEMPTS.saturating_sub(attempts);
+                            if left == 0 {
+                                // Лимит исчерпан — закрываем приложение.
+                                if let Some(w) = ui_weak.upgrade() {
+                                    w.set_error_text("Слишком много попыток. Закрытие.".into());
+                                }
+                                slint::quit_event_loop().ok();
+                            } else if let Some(w) = ui_weak.upgrade() {
+                                w.set_error_text(
+                                    format!("Неверный PIN. Осталось попыток: {left}").into(),
+                                );
                                 w.set_entered_count(0);
                             }
                             *buf = String::new();
@@ -247,6 +291,21 @@ pub fn run_lock_screen(controller: Arc<LockController>) -> Result<(), slint::Pla
             buf.pop();
             if let Some(w) = ui_weak.upgrade() {
                 w.set_entered_count(buf.len() as i32);
+                w.set_error_text("".into());
+            }
+        });
+    }
+
+    // Колбэк «Назад» — спрятать клавиатуру, вернуться на главный экран блокировки.
+    {
+        let ui_weak = ui.as_weak();
+        let entered = entered.clone();
+        ui.on_back_to_main(move || {
+            let mut buf = entered.borrow_mut();
+            buf.clear();
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_show_keyboard(false);
+                w.set_entered_count(0);
                 w.set_error_text("".into());
             }
         });
