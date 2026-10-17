@@ -137,6 +137,7 @@ export component LockScreen inherits Window {
 // --- Элемент сетки галереи ---
 struct ThumbItem {
     file-name: string,
+    source-path: string,
     image: image,
 }
 
@@ -152,8 +153,18 @@ export component GalleryScreen inherits Window {
     in-out property <string> status-text: "Выберите папку, чтобы увидеть фото";
     in-out property <string> error-text: "";
 
+    // --- Viewer (просмотр фото в полном размере) ---
+    in-out property <bool> show-viewer: false;
+    in-out property <image> viewer-image;
+    in-out property <int> viewer-index: 0;
+    in-out property <bool> viewer-loading: false;
+
     callback pick-folder-flat();
     callback pick-folder-recursive();
+    callback open-viewer(int);   // открыть фото по индексу
+    callback close-viewer();
+    callback viewer-next();
+    callback viewer-prev();
 
     VerticalLayout {
         Rectangle {
@@ -300,9 +311,109 @@ export component GalleryScreen inherits Window {
 
                     ta := TouchArea {
                         clicked => {
-                            // Открытие viewer будет в под-этапе 4.2; пока — заглушка.
+                            root.open-viewer(i);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // --- Viewer: просмотр фото в полном размере (поверх галереи) ---
+    if root.show-viewer : Rectangle {
+        background: #000000ee;
+        // Клик по фону — закрыть
+        TouchArea {
+            clicked => { root.close-viewer(); }
+        }
+
+        // Фото на весь экран, автоподстройка (contain)
+        Image {
+            source: root.viewer-image;
+            image-fit: contain;
+            width: parent.width;
+            height: parent.height;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        // Индикатор загрузки
+        if root.viewer-loading : Text {
+            text: "Загрузка...";
+            color: white;
+            font-size: 16px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        // Кнопка закрытия (✕) сверху-справа
+        Rectangle {
+            x: parent.width - 56px - 16px;
+            y: 16px;
+            width: 40px;
+            height: 40px;
+            background: #000000aa;
+            border-radius: 20px;
+            TouchArea { clicked => { root.close-viewer(); } }
+            Text {
+                text: "✕";
+                color: white;
+                font-size: 20px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Стрелка «назад» (←) слева
+        Rectangle {
+            x: 16px;
+            y: parent.height / 2 - 24px;
+            width: 48px;
+            height: 48px;
+            background: #000000aa;
+            border-radius: 24px;
+            TouchArea { clicked => { root.viewer-prev(); } }
+            Text {
+                text: "←";
+                color: white;
+                font-size: 24px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Стрелка «вперёд» (→) справа
+        Rectangle {
+            x: parent.width - 48px - 16px;
+            y: parent.height / 2 - 24px;
+            width: 48px;
+            height: 48px;
+            background: #000000aa;
+            border-radius: 24px;
+            TouchArea { clicked => { root.viewer-next(); } }
+            Text {
+                text: "→";
+                color: white;
+                font-size: 24px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Клавиатура: Esc — закрыть, ←/→ — листать
+        FocusScope {
+            key-pressed(e) => {
+                if e.text == Key.Escape {
+                    root.close-viewer();
+                    accept
+                } else if e.text == Key.LeftArrow {
+                    root.viewer-prev();
+                    accept
+                } else if e.text == Key.RightArrow {
+                    root.viewer-next();
+                    accept
+                } else {
+                    reject
                 }
             }
         }
