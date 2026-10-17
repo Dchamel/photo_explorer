@@ -17,6 +17,37 @@ use std::time::Duration;
 use crate::core::ports::{AuthOutcome, Authenticator};
 use crate::security::SecurityService;
 
+/// Выводит окно приложения на передний план и даёт ему фокус (только Windows).
+///
+/// Системное окно Windows Hello всплывает активным поверх окна, которое вызвало запрос.
+/// Поэтому перед биометрией поднимаем наше окно, чтобы Hello сразу получал фокус и палец
+/// можно было приложить без клика мышкой.
+#[cfg(windows)]
+fn bring_window_to_foreground(ui: &LockScreen) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, SetForegroundWindow, ShowWindow, SW_SHOW,
+    };
+
+    let handle = ui.window().window_handle();
+    let raw = match handle.window_handle() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    if let RawWindowHandle::Win32(win32) = raw.as_raw() {
+        let hwnd = HWND(win32.hwnd.get() as *mut _);
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn bring_window_to_foreground(_ui: &LockScreen) {}
+
 /// Результат попытки входа.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockResult {
@@ -110,6 +141,11 @@ pub fn run_lock_screen(controller: Arc<LockController>) -> Result<(), slint::Pla
             .is_err()
         {
             return;
+        }
+        // Поднимаем наше окно на передний план, чтобы системное окно Windows Hello
+        // всплыло активным (палец можно приложить без клика мышкой).
+        if let Some(w) = ui_weak.upgrade() {
+            bring_window_to_foreground(&w);
         }
         let controller = controller.clone();
         let flag = flag.clone();
