@@ -383,9 +383,26 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // ещё раз — таймер перезапускается (грузим только последний индекс).
     // Так при удержании стрелки фото «моргают» (из кэша — мгновенно, мимо —
     // только если задержался), и не копится лавина потоков.
-    const DEBOUNCE_MS: u64 = 60;
+    // 200мс — середина между 0.1 и 0.4 (по предложению заказчика).
+    const DEBOUNCE_MS: u64 = 200;
     // Timer не Clone и не Send (привязан к event loop потока) — обёртываем в Rc.
     let load_timer = std::rc::Rc::new(slint::Timer::default());
+
+    // 4.3e — автоскрытие управления viewer: кнопки гаснут через 2.5с бездействия.
+    const CONTROLS_HIDE_MS: u64 = 2500;
+    let controls_timer = std::rc::Rc::new(slint::Timer::default());
+
+    /// Мгновенно показывает миниатюру фото по индексу как placeholder (моргание).
+    /// Миниатюры уже в памяти (модель галереи) — показ без задержки.
+    fn show_thumbnail(ui_weak: &slint::Weak<GalleryScreen>, index: i32) {
+        use slint::Model; // trait Model::row_data
+        if let Some(w) = ui_weak.upgrade() {
+            let thumbs = w.get_thumbnails();
+            if let Some(item) = thumbs.row_data(index as usize) {
+                w.set_viewer_thumbnail(item.image);
+            }
+        }
+    }
 
     /// Планирует загрузку фото по индексу с debounce-задержкой.
     /// Если вызвать ещё раз до срабатывания — грузится только последний индекс.
@@ -767,10 +784,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 w.set_viewer_index(index);
                 w.set_show_viewer(true);
                 w.set_viewer_loading(false); // страховка от залипания
-                                             // Полноэкранный режим на активном мониторе (где сейчас окно).
+                                             // Полноэкранный режим на активном мониторе (гAе сейчас окно).
                 w.window().set_fullscreen(true);
                 log::info!("viewer: fullscreen ON");
             }
+            // Мгновенный placeholder-миниатюра (моргание), пока грузится чёткое.
+            show_thumbnail(&ui_weak, index);
             // Открытие — без debounce (грузим сразу, пользователь ждёт).
             let my_gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
             load_viewer_image(
@@ -819,6 +838,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 w.set_viewer_index(idx);
             }
             let idx = ui_weak.upgrade().map(|w| w.get_viewer_index()).unwrap_or(0);
+            // Мгновенный placeholder-миниатюра (моргание) — пока debounce ждёт чёткое.
+            show_thumbnail(&ui_weak, idx);
             schedule_load(
                 photos.clone(),
                 idx,
@@ -850,6 +871,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 w.set_viewer_index(idx);
             }
             let idx = ui_weak.upgrade().map(|w| w.get_viewer_index()).unwrap_or(0);
+            // Мгновенный placeholder-миниатюра (моргание) — пока debounce ждёт чёткое.
+            show_thumbnail(&ui_weak, idx);
             schedule_load(
                 photos.clone(),
                 idx,
@@ -858,6 +881,28 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 generation.clone(),
                 &timer,
             );
+        });
+    }
+
+    // 4.3e — автоскрытие управления: по движению мыши показываем кнопки
+    // и перезапускаем таймер на 2.5с; по истечении — гасим.
+    {
+        let ui_weak = ui.as_weak();
+        let timer = controls_timer.clone();
+        ui.on_mouse_moved(move || {
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_controls_visible(true);
+                let ui_weak = ui_weak.clone();
+                timer.start(
+                    slint::TimerMode::SingleShot,
+                    std::time::Duration::from_millis(CONTROLS_HIDE_MS),
+                    move || {
+                        if let Some(w) = ui_weak.upgrade() {
+                            w.set_controls_visible(false);
+                        }
+                    },
+                );
+            }
         });
     }
 

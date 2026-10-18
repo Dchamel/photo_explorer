@@ -155,9 +155,13 @@ export component GalleryScreen inherits Window {
 
     // --- Viewer (просмотр фото в полном размере) ---
     in-out property <bool> show-viewer: false;
-    in-out property <image> viewer-image;
+    in-out property <image> viewer-image;        // чёткое полное фото (грузится с debounce)
+    in-out property <image> viewer-thumbnail;    // миниатюра — показывается МГНОВЕННО при листании (моргание)
     in-out property <int> viewer-index: 0;
     in-out property <bool> viewer-loading: false;
+    // Автоскрытие управления: кнопки видны, пока мышь двигали; гаснут через 2.5с.
+    in-out property <bool> controls-visible: true;
+    callback mouse-moved();   // сообщать из Rust, что мышь двигалась в viewer
 
     callback pick-folder-flat();
     callback pick-folder-recursive();
@@ -346,6 +350,7 @@ export component GalleryScreen inherits Window {
             // Фон ловит колесо мыши — листание фото (вниз → следующее, вверх → предыдущее).
             // ЛКМ по фону/фото больше НЕ закрывает просмотр (заказчик): закрытие только
             // по Esc и кнопке ✕. ЛКМ освобождена под зум/pan (4.3b/4.3c).
+            // Любое движение мыши в viewer — показываем управление (автоскрытие).
             TouchArea {
                 scroll-event(e) => {
                     if e.delta-y < 0px {
@@ -355,9 +360,25 @@ export component GalleryScreen inherits Window {
                     }
                     accept
                 }
+                pointer-event(e) => {
+                    if e.kind == PointerEventKind.move {
+                        root.mouse-moved();
+                    }
+                }
             }
 
-            // Фото на весь экран, автоподстройка (contain)
+            // Миниатюра-плейсхолдер — показывается МГНОВЕННО при листании (моргание).
+            // Пока чёткое фото не готово, пользователь видит хоть что-то сразу.
+            Image {
+                source: root.viewer-thumbnail;
+                image-fit: contain;
+                width: parent.width;
+                height: parent.height;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            // Чёткое полное фото поверх миниатюры (когда готово — перекрывает).
             Image {
                 source: root.viewer-image;
                 image-fit: contain;
@@ -376,7 +397,7 @@ export component GalleryScreen inherits Window {
                 vertical-alignment: center;
             }
 
-            // Кнопка закрытия (✕) сверху-справа
+            // Кнопка закрытия (×) сверху-справа. Прозрачность по controls-visible.
             Rectangle {
                 x: parent.width - 56px - 16px;
                 y: 16px;
@@ -384,6 +405,7 @@ export component GalleryScreen inherits Window {
                 height: 40px;
                 background: #000000aa;
                 border-radius: 20px;
+                opacity: root.controls-visible ? 1.0 : 0.0;
                 TouchArea { clicked => { root.close-viewer(); } }
                 Text {
                     text: "×";
@@ -402,6 +424,7 @@ export component GalleryScreen inherits Window {
                 height: 48px;
                 background: #000000aa;
                 border-radius: 24px;
+                opacity: root.controls-visible ? 1.0 : 0.0;
                 TouchArea { clicked => { root.viewer-prev(); } }
                 Text {
                     text: "←";
@@ -420,6 +443,7 @@ export component GalleryScreen inherits Window {
                 height: 48px;
                 background: #000000aa;
                 border-radius: 24px;
+                opacity: root.controls-visible ? 1.0 : 0.0;
                 TouchArea { clicked => { root.viewer-next(); } }
                 Text {
                     text: "→";
