@@ -371,11 +371,55 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // Поколение загрузки: инкрементируется при каждом переключении фото.
     // Фоновый поток сверяет своё поколение перед применением результата —
     // если пользователь уже листает дальше, устаревший результат отбрасывается.
-    // Это убирает «мигание» чужих фото и лавину потоков при быстром листании.
+    // Это убирает «мигание» чужими фото и лавину потоков при быстром листании.
     let viewer_generation: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     // Максимальная сторона изображения для viewer (downscale до размера экрана).
     const VIEWER_MAX_SIZE: u32 = 2560;
+
+    // 4.3d — «моргание» при быстром листании: debounce загрузки.
+    // При листании индекс меняем мгновенно (видно, на каком фото мы), а саму
+    // загрузку запускаем с задержкой DEBOUNCE_MS. Если за это время сменили
+    // ещё раз — таймер перезапускается (грузим только последний индекс).
+    // Так при удержании стрелки фото «моргают» (из кэша — мгновенно, мимо —
+    // только если задержался), и не копится лавина потоков.
+    const DEBOUNCE_MS: u64 = 60;
+    // Timer не Clone и не Send (привязан к event loop потока) — обёртываем в Rc.
+    let load_timer = std::rc::Rc::new(slint::Timer::default());
+
+    /// Планирует загрузку фото по индексу с debounce-задержкой.
+    /// Если вызвать ещё раз до срабатывания — грузится только последний индекс.
+    fn schedule_load(
+        photos: Arc<Mutex<Vec<Photo>>>,
+        index: i32,
+        ui_weak: slint::Weak<GalleryScreen>,
+        cache: Arc<Mutex<ViewerCache>>,
+        generation: Arc<AtomicU64>,
+        timer: &std::rc::Rc<slint::Timer>,
+    ) {
+        // Новое поколение — устаревшие результаты отбрасываются.
+        let my_gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let photos = photos.clone();
+        let ui_weak = ui_weak.clone();
+        let cache = cache.clone();
+        let generation = generation.clone();
+        timer.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(DEBOUNCE_MS),
+            move || {
+                // Клонируем внутри замыкания: timer.start требует FnMut
+                // (переменные нельзя переместить, только клонировать).
+                load_viewer_image(
+                    photos.clone(),
+                    index,
+                    ui_weak.clone(),
+                    cache.clone(),
+                    generation.clone(),
+                    my_gen,
+                );
+            },
+        );
+    }
 
     /// Загружает полное изображение по пути и возвращает сырые RGBA-данные (Send).
     /// Downscale до VIEWER_MAX_SIZE для скорости. Результат кэшируется.
@@ -504,8 +548,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 let cur = generation.load(Ordering::SeqCst);
                 if cur != my_generation {
                     log::debug!(
-                        "load_viewer_image: результат устарел (my={my_generation}, cur={cur}) — отбрасываю"
+                        "load_viewer_image: результат устарел# (my={my_generation}, cur={cur}) — отбрасываю"
                     );
+                    // ФИКС залипания «Загрузка»: даже устаревший поток обязан
+                    // снять флаг loading — иначе он остаётся true навсегда
+                    // (пользователь листает дальше, ни один колбэк его не снимет).
+                    if let Some(w) = ui_weak.upgrade() {
+                        w.set_viewer_loading(false);
+                    }
                     return;
                 }
                 if let Some(w) = ui_weak.upgrade() {
@@ -710,11 +760,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             if let Some(w) = ui_weak.upgrade() {
                 w.set_viewer_index(index);
                 w.set_show_viewer(true);
+                w.set_viewer_loading(false); // страховка от залипания
                 // Полноэкранный режим на активном мониторе (где сейчас окно).
                 w.window().set_fullscreen(true);
                 log::info!("viewer: fullscreen ON");
             }
-            // Новое поколение загрузки — все предыдущие результаты устаревают.
+            // Открытие — без debounce (грузим сразу, пользователь ждёт).
             let my_gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
             load_viewer_image(
                 photos.clone(),
@@ -729,21 +780,25 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // Закрыть viewer: выходим из полноэкранного режима, возвращаем оконный.
     {
         let ui_weak = ui.as_weak();
+        let timer = load_timer.clone();
         ui.on_close_viewer(move || {
             log::info!("viewer: закрытие");
+            timer.stop(); // отменить отложенную debounce-загрузку
             if let Some(w) = ui_weak.upgrade() {
                 w.set_show_viewer(false);
+                w.set_viewer_loading(false); // страховка от залипания
                 w.window().set_fullscreen(false);
                 log::info!("viewer: fullscreen OFF");
             }
         });
     }
-    // Следующее фото.
+    // Следующее фото. Индекс меняем мгновенно, загрузку — с debounce (моргание).
     {
         let photos = photos.clone();
         let ui_weak = ui.as_weak();
         let viewer_cache = viewer_cache.clone();
         let generation = viewer_generation.clone();
+        let timer = load_timer.clone();
         ui.on_viewer_next(move || {
             if let Some(w) = ui_weak.upgrade() {
                 let count = lock_or_recover(&photos).len() as i32;
@@ -757,25 +812,24 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 log::debug!("viewer: next → index={idx}");
                 w.set_viewer_index(idx);
             }
-            // Новое поколение — устаревшие загрузки отменяются.
-            let my_gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
             let idx = ui_weak.upgrade().map(|w| w.get_viewer_index()).unwrap_or(0);
-            load_viewer_image(
+            schedule_load(
                 photos.clone(),
                 idx,
                 ui_weak.clone(),
                 viewer_cache.clone(),
                 generation.clone(),
-                my_gen,
+                &timer,
             );
         });
     }
-    // Предыдущее фото.
+    // Предыдущее фото. Индекс меняем мгновенно, загрузку — с debounce (моргание).
     {
         let photos = photos.clone();
         let ui_weak = ui.as_weak();
         let viewer_cache = viewer_cache.clone();
         let generation = viewer_generation.clone();
+        let timer = load_timer.clone();
         ui.on_viewer_prev(move || {
             if let Some(w) = ui_weak.upgrade() {
                 let count = lock_or_recover(&photos).len() as i32;
@@ -789,16 +843,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 log::debug!("viewer: prev → index={idx}");
                 w.set_viewer_index(idx);
             }
-            // Новое поколение — устаревшие загрузки отменяются.
-            let my_gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
             let idx = ui_weak.upgrade().map(|w| w.get_viewer_index()).unwrap_or(0);
-            load_viewer_image(
+            schedule_load(
                 photos.clone(),
                 idx,
                 ui_weak.clone(),
                 viewer_cache.clone(),
                 generation.clone(),
-                my_gen,
+                &timer,
             );
         });
     }
