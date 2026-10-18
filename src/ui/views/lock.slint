@@ -343,9 +343,18 @@ export component GalleryScreen inherits Window {
 
         Rectangle {
             background: #000000ee;
-            // Клик по фону — закрыть
+            // Фон ловит колесо мыши — листание фото (вниз → следующее, вверх → предыдущее).
+            // ЛКМ по фону/фото больше НЕ закрывает просмотр (заказчик): закрытие только
+            // по Esc и кнопке ✕. ЛКМ освобождена под зум/pan (4.3b/4.3c).
             TouchArea {
-                clicked => { root.close-viewer(); }
+                scroll-event(e) => {
+                    if e.delta-y < 0px {
+                        root.viewer-next();
+                    } else if e.delta-y > 0px {
+                        root.viewer-prev();
+                    }
+                    accept
+                }
             }
 
             // Фото на весь экран, автоподстройка (contain)
