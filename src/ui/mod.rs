@@ -512,7 +512,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         // снова берёт тот же cache-Mutex → std Mutex не реентерабельный → deadlock.
         let cached_opt = lock_or_recover(&cache).get(&path).cloned();
         if let Some(cached) = cached_opt {
-            log::debug!("load_viewer_image: «{}» уже в кэше — мгновенно", path.display());
+            log::debug!(
+                "load_viewer_image: «{}» уже в кэше — мгновенно",
+                path.display()
+            );
             // Устаревший результат — не показываем (пользователь уже ушёл дальше).
             if generation.load(Ordering::SeqCst) != my_generation {
                 log::debug!("load_viewer_image: устарело (gen), пропускаю");
@@ -534,7 +537,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             preload_neighbors(photos.clone(), index, cache.clone());
             return;
         }
-        log::debug!("load_viewer_image: «{}» мимо кэша — фоновый поток", path.display());
+        log::debug!(
+            "load_viewer_image: «{}» мимо кэша — фоновый поток",
+            path.display()
+        );
         if let Some(w) = ui_weak.upgrade() {
             w.set_viewer_loading(true);
         }
@@ -761,7 +767,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 w.set_viewer_index(index);
                 w.set_show_viewer(true);
                 w.set_viewer_loading(false); // страховка от залипания
-                // Полноэкранный режим на активном мониторе (где сейчас окно).
+                                             // Полноэкранный режим на активном мониторе (где сейчас окно).
                 w.window().set_fullscreen(true);
                 log::info!("viewer: fullscreen ON");
             }

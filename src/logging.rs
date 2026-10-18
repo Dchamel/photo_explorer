@@ -80,7 +80,9 @@ impl Log for FileLogger {
 /// Формат YYYY-MM-DDThh:mm:ss.mmm (локальное время, точность до мс).
 fn chrono_like_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = now.as_secs() as i64;
     let millis = now.subsec_millis();
     // Перевод секунд эпохи в дату — локально, без внешних крейтов.
@@ -137,10 +139,7 @@ pub fn init() -> std::path::PathBuf {
 
     // Открываем файл в режиме дополнения (append). Если не вышло — логируем
     // только в stderr (LOG_FILE останется None, FileLogger это учитывает).
-    let file_result = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path);
+    let file_result = OpenOptions::new().create(true).append(true).open(&path);
     match file_result {
         Ok(file) => {
             // Допишем разделитель в файл.
@@ -166,19 +165,13 @@ pub fn init() -> std::path::PathBuf {
             .downcast_ref::<&str>()
             .copied()
             .map(String::from)
-            .or_else(|| {
-                info.payload()
-                    .downcast_ref::<String>()
-                    .map(String::from)
-            })
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::from))
             .unwrap_or_else(|| "<non-string panic payload>".to_string());
         let location = info
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "<unknown location>".to_string());
-        log::error!(
-            "ПАНИКА в потоке «{name}» по адресу {location}: {payload}"
-        );
+        log::error!("ПАНИКА в потоке «{name}» по адресу {location}: {payload}");
         // Стек недоступен без backtrace-крейта; предыдущий hook напечатает стандартное.
         prev(info);
     }));
