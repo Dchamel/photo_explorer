@@ -381,13 +381,126 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     const CONTROLS_HIDE_MS: u64 = 2500;
     let controls_timer = std::rc::Rc::new(slint::Timer::default());
 
-    // 4.3d-v4 — отсутствие лавины потоков при удержании стрелки:
-    // тяжёлую фоновую загрузку ПОЛНОГО фото (мимо кэша) запускаем через
-    // ПЕРЕЗАПУСКАЕМЫЙ таймер. При удержании каждое нажатие сбрасывает таймер,
-    // поэтому поток стартует ОДИН — только когда пользователь остановился.
-    // Кэш и миниатюра показываются мгновенно (без таймера).
-    const LOAD_DEBOUNCE_MS: u64 = 300;
-    let load_timer = std::rc::Rc::new(slint::Timer::default());
+    // 4.3d-v6 — ОДИН постоянный воркер-поток (вместо spawn на задачу).
+    // Раньше на каждое нажатие создавался новый ОС-поток; при удержании их
+    // сотни → ОС захлёбывался, память RGBA не успевала чиститься → затуп.
+    // Теперь: один воркер живёт всё время, UI шлёт задачи в канал (producer-
+    // consumer). Воркер дренирует очередь (берёт последнюю актуальную по gen),
+    // декодирует ОДНО фото и отдаёт в UI. Всегда ровно 1 фоновый поток.
+    use std::sync::mpsc;
+    enum LoadTask {
+        Photo {
+            index: i32,
+            path: std::path::PathBuf,
+            generation: u64,
+        },
+        Preload {
+            path: std::path::PathBuf,
+        },
+    }
+    let (load_tx, load_rx) = mpsc::channel::<LoadTask>();
+    // ui_weak для воркера (Send): Weak<GalleryScreen> — Send.
+    let ui_weak_for_viewer = ui.as_weak();
+    // Воркер-поток: цикл приёма задач. Send-данные (Vec<u8>) отдаём в UI
+    // через invoke_from_event_loop (slint::Image — не Send, строим в UI-потоке).
+    {
+        let viewer_cache = viewer_cache.clone();
+        let viewer_generation = viewer_generation.clone();
+        let ui_weak_for_viewer = ui_weak_for_viewer.clone();
+        std::thread::spawn(move || {
+            log::info!("viewer worker: запущен (1 поток)");
+            let viewer_cache = viewer_cache;
+            let viewer_generation = viewer_generation;
+            while let Ok(task) = load_rx.recv() {
+                match task {
+                    LoadTask::Photo {
+                        index: _,
+                        path,
+                        generation: my_gen,
+                    } => {
+                        // Дренируем очередь: если в канале ещё есть задачи —
+                        // берём последнюю (промежуточные пропускаем, не декодируя).
+                        // index воркеру не нужен — работаем по path.
+                        let (_, path, my_gen) = drain_to_last(&load_rx, 0, path, my_gen);
+                        // Устаревшая задача — пропускаем (пользователь ушёл дальше).
+                        if viewer_generation.load(Ordering::SeqCst) != my_gen {
+                            log::debug!("worker: устарела gen={my_gen}, пропускаю");
+                            continue;
+                        }
+                        // Снимаем loading только если это актуальное поколение.
+                        let result = load_full_image(path, viewer_cache.clone());
+                        let gen = viewer_generation.clone();
+                        let ui_weak = ui_weak_for_viewer.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            // Устарел к моменту готовности — не показываем, но
+                            // снимаем loading (фикс залипания «Загрузка»).
+                            let cur = gen.load(Ordering::SeqCst);
+                            if cur != my_gen {
+                                log::debug!("worker: результат устарел my={my_gen} cur={cur}");
+                                // loading снимет актуальная задача; здесь просто выходим.
+                                return;
+                            }
+                            if let Some(w) = ui_weak.upgrade() {
+                                w.set_viewer_loading(false);
+                                match result {
+                                    Ok((data, w_px, h_px)) => {
+                                        let mut buf =
+                                            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
+                                                w_px, h_px,
+                                            );
+                                        let pixels = buf.make_mut_slice();
+                                        for (dst, chunk) in
+                                            pixels.iter_mut().zip(data.as_chunks::<4>().0)
+                                        {
+                                            dst.r = chunk[0];
+                                            dst.g = chunk[1];
+                                            dst.b = chunk[2];
+                                            dst.a = chunk[3];
+                                        }
+                                        w.set_viewer_image(slint::Image::from_rgba8(buf));
+                                    }
+                                    Err(e) => {
+                                        log::error!("worker: ошибка: {e}");
+                                        w.set_error_text(e.into());
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    LoadTask::Preload { path } => {
+                        // Предзагрузка соседа: если уже в кэше — пропускаем.
+                        if lock_or_recover(&viewer_cache).contains(&path) {
+                            continue;
+                        }
+                        let _ = load_full_image(path, viewer_cache.clone());
+                    }
+                }
+            }
+            log::info!("viewer worker: завершён");
+        });
+    }
+    // Дренирование: берём последнюю задачу Photo из канала, пропуская промежуточные.
+    fn drain_to_last(
+        rx: &mpsc::Receiver<LoadTask>,
+        mut index: i32,
+        mut path: std::path::PathBuf,
+        mut generation: u64,
+    ) -> (i32, std::path::PathBuf, u64) {
+        while let Ok(next) = rx.try_recv() {
+            if let LoadTask::Photo {
+                index: i,
+                path: p,
+                generation: g,
+            } = next
+            {
+                index = i;
+                path = p;
+                generation = g;
+            }
+            // Preload-задачи игнорируем при дренировании (они низкого приоритета).
+        }
+        (index, path, generation)
+    }
 
     /// Мгновенно показывает миниатюру фото по индексу как placeholder (моргание).
     /// Миниатюры уже в памяти (модель галереи) — показ без задержки.
@@ -401,22 +514,19 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         }
     }
 
-    /// Запросить показ фото по индексу (v4 — без лавины потоков).
-    /// 1) Кэш — МГНОВЕННО (показываем сразу, без таймера).
-    /// 2) Мимо кэша — тяжёлую фоновую загрузку запускаем через ПЕРЕЗАПУСКАЕМЫЙ
-    ///    таймер LOAD_DEBOUNCE_MS. При удержании стрелки каждое нажатие сбрасывает
-    ///    таймер, поэтому поток стартует ОДИН — только когда пользователь остановился.
-    ///    Так нет лавины потоков и раздутой очереди event loop («отпустил — догоняет»).
+    /// Запросить показ фото по индексу (v6 — один воркер-поток, без лавины).
+    /// 1) Кэш — МГНОВЕННО (показываем сразу).
+    /// 2) Мимо кэша — шлём задачу в канал воркеру. Воркер один, дренирует
+    ///    очередь (берёт последнюю актуальную), декодирует, отдаёт в UI.
     fn request_viewer_load(
         photos: Arc<Mutex<Vec<Photo>>>,
         index: i32,
         ui_weak: slint::Weak<GalleryScreen>,
         cache: Arc<Mutex<ViewerCache>>,
         generation: Arc<AtomicU64>,
-        timer: &std::rc::Rc<slint::Timer>,
+        load_tx: &mpsc::Sender<LoadTask>,
     ) {
         let my_gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
-        // Кэш — мгновенно, без таймера.
         let idx = index as usize;
         let path = {
             let p = lock_or_recover(&photos);
@@ -425,6 +535,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 None => return,
             }
         };
+        // Кэш — мгновенно.
         let cached_opt = lock_or_recover(&cache).get(&path).cloned();
         if let Some(cached) = cached_opt {
             if generation.load(Ordering::SeqCst) == my_gen {
@@ -444,31 +555,48 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     }
                     w.set_viewer_image(slint::Image::from_rgba8(buf));
                 }
-                preload_neighbors(photos, index, cache);
+                // Предзагрузку соседей тоже шлём в канал (не spawn).
+                enqueue_preload(&photos, index, cache, load_tx);
             }
             return;
         }
-        // Мимо кэша — планируем тяжёлую загрузку с debounce (перезапуск таймера).
-        let photos = photos.clone();
-        let ui_weak = ui_weak.clone();
-        let cache = cache.clone();
-        let generation = generation.clone();
-        timer.start(
-            slint::TimerMode::SingleShot,
-            std::time::Duration::from_millis(LOAD_DEBOUNCE_MS),
-            move || {
-                // Клонируем внутри: timer.start требует FnMut (многократный вызов),
-                // переменные нельзя переместить — только клонировать.
-                load_viewer_image(
-                    photos.clone(),
-                    index,
-                    ui_weak.clone(),
-                    cache.clone(),
-                    generation.clone(),
-                    my_gen,
-                );
-            },
-        );
+        // Мимо кэша — задача воркеру. loading=true покажет индикатор.
+        if let Some(w) = ui_weak.upgrade() {
+            w.set_viewer_loading(true);
+        }
+        let _ = load_tx.send(LoadTask::Photo {
+            index,
+            path,
+            generation: my_gen,
+        });
+    }
+
+    /// Ставит в канал задачи на предзагрузку соседей (index-1, index+1).
+    /// Воркер обработает их после текущего фото (низкий приоритет).
+    fn enqueue_preload(
+        photos: &Arc<Mutex<Vec<Photo>>>,
+        index: i32,
+        cache: Arc<Mutex<ViewerCache>>,
+        load_tx: &mpsc::Sender<LoadTask>,
+    ) {
+        let count = lock_or_recover(photos).len() as i32;
+        for ni in [index - 1, index + 1] {
+            if ni < 0 || ni >= count {
+                continue;
+            }
+            let path = {
+                let p = lock_or_recover(photos);
+                match p.get(ni as usize) {
+                    Some(ph) => ph.path.clone(),
+                    None => continue,
+                }
+            };
+            // Уже в кэше — не шлём.
+            if lock_or_recover(&cache).contains(&path) {
+                continue;
+            }
+            let _ = load_tx.send(LoadTask::Preload { path });
+        }
     }
 
     /// Загружает полное изображение по пути и возвращает сырые RGBA-данные (Send).
@@ -525,157 +653,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         Ok((data, w, h))
     }
 
-    /// Загружает полное изображение по индексу в фоновом потоке, результат — в UI.
-    /// Если уже в кэше — мгновенно. После — предзагружает соседей.
-    /// `my_generation` — поколение этой загрузки; если к моменту готовности
-    /// актуальное поколение уже больше (пользователь листает дальше), результат
-    /// отбрасывается (не мигаем чужими фото, не плодим лишнюю работу).
-    fn load_viewer_image(
-        photos: Arc<Mutex<Vec<Photo>>>,
-        index: i32,
-        ui_weak: slint::Weak<GalleryScreen>,
-        cache: Arc<Mutex<ViewerCache>>,
-        generation: Arc<AtomicU64>,
-        my_generation: u64,
-    ) {
-        log::debug!(
-            "load_viewer_image: index={index}, gen={my_generation}, текущий gen={}",
-            generation.load(Ordering::SeqCst)
-        );
-        let idx = index as usize;
-        let path = {
-            let p = lock_or_recover(&photos);
-            match p.get(idx) {
-                Some(ph) => ph.path.clone(),
-                None => {
-                    log::warn!("load_viewer_image: индекс {index} вне диапазона");
-                    return;
-                }
-            }
-        };
-        // Быстрая проверка кэша — если есть, показываем сразу (без потока),
-        // но только если поколение ещё актуально.
-        //
-        // ВАЖНО (фикс deadlock): guard кэша освобождаем НЕМЕДЛЕННО после клонирования.
-        // Раньше `if let Some(cached) = lock_or_recover(&cache).get(...)` держал
-        // guard до конца блока, а внутри вызывался preload_neighbors, который
-        // снова берёт тот же cache-Mutex → std Mutex не реентерабельный → deadlock.
-        let cached_opt = lock_or_recover(&cache).get(&path).cloned();
-        if let Some(cached) = cached_opt {
-            log::debug!(
-                "load_viewer_image: «{}» уже в кэше — мгновенно",
-                path.display()
-            );
-            // Устаревший результат — не показываем (пользователь уже ушёл дальше).
-            if generation.load(Ordering::SeqCst) != my_generation {
-                log::debug!("load_viewer_image: устарело (gen), пропускаю");
-                return;
-            }
-            if let Some(w) = ui_weak.upgrade() {
-                let (data, w_px, h_px) = cached;
-                let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w_px, h_px);
-                let pixels = buf.make_mut_slice();
-                for (dst, chunk) in pixels.iter_mut().zip(data.as_chunks::<4>().0) {
-                    dst.r = chunk[0];
-                    dst.g = chunk[1];
-                    dst.b = chunk[2];
-                    dst.a = chunk[3];
-                }
-                w.set_viewer_image(slint::Image::from_rgba8(buf));
-            }
-            // Предзагрузка соседей в фоне. guard кэша УЖЕ освобождён — deadlock невозможен.
-            preload_neighbors(photos.clone(), index, cache.clone());
-            return;
-        }
-        log::debug!(
-            "load_viewer_image: «{}» мимо кэша — фоновый поток",
-            path.display()
-        );
-        if let Some(w) = ui_weak.upgrade() {
-            w.set_viewer_loading(true);
-        }
-        std::thread::spawn(move || {
-            let result = load_full_image(path, cache.clone());
-            let ui_weak = ui_weak.clone();
-            let generation = generation.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                // Отмена устаревшей загрузки: если поколение изменилось —
-                // результат не применяем (не мигаем чужими фото).
-                let cur = generation.load(Ordering::SeqCst);
-                if cur != my_generation {
-                    log::debug!(
-                        "load_viewer_image: результат устарел# (my={my_generation}, cur={cur}) — отбрасываю"
-                    );
-                    // ФИКС залипания «Загрузка»: даже устаревший поток обязан
-                    // снять флаг loading — иначе он остаётся true навсегда
-                    // (пользователь листает дальше, ни один колбэк его не снимет).
-                    if let Some(w) = ui_weak.upgrade() {
-                        w.set_viewer_loading(false);
-                    }
-                    return;
-                }
-                if let Some(w) = ui_weak.upgrade() {
-                    w.set_viewer_loading(false);
-                    match result {
-                        Ok((data, w_px, h_px)) => {
-                            let mut buf =
-                                slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w_px, h_px);
-                            let pixels = buf.make_mut_slice();
-                            for (dst, chunk) in pixels.iter_mut().zip(data.as_chunks::<4>().0) {
-                                dst.r = chunk[0];
-                                dst.g = chunk[1];
-                                dst.b = chunk[2];
-                                dst.a = chunk[3];
-                            }
-                            w.set_viewer_image(slint::Image::from_rgba8(buf));
-                        }
-                        Err(e) => {
-                            log::error!("load_viewer_image: ошибка: {e}");
-                            w.set_error_text(e.into());
-                        }
-                    }
-                }
-            });
-            // Предзагрузка соседей в фоне (после текущего).
-            preload_neighbors(photos, index, cache);
-        });
-    }
-
-    /// Предзагружает соседние фото (index-1, index+1) в кэш в фоновом потоке.
-    /// Ошибки декодирования игнорируются (битый сосед не должен ронять просмотр).
-    fn preload_neighbors(
-        photos: Arc<Mutex<Vec<Photo>>>,
-        index: i32,
-        cache: Arc<Mutex<ViewerCache>>,
-    ) {
-        let count = lock_or_recover(&photos).len() as i32;
-        if count == 0 {
-            return;
-        }
-        let neighbors = [index - 1, index + 1];
-        for ni in neighbors {
-            if ni < 0 || ni >= count {
-                continue;
-            }
-            let path = {
-                let p = lock_or_recover(&photos);
-                match p.get(ni as usize) {
-                    Some(ph) => ph.path.clone(),
-                    None => continue,
-                }
-            };
-            // Уже в кэше — пропускаем.
-            if lock_or_recover(&cache).contains(&path) {
-                continue;
-            }
-            let cache = cache.clone();
-            std::thread::spawn(move || {
-                // Ошибки декодирования соседа игнорируем — это фоновая
-                // предзагрузка, пользователь её не видит.
-                let _ = load_full_image(path, cache);
-            });
-        }
-    }
+    // (v6) load_viewer_image и preload_neighbors удалены — их заменили
+    // воркер-поток (цикл приёма LoadTask) и enqueue_preload (шлёт в канал).
+    // Это убирает std::thread::spawn на каждую задачу — теперь всегда 1 поток.
 
     /// Запускает выбор папки + скан + генерацию миниатюр в фоновом потоке.
     fn scan_and_show(
@@ -811,7 +791,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let ui_weak = ui.as_weak();
         let viewer_cache = viewer_cache.clone();
         let generation = viewer_generation.clone();
-        let timer = load_timer.clone();
+        let load_tx = load_tx.clone();
         ui.on_open_viewer(move |index| {
             log::info!("viewer: открыть фото index={index}");
             if let Some(w) = ui_weak.upgrade() {
@@ -824,14 +804,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
             // Мгновенный placeholder-миниатюра (моргание), пока грузится чёткое.
             show_thumbnail(&ui_weak, index);
-            // Кэш покажется мгновенно; мимо кэша — через debounce (как при листании).
+            // Кэш покажется мгновенно; мимо кэша — задача воркеру (1 поток).
             request_viewer_load(
                 photos.clone(),
                 index,
                 ui_weak.clone(),
                 viewer_cache.clone(),
                 generation.clone(),
-                &timer,
+                &load_tx,
             );
         });
     }
@@ -856,7 +836,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let ui_weak = ui.as_weak();
         let viewer_cache = viewer_cache.clone();
         let generation = viewer_generation.clone();
-        let timer = load_timer.clone();
+        let load_tx = load_tx.clone();
         ui.on_viewer_next(move || {
             if let Some(w) = ui_weak.upgrade() {
                 let count = lock_or_recover(&photos).len() as i32;
@@ -879,7 +859,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 ui_weak.clone(),
                 viewer_cache.clone(),
                 generation.clone(),
-                &timer,
+                &load_tx,
             );
         });
     }
@@ -889,7 +869,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let ui_weak = ui.as_weak();
         let viewer_cache = viewer_cache.clone();
         let generation = viewer_generation.clone();
-        let timer = load_timer.clone();
+        let load_tx = load_tx.clone();
         ui.on_viewer_prev(move || {
             if let Some(w) = ui_weak.upgrade() {
                 let count = lock_or_recover(&photos).len() as i32;
@@ -912,7 +892,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 ui_weak.clone(),
                 viewer_cache.clone(),
                 generation.clone(),
-                &timer,
+                &load_tx,
             );
         });
     }
