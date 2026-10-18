@@ -320,101 +320,104 @@ export component GalleryScreen inherits Window {
     }
 
     // --- Viewer: просмотр фото в полном размере (поверх галереи) ---
-    if root.show-viewer : Rectangle {
-        background: #000000ee;
-        // Клик по фону — закрыть
-        TouchArea {
-            clicked => { root.close-viewer(); }
-        }
-
-        // Фото на весь экран, автоподстройка (contain)
-        Image {
-            source: root.viewer-image;
-            image-fit: contain;
-            width: parent.width;
-            height: parent.height;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
-
-        // Индикатор загрузки
-        if root.viewer-loading : Text {
-            text: "Загрузка...";
-            color: white;
-            font-size: 16px;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
-
-        // Кнопка закрытия (✕) сверху-справа
-        Rectangle {
-            x: parent.width - 56px - 16px;
-            y: 16px;
-            width: 40px;
-            height: 40px;
-            background: #000000aa;
-            border-radius: 20px;
-            TouchArea { clicked => { root.close-viewer(); } }
-            Text {
-                text: "✕";
-                color: white;
-                font-size: 20px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
+    // FocusScope — КОРЕНЬ overlay: занимает весь экран, первым получает фокус
+    // при показе (init => self.focus()). Все элементы внутри — его дети,
+    // поэтому TouchArea фона и кнопки не крадут клавиатурный фокус.
+    // Esc — закрыть, ←/→ — листать. Фокус сразу, без второго клика.
+    if root.show-viewer : FocusScope {
+        init => { self.focus(); }
+        key-pressed(e) => {
+            if e.text == Key.Escape {
+                root.close-viewer();
+                accept
+            } else if e.text == Key.LeftArrow {
+                root.viewer-prev();
+                accept
+            } else if e.text == Key.RightArrow {
+                root.viewer-next();
+                accept
+            } else {
+                reject
             }
         }
 
-        // Стрелка «назад» (←) слева
         Rectangle {
-            x: 16px;
-            y: parent.height / 2 - 24px;
-            width: 48px;
-            height: 48px;
-            background: #000000aa;
-            border-radius: 24px;
-            TouchArea { clicked => { root.viewer-prev(); } }
-            Text {
-                text: "←";
-                color: white;
-                font-size: 24px;
+            background: #000000ee;
+            // Клик по фону — закрыть
+            TouchArea {
+                clicked => { root.close-viewer(); }
+            }
+
+            // Фото на весь экран, автоподстройка (contain)
+            Image {
+                source: root.viewer-image;
+                image-fit: contain;
+                width: parent.width;
+                height: parent.height;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-        }
 
-        // Стрелка «вперёд» (→) справа
-        Rectangle {
-            x: parent.width - 48px - 16px;
-            y: parent.height / 2 - 24px;
-            width: 48px;
-            height: 48px;
-            background: #000000aa;
-            border-radius: 24px;
-            TouchArea { clicked => { root.viewer-next(); } }
-            Text {
-                text: "→";
+            // Индикатор загрузки
+            if root.viewer-loading : Text {
+                text: "Загрузка...";
                 color: white;
-                font-size: 24px;
+                font-size: 16px;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-        }
 
-        // Клавиатура: Esc — закрыть, ←/→ — листать. Фокус сразу при показе.
-        FocusScope {
-            init => { self.focus(); }
-            key-pressed(e) => {
-                if e.text == Key.Escape {
-                    root.close-viewer();
-                    accept
-                } else if e.text == Key.LeftArrow {
-                    root.viewer-prev();
-                    accept
-                } else if e.text == Key.RightArrow {
-                    root.viewer-next();
-                    accept
-                } else {
-                    reject
+            // Кнопка закрытия (✕) сверху-справа
+            Rectangle {
+                x: parent.width - 56px - 16px;
+                y: 16px;
+                width: 40px;
+                height: 40px;
+                background: #000000aa;
+                border-radius: 20px;
+                TouchArea { clicked => { root.close-viewer(); } }
+                Text {
+                    text: "✕";
+                    color: white;
+                    font-size: 20px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Стрелка «назад» (←) слева
+            Rectangle {
+                x: 16px;
+                y: parent.height / 2 - 24px;
+                width: 48px;
+                height: 48px;
+                background: #000000aa;
+                border-radius: 24px;
+                TouchArea { clicked => { root.viewer-prev(); } }
+                Text {
+                    text: "←";
+                    color: white;
+                    font-size: 24px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Стрелка «вперёд» (→) справа
+            Rectangle {
+                x: parent.width - 48px - 16px;
+                y: parent.height / 2 - 24px;
+                width: 48px;
+                height: 48px;
+                background: #000000aa;
+                border-radius: 24px;
+                TouchArea { clicked => { root.viewer-next(); } }
+                Text {
+                    text: "→";
+                    color: white;
+                    font-size: 24px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
                 }
             }
         }

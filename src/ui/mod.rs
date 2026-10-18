@@ -385,10 +385,17 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         path: std::path::PathBuf,
         cache: Arc<Mutex<ViewerCache>>,
     ) -> Result<(Vec<u8>, u32, u32), String> {
-        // Проверяем кэш.
-        if let Some(cached) = lock_or_recover(&cache).get(&path).cloned() {
+        log::trace!("load_full_image: запрос «{}»", path.display());
+        // Проверяем кэш. ВАЖНО: guard освобождается сразу после клонирования —
+        // не держим блокировку дольше нужного (правило: не вызывать функции,
+        // которые сами берут тот же Mutex, пока держим guard).
+        let cached_opt = lock_or_recover(&cache).get(&path).cloned();
+        if let Some(cached) = cached_opt {
+            log::trace!("load_full_image: есть в кэше «{}»", path.display());
             return Ok(cached);
         }
+        log::debug!("load_full_image: мимо кэша, декодирую «{}»", path.display());
+        let start = std::time::Instant::now();
         // Декодирование в панико-безопасной обёртке. image::open может паниковать
         // на некоторых файлах; ловим панику, чтобы не отравить мьютекс.
         let decode = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -398,6 +405,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let img = decode?;
         // Downscale, если фото больше максимума (быстрый фильтр Triangle).
         let img = if img.width() > VIEWER_MAX_SIZE || img.height() > VIEWER_MAX_SIZE {
+            log::debug!(
+                "load_full_image: downscale {}x{} → ≤{VIEWER_MAX_SIZE}",
+                img.width(),
+                img.height()
+            );
             img.resize(
                 VIEWER_MAX_SIZE,
                 VIEWER_MAX_SIZE,
@@ -409,7 +421,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let rgba = img.to_rgba8();
         let (w, h) = rgba.dimensions();
         let data = rgba.into_raw();
-        // Сохраняем в кэш.
+        log::debug!(
+            "load_full_image: декодировано «{}» {w}x{h} за {:?}",
+            path.display(),
+            start.elapsed()
+        );
+        // Сохраняем в кэш (короткая блокировка).
         lock_or_recover(&cache).put(path, (data.clone(), w, h));
         Ok((data, w, h))
     }
@@ -427,19 +444,34 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         generation: Arc<AtomicU64>,
         my_generation: u64,
     ) {
+        log::debug!(
+            "load_viewer_image: index={index}, gen={my_generation}, текущий gen={}",
+            generation.load(Ordering::SeqCst)
+        );
         let idx = index as usize;
         let path = {
             let p = lock_or_recover(&photos);
             match p.get(idx) {
                 Some(ph) => ph.path.clone(),
-                None => return,
+                None => {
+                    log::warn!("load_viewer_image: индекс {index} вне диапазона");
+                    return;
+                }
             }
         };
         // Быстрая проверка кэша — если есть, показываем сразу (без потока),
         // но только если поколение ещё актуально.
-        if let Some(cached) = lock_or_recover(&cache).get(&path).cloned() {
+        //
+        // ВАЖНО (фикс deadlock): guard кэша освобождаем НЕМЕДЛЕННО после клонирования.
+        // Раньше `if let Some(cached) = lock_or_recover(&cache).get(...)` держал
+        // guard до конца блока, а внутри вызывался preload_neighbors, который
+        // снова берёт тот же cache-Mutex → std Mutex не реентерабельный → deadlock.
+        let cached_opt = lock_or_recover(&cache).get(&path).cloned();
+        if let Some(cached) = cached_opt {
+            log::debug!("load_viewer_image: «{}» уже в кэше — мгновенно", path.display());
             // Устаревший результат — не показываем (пользователь уже ушёл дальше).
             if generation.load(Ordering::SeqCst) != my_generation {
+                log::debug!("load_viewer_image: устарело (gen), пропускаю");
                 return;
             }
             if let Some(w) = ui_weak.upgrade() {
@@ -454,10 +486,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 }
                 w.set_viewer_image(slint::Image::from_rgba8(buf));
             }
-            // Предзагрузка соседей в фоне.
+            // Предзагрузка соседей в фоне. guard кэша УЖЕ освобождён — deadlock невозможен.
             preload_neighbors(photos.clone(), index, cache.clone());
             return;
         }
+        log::debug!("load_viewer_image: «{}» мимо кэша — фоновый поток", path.display());
         if let Some(w) = ui_weak.upgrade() {
             w.set_viewer_loading(true);
         }
@@ -468,7 +501,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             let _ = slint::invoke_from_event_loop(move || {
                 // Отмена устаревшей загрузки: если поколение изменилось —
                 // результат не применяем (не мигаем чужими фото).
-                if generation.load(Ordering::SeqCst) != my_generation {
+                let cur = generation.load(Ordering::SeqCst);
+                if cur != my_generation {
+                    log::debug!(
+                        "load_viewer_image: результат устарел (my={my_generation}, cur={cur}) — отбрасываю"
+                    );
                     return;
                 }
                 if let Some(w) = ui_weak.upgrade() {
@@ -486,7 +523,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             }
                             w.set_viewer_image(slint::Image::from_rgba8(buf));
                         }
-                        Err(e) => w.set_error_text(e.into()),
+                        Err(e) => {
+                            log::error!("load_viewer_image: ошибка: {e}");
+                            w.set_error_text(e.into());
+                        }
                     }
                 }
             });
@@ -539,6 +579,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         photos: Arc<Mutex<Vec<Photo>>>,
         recursive: bool,
     ) {
+        log::info!("scan_and_show: старт (recursive={recursive})");
         if let Some(w) = ui_weak.upgrade() {
             w.set_scanning(true);
             w.set_error_text("".into());
@@ -551,6 +592,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             let result: Result<(Vec<Photo>, Vec<crate::core::models::Thumbnail>), String> =
                 (|| {
                     let folder = folder.ok_or("Папка не выбрана")?;
+                    log::info!("scan_and_show: выбрана папка «{}»", folder.display());
                     let mode = if recursive {
                         ScanMode::FolderRecursive(folder)
                     } else {
@@ -655,15 +697,22 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
 
     // --- Viewer колбэги ---
     // Открыть фото по индексу.
+    // ВАЖНО: именно здесь включаем ПОЛНОЭКРАННЫЙ режим (как в играх) —
+    // окно разворачивается на текущий монитор. Само приложение в обычном
+    // оконном режиме; на весь экран уходит только просмотр фото.
     {
         let photos = photos.clone();
         let ui_weak = ui.as_weak();
         let viewer_cache = viewer_cache.clone();
         let generation = viewer_generation.clone();
         ui.on_open_viewer(move |index| {
+            log::info!("viewer: открыть фото index={index}");
             if let Some(w) = ui_weak.upgrade() {
                 w.set_viewer_index(index);
                 w.set_show_viewer(true);
+                // Полноэкранный режим на активном мониторе (где сейчас окно).
+                w.window().set_fullscreen(true);
+                log::info!("viewer: fullscreen ON");
             }
             // Новое поколение загрузки — все предыдущие результаты устаревают.
             let my_gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -677,12 +726,15 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             );
         });
     }
-    // Закрыть viewer.
+    // Закрыть viewer: выходим из полноэкранного режима, возвращаем оконный.
     {
         let ui_weak = ui.as_weak();
         ui.on_close_viewer(move || {
+            log::info!("viewer: закрытие");
             if let Some(w) = ui_weak.upgrade() {
                 w.set_show_viewer(false);
+                w.window().set_fullscreen(false);
+                log::info!("viewer: fullscreen OFF");
             }
         });
     }
@@ -702,6 +754,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 if idx >= count {
                     idx = 0;
                 }
+                log::debug!("viewer: next → index={idx}");
                 w.set_viewer_index(idx);
             }
             // Новое поколение — устаревшие загрузки отменяются.
@@ -733,6 +786,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 if idx < 0 {
                     idx = count - 1;
                 }
+                log::debug!("viewer: prev → index={idx}");
                 w.set_viewer_index(idx);
             }
             // Новое поколение — устаревшие загрузки отменяются.

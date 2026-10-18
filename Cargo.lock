@@ -3809,6 +3809,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "image",
+ "log",
  "lru",
  "rand 0.8.8",
  "rand_core 0.6.4",

@@ -11,6 +11,8 @@ build = "build.rs"
 [dependencies]
 # Ядро
 thiserror = "1"
+# Логирование (фасад log + собственный логгер в src/logging.rs)
+log = "0.4"
 # Сканер
 walkdir = "2"
 # Миниатюры

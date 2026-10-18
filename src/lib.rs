@@ -4,6 +4,7 @@
 //! использовать из бинарника (`main.rs`) и из интеграционных тестов (`tests/`).
 
 pub mod core;
+pub mod logging;
 pub mod scanner;
 pub mod security;
 pub mod thumbnails;
