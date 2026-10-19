@@ -455,7 +455,6 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                 return;
                             }
                             if let Some(w) = ui_weak.upgrade() {
-                                w.set_viewer_loading(false);
                                 match result {
                                     Ok((data, w_px, h_px)) => {
                                         let mut buf =
@@ -599,10 +598,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
             return;
         }
-        // 3) Мимо кэша — задача воркеру.
-        if let Some(w) = ui_weak.upgrade() {
-            w.set_viewer_loading(true);
-        }
+        // 3) Мимо кэша — задача воркеру. Миниатюра-плейсхолдер уже показана,
+        //    индикатор «Загрузка» убран (бесполезен и залипал).
         let _ = load_tx.send(LoadTask::Photo {
             index,
             path,
@@ -837,8 +834,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             if let Some(w) = ui_weak.upgrade() {
                 w.set_viewer_index(index);
                 w.set_show_viewer(true);
-                w.set_viewer_loading(false); // страховка от залипания
-                                             // Полноэкранный режим на активном мониторе (где сейчас окно).
+                // Полноэкранный режим на активном мониторе (где сейчас окно).
                 w.window().set_fullscreen(true);
                 log::info!("viewer: fullscreen ON");
             }
@@ -863,7 +859,6 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             log::info!("viewer: закрытие");
             if let Some(w) = ui_weak.upgrade() {
                 w.set_show_viewer(false);
-                w.set_viewer_loading(false); // страховка от залипания
                 w.window().set_fullscreen(false);
                 log::info!("viewer: fullscreen OFF");
             }

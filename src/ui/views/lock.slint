@@ -158,7 +158,6 @@ export component GalleryScreen inherits Window {
     in-out property <image> viewer-image;        // чёткое полное фото (грузится с debounce)
     in-out property <image> viewer-thumbnail;    // миниатюра — показывается МГНОВЕННО при листании (моргание)
     in-out property <int> viewer-index: 0;
-    in-out property <bool> viewer-loading: false;
     // Автоскрытие управления: кнопки видны, пока мышь двигали; гаснут через 2.5с.
     in-out property <bool> controls-visible: true;
     callback mouse-moved();   // сообщать из Rust, что мышь двигалась в viewer
@@ -384,15 +383,6 @@ export component GalleryScreen inherits Window {
                 image-fit: contain;
                 width: parent.width;
                 height: parent.height;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-
-            // Индикатор загрузки
-            if root.viewer-loading : Text {
-                text: "Загрузка...";
-                color: white;
-                font-size: 16px;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
