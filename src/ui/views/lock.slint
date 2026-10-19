@@ -357,10 +357,20 @@ export component GalleryScreen inherits Window {
             // ЛКМ по фону/фото НЕ закрывает просмотр: закрытие только по Esc и ✕.
             // Любое движение мыши в viewer — показываем управление (автоскрытие).
             TouchArea {
+                // 4.3c — pan «лапкой»: при zoom>1 запоминаем стартовые offset/mouse
+                // при нажатии ЛКМ, при движении (drag) — двигаем offset на дельту мыши.
+                property <length> pan-start-mouse-x: 0px;
+                property <length> pan-start-mouse-y: 0px;
+                property <length> pan-start-offset-x: 0px;
+                property <length> pan-start-offset-y: 0px;
+                // Курсор-«лапка» при увеличении (grab — наведение, grabbing — перетаскивание).
+                mouse-cursor: root.viewer-zoom > 1.0
+                    ? (self.pressed ? grab : grab)
+                    : default;
+
                 scroll-event(e) => {
                     if self.pressed {
                         // Зум к курсору: mx,my — позиция курсора относительно центра viewport (px).
-                        // Колесо вверх (delta-y < 0) — приблизить, вниз — отдалить.
                         let mx = (self.mouse-x - parent.width / 2) / 1px;
                         let my = (self.mouse-y - parent.height / 2) / 1px;
                         // Инверсия колеса (по просьбе заказчика): колесо ВНИЗ → приблизить,
@@ -380,6 +390,21 @@ export component GalleryScreen inherits Window {
                 pointer-event(e) => {
                     if e.kind == PointerEventKind.move {
                         root.mouse-moved();
+                    }
+                    // 4.3c — pan: при нажатии ЛКМ (zoom>1) запоминаем старт;
+                    // при движении с зажатой ЛКМ — двигаем offset на дельту.
+                    if e.kind == PointerEventKind.down && root.viewer-zoom > 1.0 {
+                        self.pan-start-mouse-x = self.mouse-x;
+                        self.pan-start-mouse-y = self.mouse-y;
+                        self.pan-start-offset-x = root.viewer-offset-x;
+                        self.pan-start-offset-y = root.viewer-offset-y;
+                    }
+                    if e.kind == PointerEventKind.move && self.pressed
+                        && root.viewer-zoom > 1.0 {
+                        root.viewer-offset-x =
+                            self.pan-start-offset-x + (self.mouse-x - self.pan-start-mouse-x);
+                        root.viewer-offset-y =
+                            self.pan-start-offset-y + (self.mouse-y - self.pan-start-mouse-y);
                     }
                 }
             }
