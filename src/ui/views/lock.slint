@@ -158,9 +158,16 @@ export component GalleryScreen inherits Window {
     in-out property <image> viewer-image;        // чёткое полное фото (грузится с debounce)
     in-out property <image> viewer-thumbnail;    // миниатюра — показывается МГНОВЕННО при листании (моргание)
     in-out property <int> viewer-index: 0;
+    // 4.3b — зум: масштаб (1.0 = вписано) и смещение центра (для зума к курсору и pan).
+    in-out property <float> viewer-zoom: 1.0;
+    in-out property <length> viewer-offset-x: 0px;
+    in-out property <length> viewer-offset-y: 0px;
     // Автоскрытие управления: кнопки видны, пока мышь двигали; гаснут через 2.5с.
     in-out property <bool> controls-visible: true;
     callback mouse-moved();   // сообщать из Rust, что мышь двигалась в viewer
+    // 4.3b — зум к курсору: (mx, my) — позиция курсора относительно центра viewport (px),
+    // up — true (приблизить) / false (отдалить). Расчёт новых zoom/offset — в Rust.
+    callback viewer-zoom-at(float, float, bool);
 
     callback pick-folder-flat();
     callback pick-folder-recursive();
@@ -346,16 +353,25 @@ export component GalleryScreen inherits Window {
 
         Rectangle {
             background: #000000ee;
-            // Фон ловит колесо мыши — листание фото (вниз → следующее, вверх → предыдущее).
-            // ЛКМ по фону/фото больше НЕ закрывает просмотр (заказчик): закрытие только
-            // по Esc и кнопке ✕. ЛКМ освобождена под зум/pan (4.3b/4.3c).
+            // Колесо мыши: если ЛКМ ЗАЖАТА — зум к курсору (4.3b), иначе — листание.
+            // ЛКМ по фону/фото НЕ закрывает просмотр: закрытие только по Esc и ✕.
             // Любое движение мыши в viewer — показываем управление (автоскрытие).
             TouchArea {
                 scroll-event(e) => {
-                    if e.delta-y < 0px {
-                        root.viewer-next();
-                    } else if e.delta-y > 0px {
-                        root.viewer-prev();
+                    if self.pressed {
+                        // Зум к курсору: mx,my — позиция курсора относительно центра viewport (px).
+                        // Колесо вверх (delta-y < 0) — приблизить, вниз — отдалить.
+                        let mx = (self.mouse-x - parent.width / 2) / 1px;
+                        let my = (self.mouse-y - parent.height / 2) / 1px;
+                        let up = e.delta-y < 0px;
+                        root.viewer-zoom-at(mx, my, up);
+                    } else {
+                        // Листание (без зажатой ЛКМ).
+                        if e.delta-y < 0px {
+                            root.viewer-next();
+                        } else if e.delta-y > 0px {
+                            root.viewer-prev();
+                        }
                     }
                     accept
                 }
@@ -378,13 +394,21 @@ export component GalleryScreen inherits Window {
             }
 
             // Чёткое полное фото поверх миниатюры (когда готово — перекрывает).
+            // 4.3b — зум: масштабируем размер на viewer-zoom и смещаем на offset.
+            // При zoom=1, offset=0 — фото вписано по центру (как раньше).
+            // image-fit: contain внутри масштабированного размера сохраняет пропорции.
             Image {
                 source: root.viewer-image;
                 image-fit: contain;
-                width: parent.width;
-                height: parent.height;
+                width: parent.width * root.viewer-zoom;
+                height: parent.height * root.viewer-zoom;
+                // Центрируем масштабированное изображение + смещение (для зума к курсору/pan).
+                x: (parent.width - self.width) / 2 + root.viewer-offset-x;
+                y: (parent.height - self.height) / 2 + root.viewer-offset-y;
                 horizontal-alignment: center;
                 vertical-alignment: center;
+                // Сглаживание при масштабировании (интерполяция) — против «квадратиков».
+                image-rendering: smooth;
             }
 
             // Кнопка закрытия (×) сверху-справа. Прозрачность по controls-visible.

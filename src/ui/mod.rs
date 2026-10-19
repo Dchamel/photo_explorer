@@ -834,6 +834,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             if let Some(w) = ui_weak.upgrade() {
                 w.set_viewer_index(index);
                 w.set_show_viewer(true);
+                // Сброс зума при открытии нового фото (иначе откроется зумленным).
+                w.set_viewer_zoom(1.0);
+                w.set_viewer_offset_x(0.0);
+                w.set_viewer_offset_y(0.0);
                 // Полноэкранный режим на активном мониторе (где сейчас окно).
                 w.window().set_fullscreen(true);
                 log::info!("viewer: fullscreen ON");
@@ -887,6 +891,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 log::debug!("viewer: next → index={idx}");
                 w.set_viewer_index(idx);
                 w.set_viewer_image(slint::Image::default()); // очистить старое чёткое
+                w.set_viewer_zoom(1.0); // сброс зума для нового фото
+                w.set_viewer_offset_x(0.0);
+                w.set_viewer_offset_y(0.0);
             }
             let idx = ui_weak.upgrade().map(|w| w.get_viewer_index()).unwrap_or(0);
             show_thumbnail(&ui_weak, idx); // мгновенный плейсхолдер
@@ -922,6 +929,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 log::debug!("viewer: prev → index={idx}");
                 w.set_viewer_index(idx);
                 w.set_viewer_image(slint::Image::default()); // очистить старое чёткое
+                w.set_viewer_zoom(1.0); // сброс зума для нового фото
+                w.set_viewer_offset_x(0.0);
+                w.set_viewer_offset_y(0.0);
             }
             let idx = ui_weak.upgrade().map(|w| w.get_viewer_index()).unwrap_or(0);
             show_thumbnail(&ui_weak, idx); // мгновенный плейсхолдер
@@ -954,6 +964,48 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             w.set_controls_visible(false);
                         }
                     },
+                );
+            }
+        });
+    }
+
+    // 4.3b — зум к курсору: пересчёт масштаба и смещения.
+    // mx,my — позиция курсора относительно центра viewport (px). up — приблизить/отдалить.
+    // Формула zoom-to-point: offset' = cursor - (cursor - offset) * (zoom'/zoom),
+    // чтобы точка изображения под курсором осталась под курсором.
+    {
+        let ui_weak = ui.as_weak();
+        const ZOOM_STEP: f32 = 1.2; // шаг масштаба на одно деление колеса
+        const ZOOM_MIN: f32 = 1.0; // не меньше вписанного
+        const ZOOM_MAX: f32 = 10.0; // предел приближения
+        ui.on_viewer_zoom_at(move |mx, my, up| {
+            if let Some(w) = ui_weak.upgrade() {
+                let zoom = w.get_viewer_zoom();
+                let new_zoom = if up {
+                    (zoom * ZOOM_STEP).min(ZOOM_MAX)
+                } else {
+                    (zoom / ZOOM_STEP).max(ZOOM_MIN)
+                };
+                if (new_zoom - zoom).abs() < 1e-6 {
+                    return; // упёрлись в предел — ничего не делаем
+                }
+                // offset' = cursor - (cursor - offset) * (new_zoom / zoom)
+                let ox = w.get_viewer_offset_x();
+                let oy = w.get_viewer_offset_y();
+                let k = new_zoom / zoom;
+                let new_ox = mx - (mx - ox) * k;
+                let new_oy = my - (my - oy) * k;
+                // При возврате к zoom=1 центрируем (offset=0), чтобы фото встало ровно.
+                if (new_zoom - 1.0).abs() < 1e-6 {
+                    w.set_viewer_offset_x(0.0);
+                    w.set_viewer_offset_y(0.0);
+                } else {
+                    w.set_viewer_offset_x(new_ox);
+                    w.set_viewer_offset_y(new_oy);
+                }
+                w.set_viewer_zoom(new_zoom);
+                log::debug!(
+                    "viewer: zoom {zoom:.2}→{new_zoom:.2}, offset ({new_ox:.0},{new_oy:.0})"
                 );
             }
         });
