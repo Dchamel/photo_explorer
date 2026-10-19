@@ -363,7 +363,9 @@ export component GalleryScreen inherits Window {
                         // Колесо вверх (delta-y < 0) — приблизить, вниз — отдалить.
                         let mx = (self.mouse-x - parent.width / 2) / 1px;
                         let my = (self.mouse-y - parent.height / 2) / 1px;
-                        let up = e.delta-y < 0px;
+                        // Инверсия колеса (по просьбе заказчика): колесо ВНИЗ → приблизить,
+                        // колесо ВВЕРХ → отдалить.
+                        let up = e.delta-y > 0px;
                         root.viewer-zoom-at(mx, my, up);
                     } else {
                         // Листание (без зажатой ЛКМ).
