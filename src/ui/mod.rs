@@ -364,9 +364,23 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // Список Photo (с путями к оригиналам) — нужен для viewer. Arc<Mutex> — доступ из потоков.
     let photos: Arc<Mutex<Vec<Photo>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // LRU-кэш полных изображений в памяти (быстрый повторный просмотр).
+    // LRU-кэш полных изображений (сырой RGBA, Send) — для воркера.
     let viewer_cache: Arc<Mutex<ViewerCache>> =
         Arc::new(Mutex::new(ViewerCache::new(20.try_into().unwrap())));
+
+    // 4.3d-v7 — UI-кэш ГОТОВЫХ slint::Image (ключ — путь).
+    // КОРЕНЬ фикса затупа: раньше на КАЖДЫЙ кадр (даже из кэша) UI-поток строил
+    // slint::Image из сырого RGBA попиксельно (до 26 МБ на фото) — при 20-30
+    // событиях/сек это гигабайты копирования в главном потоке → затуп.
+    // Теперь: воркер один раз строит slint::Image и кладёт сюда; показ из кэша
+    // = set_viewer_image(img.clone()) — clone дешёвый (внутри Rc). Без копирования.
+    // slint::Image НЕ Send → кэш в Rc<RefCell>, живёт только в UI-потоке.
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    type ImageCache = Rc<RefCell<HashMap<std::path::PathBuf, slint::Image>>>;
+    let image_cache: ImageCache = Rc::new(RefCell::new(HashMap::new()));
+    const IMAGE_CACHE_MAX: usize = 20;
 
     // Поколение загрузки: инкрементируется при каждом переключении фото.
     // Фоновый поток сверяет своё поколение перед применением результата —
@@ -514,15 +528,17 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         }
     }
 
-    /// Запросить показ фото по индексу (v6 — один воркер-поток, без лавины).
-    /// 1) Кэш — МГНОВЕННО (показываем сразу).
-    /// 2) Мимо кэша — шлём задачу в канал воркеру. Воркер один, дренирует
-    ///    очередь (берёт последнюю актуальную), декодирует, отдаёт в UI.
+    /// Запросить показ фото по индексу (v7 — кэш готовых slint::Image + воркер).
+    /// 1) UI-кэш готовых slint::Image — МГНОВЕННО (дешёвый clone, без копирования).
+    /// 2) Сырой RGBA в кэше — строим slint::Image ОДИН раз, сохраняем в UI-кэш,
+    ///    показываем. При повторе — уже мгновенно из UI-кэша.
+    /// 3) Мимо кэша — задача воркеру (1 поток).
     fn request_viewer_load(
         photos: Arc<Mutex<Vec<Photo>>>,
         index: i32,
         ui_weak: slint::Weak<GalleryScreen>,
         cache: Arc<Mutex<ViewerCache>>,
+        image_cache: ImageCache,
         generation: Arc<AtomicU64>,
         load_tx: &mpsc::Sender<LoadTask>,
     ) {
@@ -535,12 +551,26 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 None => return,
             }
         };
-        // Кэш — мгновенно.
+        // 1) UI-кэш готовых slint::Image — мгновенно, без копирования RGBA.
+        if let Some(img) = image_cache.borrow().get(&path).cloned() {
+            if generation.load(Ordering::SeqCst) == my_gen {
+                log::debug!(
+                    "request_viewer_load: «{}» из UI-кэша Image — мгновенно",
+                    path.display()
+                );
+                if let Some(w) = ui_weak.upgrade() {
+                    w.set_viewer_image(img);
+                }
+                enqueue_preload(&photos, index, cache, load_tx);
+            }
+            return;
+        }
+        // 2) Сырой RGBA в кэше — строим slint::Image ОДИН раз, кэшируем, показываем.
         let cached_opt = lock_or_recover(&cache).get(&path).cloned();
         if let Some(cached) = cached_opt {
             if generation.load(Ordering::SeqCst) == my_gen {
                 log::debug!(
-                    "request_viewer_load: «{}» из кэша — мгновенно",
+                    "request_viewer_load: «{}» из RGBA-кэша — строим Image",
                     path.display()
                 );
                 if let Some(w) = ui_weak.upgrade() {
@@ -553,14 +583,23 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         dst.b = chunk[2];
                         dst.a = chunk[3];
                     }
-                    w.set_viewer_image(slint::Image::from_rgba8(buf));
+                    let img = slint::Image::from_rgba8(buf);
+                    // Сохраняем в UI-кэш (с ограничением размера).
+                    let mut ic = image_cache.borrow_mut();
+                    if ic.len() >= IMAGE_CACHE_MAX {
+                        // Удаляем произвольный элемент (простейшая eviction).
+                        if let Some(k) = ic.keys().next().cloned() {
+                            ic.remove(&k);
+                        }
+                    }
+                    ic.insert(path.clone(), img.clone());
+                    w.set_viewer_image(img);
                 }
-                // Предзагрузку соседей тоже шлём в канал (не spawn).
                 enqueue_preload(&photos, index, cache, load_tx);
             }
             return;
         }
-        // Мимо кэша — задача воркеру. loading=true покажет индикатор.
+        // 3) Мимо кэша — задача воркеру.
         if let Some(w) = ui_weak.upgrade() {
             w.set_viewer_loading(true);
         }
@@ -790,6 +829,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let photos = photos.clone();
         let ui_weak = ui.as_weak();
         let viewer_cache = viewer_cache.clone();
+        let image_cache = image_cache.clone();
         let generation = viewer_generation.clone();
         let load_tx = load_tx.clone();
         ui.on_open_viewer(move |index| {
@@ -810,6 +850,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 index,
                 ui_weak.clone(),
                 viewer_cache.clone(),
+                image_cache.clone(),
                 generation.clone(),
                 &load_tx,
             );
@@ -835,6 +876,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let photos = photos.clone();
         let ui_weak = ui.as_weak();
         let viewer_cache = viewer_cache.clone();
+        let image_cache = image_cache.clone();
         let generation = viewer_generation.clone();
         let load_tx = load_tx.clone();
         ui.on_viewer_next(move || {
@@ -858,6 +900,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 idx,
                 ui_weak.clone(),
                 viewer_cache.clone(),
+                image_cache.clone(),
                 generation.clone(),
                 &load_tx,
             );
@@ -868,6 +911,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let photos = photos.clone();
         let ui_weak = ui.as_weak();
         let viewer_cache = viewer_cache.clone();
+        let image_cache = image_cache.clone();
         let generation = viewer_generation.clone();
         let load_tx = load_tx.clone();
         ui.on_viewer_prev(move || {
@@ -891,6 +935,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 idx,
                 ui_weak.clone(),
                 viewer_cache.clone(),
+                image_cache.clone(),
                 generation.clone(),
                 &load_tx,
             );
