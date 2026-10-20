@@ -16,6 +16,22 @@ use std::sync::{Arc, Mutex};
 use crate::core::ports::{AuthOutcome, Authenticator};
 use crate::security::SecurityService;
 
+/// 4.3e — следующий индекс при авто-скипе битого файла.
+/// dir = +1 (вперёд) или −1 (назад). Без зацикливания: клампим по границам,
+/// возвращаем −1, если вышли за край (сигнал «годных больше нет»).
+/// Чистая функция на уровне модуля — легко тестировать без UI.
+pub fn next_valid_index(next_index: i32, dir: i32, count: i32) -> i32 {
+    if count <= 0 {
+        return -1;
+    }
+    let ni = next_index + dir;
+    if ni < 0 || ni >= count {
+        -1 // край списка — дальше годных нет
+    } else {
+        ni
+    }
+}
+
 /// Выводит окно приложения на передний план и даёт ему фокус (только Windows).
 ///
 /// Системное окно Windows Hello всплывает активным поверх окна, которое вызвало запрос.
@@ -388,6 +404,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // Это убирает «мигание» чужими фото и лавину потоков при быстром листании.
     let viewer_generation: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
+    // 4.3e — направление последнего листания (+1 вперёд / −1 назад).
+    // Нужно для авто-скипа битого файла: скип идём в ту же сторону, куда листал
+    // пользователь. AtomicI32 — доступ из воркера и UI без блокировок.
+    use std::sync::atomic::AtomicI32;
+    let last_direction: Arc<AtomicI32> = Arc::new(AtomicI32::new(1));
+
     // Максимальная сторона изображения для viewer (downscale до размера экрана).
     const VIEWER_MAX_SIZE: u32 = 2560;
 
@@ -407,6 +429,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             index: i32,
             path: std::path::PathBuf,
             generation: u64,
+            // 4.3e — глубина авто-скипа битых файлов (0 = обычный показ).
+            // Защита от зацикливания: если превысила размер списка — стоп + плашка.
+            skip_depth: u32,
         },
         Preload {
             path: std::path::PathBuf,
@@ -420,38 +445,39 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     {
         let viewer_cache = viewer_cache.clone();
         let viewer_generation = viewer_generation.clone();
+        let last_direction = last_direction.clone();
         let ui_weak_for_viewer = ui_weak_for_viewer.clone();
         std::thread::spawn(move || {
             log::info!("viewer worker: запущен (1 поток)");
             let viewer_cache = viewer_cache;
             let viewer_generation = viewer_generation;
+            let last_direction = last_direction;
             while let Ok(task) = load_rx.recv() {
                 match task {
                     LoadTask::Photo {
-                        index: _,
+                        index,
                         path,
                         generation: my_gen,
+                        skip_depth,
                     } => {
                         // Дренируем очередь: если в канале ещё есть задачи —
                         // берём последнюю (промежуточные пропускаем, не декодируя).
-                        // index воркеру не нужен — работаем по path.
-                        let (_, path, my_gen) = drain_to_last(&load_rx, 0, path, my_gen);
+                        let (_, path, my_gen, skip_depth) =
+                            drain_to_last(&load_rx, index, path, my_gen, skip_depth);
                         // Устаревшая задача — пропускаем (пользователь ушёл дальше).
                         if viewer_generation.load(Ordering::SeqCst) != my_gen {
                             log::debug!("worker: устарела gen={my_gen}, пропускаю");
                             continue;
                         }
-                        // Снимаем loading только если это актуальное поколение.
                         let result = load_full_image(path, viewer_cache.clone());
                         let gen = viewer_generation.clone();
+                        let dir = last_direction.load(Ordering::SeqCst);
                         let ui_weak = ui_weak_for_viewer.clone();
                         let _ = slint::invoke_from_event_loop(move || {
-                            // Устарел к моменту готовности — не показываем, но
-                            // снимаем loading (фикс залипания «Загрузка»).
+                            // Устарел к моменту готовности — не показываем.
                             let cur = gen.load(Ordering::SeqCst);
                             if cur != my_gen {
                                 log::debug!("worker: результат устарел my={my_gen} cur={cur}");
-                                // loading снимет актуальная задача; здесь просто выходим.
                                 return;
                             }
                             if let Some(w) = ui_weak.upgrade() {
@@ -471,10 +497,18 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                             dst.a = chunk[3];
                                         }
                                         w.set_viewer_image(slint::Image::from_rgba8(buf));
+                                        // 4.3e — успешный показ: гасим плашку ошибки.
+                                        w.set_viewer_error("".into());
                                     }
                                     Err(e) => {
-                                        log::error!("worker: ошибка: {e}");
-                                        w.set_error_text(e.into());
+                                        // 4.3e — авто-скип битого файла: просим UI
+                                        // показать следующий кадр в текущем направлении.
+                                        // UI-колбэк request-skip сам решает границы и
+                                        // защиту от зацикливания (ему доступен Rc-кэш).
+                                        log::error!("worker: битый файл index={index}: {e}");
+                                        let next = index + dir;
+                                        let next_depth = skip_depth.saturating_add(1);
+                                        w.invoke_request_skip(next, dir, next_depth as i32);
                                     }
                                 }
                             }
@@ -498,21 +532,24 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         mut index: i32,
         mut path: std::path::PathBuf,
         mut generation: u64,
-    ) -> (i32, std::path::PathBuf, u64) {
+        mut skip_depth: u32,
+    ) -> (i32, std::path::PathBuf, u64, u32) {
         while let Ok(next) = rx.try_recv() {
             if let LoadTask::Photo {
                 index: i,
                 path: p,
                 generation: g,
+                skip_depth: d,
             } = next
             {
                 index = i;
                 path = p;
                 generation = g;
+                skip_depth = d;
             }
             // Preload-задачи игнорируем при дренировании (они низкого приоритета).
         }
-        (index, path, generation)
+        (index, path, generation, skip_depth)
     }
 
     /// Мгновенно показывает миниатюру фото по индексу как placeholder (моргание).
@@ -559,6 +596,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 );
                 if let Some(w) = ui_weak.upgrade() {
                     w.set_viewer_image(img);
+                    w.set_viewer_error("".into()); // 4.3e — успешный показ, гасим плашку.
                 }
                 enqueue_preload(&photos, index, cache, load_tx);
             }
@@ -593,6 +631,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     }
                     ic.insert(path.clone(), img.clone());
                     w.set_viewer_image(img);
+                    w.set_viewer_error("".into()); // 4.3e — успешный показ, гасим плашку.
                 }
                 enqueue_preload(&photos, index, cache, load_tx);
             }
@@ -604,6 +643,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             index,
             path,
             generation: my_gen,
+            skip_depth: 0,
         });
     }
 
@@ -828,9 +868,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let viewer_cache = viewer_cache.clone();
         let image_cache = image_cache.clone();
         let generation = viewer_generation.clone();
+        let last_direction = last_direction.clone();
         let load_tx = load_tx.clone();
         ui.on_open_viewer(move |index| {
             log::info!("viewer: открыть фото index={index}");
+            last_direction.store(1, Ordering::SeqCst); // 4.3e — открытие = «вперёд».
             if let Some(w) = ui_weak.upgrade() {
                 w.set_viewer_index(index);
                 w.set_show_viewer(true);
@@ -877,8 +919,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let viewer_cache = viewer_cache.clone();
         let image_cache = image_cache.clone();
         let generation = viewer_generation.clone();
+        let last_direction = last_direction.clone();
         let load_tx = load_tx.clone();
         ui.on_viewer_next(move || {
+            last_direction.store(1, Ordering::SeqCst); // 4.3e — листаем вперёд.
             if let Some(w) = ui_weak.upgrade() {
                 let count = lock_or_recover(&photos).len() as i32;
                 if count == 0 {
@@ -915,8 +959,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let viewer_cache = viewer_cache.clone();
         let image_cache = image_cache.clone();
         let generation = viewer_generation.clone();
+        let last_direction = last_direction.clone();
         let load_tx = load_tx.clone();
         ui.on_viewer_prev(move || {
+            last_direction.store(-1, Ordering::SeqCst); // 4.3e — листаем назад.
             if let Some(w) = ui_weak.upgrade() {
                 let count = lock_or_recover(&photos).len() as i32;
                 if count == 0 {
@@ -944,6 +990,65 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 generation.clone(),
                 &load_tx,
             );
+        });
+    }
+
+    // 4.3e — авто-скип битого файла: воркер через request-skip просит показать
+    // фото next-index в направлении dir. Здесь (в UI-потоке) доступен Rc-кэш,
+    // поэтому можем звать request_viewer_load. Защита от зацикливания: если
+    // skip_depth превысил размер списка — все файлы битые, показываем плашку.
+    // next-index и dir приходят из воркера; skip_depth — сколько уже скипнули.
+    {
+        let photos = photos.clone();
+        let ui_weak = ui.as_weak();
+        let generation = viewer_generation.clone();
+        let load_tx = load_tx.clone();
+        ui.on_request_skip(move |next_index, dir, skip_depth| {
+            let count = lock_or_recover(&photos).len() as i32;
+            // Защита от зацикливания: перепробовали больше, чем файлов в списке.
+            if skip_depth > count || count == 0 {
+                log::error!(
+                    "request-skip: все файлы битые (depth={skip_depth}, count={count}) — плашка"
+                );
+                if let Some(w) = ui_weak.upgrade() {
+                    w.set_viewer_image(slint::Image::default());
+                    w.set_viewer_error("Файл не открывается".into());
+                }
+                return;
+            }
+            // Клампим индекс по границам списка (без зацикливания — стоп на краю).
+            let idx = next_valid_index(next_index, dir, count);
+            if idx < 0 || idx >= count {
+                // Достигли края и дальше годных нет — показываем плашку.
+                log::error!("request-skip: край списка (idx={idx}, count={count}) — плашка");
+                if let Some(w) = ui_weak.upgrade() {
+                    w.set_viewer_image(slint::Image::default());
+                    w.set_viewer_error("Файл не открывается".into());
+                }
+                return;
+            }
+            log::debug!("request-skip: скип → index={idx} (depth={skip_depth})");
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_viewer_index(idx);
+                w.set_viewer_image(slint::Image::default());
+                w.set_viewer_zoom(1.0);
+                w.set_viewer_offset_x(0.0);
+                w.set_viewer_offset_y(0.0);
+            }
+            show_thumbnail(&ui_weak, idx);
+            // Передаём skip_depth дальше — воркер снова скипнет, если и этот битый.
+            let _ = load_tx.send(LoadTask::Photo {
+                index: idx,
+                path: {
+                    let p = lock_or_recover(&photos);
+                    match p.get(idx as usize) {
+                        Some(ph) => ph.path.clone(),
+                        None => return,
+                    }
+                },
+                generation: generation.fetch_add(1, Ordering::SeqCst) + 1,
+                skip_depth: skip_depth as u32,
+            });
         });
     }
 

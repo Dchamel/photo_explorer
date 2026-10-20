@@ -168,6 +168,9 @@ export component GalleryScreen inherits Window {
     // 4.3b — зум к курсору: (mx, my) — позиция курсора относительно центра viewport (px),
     // up — true (приблизить) / false (отдалить). Расчёт новых zoom/offset — в Rust.
     callback viewer-zoom-at(float, float, bool);
+    // 4.3e — сообщение об ошибке просмотра (битый файл). Пусто = скрыто.
+    // Показывается только если все соседние файлы битые и скип невозможен.
+    in-out property <string> viewer-error: "";
 
     callback pick-folder-flat();
     callback pick-folder-recursive();
@@ -175,6 +178,11 @@ export component GalleryScreen inherits Window {
     callback close-viewer();
     callback viewer-next();
     callback viewer-prev();
+    // 4.3e — авто-скип битого файла: воркер просит UI показать фото next-index
+    // (направление dir = +1/−1, skip-depth — сколько уже скипнули подряд для
+    // защиты от зацикливания). Обработчик в UI-потоке зовёт request_viewer_load
+    // (Rc-кэш не Send — из воркера напрямую нельзя).
+    callback request-skip(int, int, int);
 
     VerticalLayout {
         Rectangle {
@@ -436,6 +444,20 @@ export component GalleryScreen inherits Window {
                 vertical-alignment: center;
                 // Сглаживание при масштабировании (интерполяция) — против «квадратиков».
                 image-rendering: smooth;
+            }
+
+            // 4.3e — плашка ошибки: битый файл, который не удалось открыть.
+            // Показывается только если скип невозможен (все соседние тоже битые
+            // или достигли края). Чёрный фон + сообщение по центру.
+            if root.viewer-error != "" : Rectangle {
+                background: #000000cc;
+                Text {
+                    text: root.viewer-error;
+                    color: #ffcccc;
+                    font-size: 20px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
             }
 
             // Кнопка закрытия (×) сверху-справа. Прозрачность по controls-visible.
