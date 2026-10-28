@@ -32,6 +32,15 @@ pub fn next_valid_index(next_index: i32, dir: i32, count: i32) -> i32 {
     }
 }
 
+/// 4.3f — кламп смещения фото «край в край» (как в классических просмотрщиках).
+/// Фото масштабируется на zoom и центрируется; максимальное смещение, при котором
+/// фото ещё ЗАКРЫВАЕТ viewport по этой оси: max = (vp * zoom − vp) / 2.
+/// При zoom=1 максимум 0 (вписанное фото не двигается). Чистая функция — легко тестировать.
+pub fn clamp_offset(offset: f32, zoom: f32, viewport: f32) -> f32 {
+    let max = ((viewport * zoom - viewport) / 2.0).max(0.0);
+    offset.clamp(-max, max)
+}
+
 /// Выводит окно приложения на передний план и даёт ему фокус (только Windows).
 ///
 /// Системное окно Windows Hello всплывает активным поверх окна, которое вызвало запрос.
@@ -1078,12 +1087,15 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // mx,my — позиция курсора относительно центра viewport (px). up — приблизить/отдалить.
     // Формула zoom-to-point: offset' = cursor - (cursor - offset) * (zoom'/zoom),
     // чтобы точка изображения под курсором осталась под курсором.
+    // 4.3f — добавлен кламп offset «край в край»: фото нельзя утащить/зазумить
+    // за пределы экрана (упирается краем в край viewport, как в классических
+    // просмотрщиках). Для этого slint передаёт размеры viewport (vw, vh).
     {
         let ui_weak = ui.as_weak();
         const ZOOM_STEP: f32 = 1.2; // шаг масштаба на одно деление колеса
         const ZOOM_MIN: f32 = 1.0; // не меньше вписанного
         const ZOOM_MAX: f32 = 10.0; // предел приближения
-        ui.on_viewer_zoom_at(move |mx, my, up| {
+        ui.on_viewer_zoom_at(move |mx, my, up, vw, vh| {
             if let Some(w) = ui_weak.upgrade() {
                 let zoom = w.get_viewer_zoom();
                 let new_zoom = if up {
@@ -1100,6 +1112,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 let k = new_zoom / zoom;
                 let new_ox = mx - (mx - ox) * k;
                 let new_oy = my - (my - oy) * k;
+                // 4.3f — кламп «край в край»: фото всегда закрывает viewport.
+                let new_ox = clamp_offset(new_ox, new_zoom, vw);
+                let new_oy = clamp_offset(new_oy, new_zoom, vh);
                 // При возврате к zoom=1 центрируем (offset=0), чтобы фото встало ровно.
                 if (new_zoom - 1.0).abs() < 1e-6 {
                     w.set_viewer_offset_x(0.0);
@@ -1112,6 +1127,22 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 log::debug!(
                     "viewer: zoom {zoom:.2}→{new_zoom:.2}, offset ({new_ox:.0},{new_oy:.0})"
                 );
+            }
+        });
+    }
+    // 4.3f — инкрементальный pan: добавить к offset дельту мыши (dx, dy) с клампом
+    // «край в край» по размерам viewport (vw, vh). Вызывается из slint на каждом
+    // pointer-move с зажатой ЛКМ (zoom>1). Инкрементальность убирает конфликт
+    // с зумом: pan не опирается на замороженный стартовый offset.
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_viewer_pan_by(move |dx, dy, vw, vh| {
+            if let Some(w) = ui_weak.upgrade() {
+                let zoom = w.get_viewer_zoom();
+                let new_ox = clamp_offset(w.get_viewer_offset_x() + dx, zoom, vw);
+                let new_oy = clamp_offset(w.get_viewer_offset_y() + dy, zoom, vh);
+                w.set_viewer_offset_x(new_ox);
+                w.set_viewer_offset_y(new_oy);
             }
         });
     }

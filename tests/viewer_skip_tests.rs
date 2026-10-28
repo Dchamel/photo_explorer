@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use photo_explorer::ui::next_valid_index;
+use photo_explorer::ui::{clamp_offset, next_valid_index};
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -76,4 +76,39 @@ fn broken_png_does_not_decode() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn clamp_offset_center_stays() {
+    // Смещение 0 (центр) — кламп не трогает.
+    assert_eq!(clamp_offset(0.0, 2.0, 1000.0), 0.0);
+}
+
+#[test]
+fn clamp_offset_zoom_one_forces_zero() {
+    // zoom=1: вписанное фото нельзя двигать — максимум 0, любой offset → 0.
+    assert_eq!(clamp_offset(50.0, 1.0, 1000.0), 0.0);
+    assert_eq!(clamp_offset(-50.0, 1.0, 1000.0), 0.0);
+}
+
+#[test]
+fn clamp_offset_edge_limit() {
+    // viewport 1000, zoom 2 → max = (1000*2 − 1000)/2 = 500.
+    // Смещение 700 (за край) клампится к 500 — фото упирается краем в край.
+    assert_eq!(clamp_offset(700.0, 2.0, 1000.0), 500.0);
+    assert_eq!(clamp_offset(-700.0, 2.0, 1000.0), -500.0);
+}
+
+#[test]
+fn clamp_offset_inside_bounds_untouched() {
+    // Смещение внутри допустимого диапазона не меняется.
+    assert_eq!(clamp_offset(300.0, 2.0, 1000.0), 300.0);
+    assert_eq!(clamp_offset(-300.0, 2.0, 1000.0), -300.0);
+}
+
+#[test]
+fn clamp_offset_negative_viewport_safe() {
+    // Защита от вырожденных размеров: viewport ≤ 0 → максимум 0.
+    assert_eq!(clamp_offset(123.0, 2.0, 0.0), 0.0);
+    assert_eq!(clamp_offset(123.0, 2.0, -10.0), 0.0);
 }

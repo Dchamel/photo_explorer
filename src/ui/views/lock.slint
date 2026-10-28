@@ -166,8 +166,12 @@ export component GalleryScreen inherits Window {
     in-out property <bool> controls-visible: true;
     callback mouse-moved();   // сообщать из Rust, что мышь двигалась в viewer
     // 4.3b — зум к курсору: (mx, my) — позиция курсора относительно центра viewport (px),
-    // up — true (приблизить) / false (отдалить). Расчёт новых zoom/offset — в Rust.
-    callback viewer-zoom-at(float, float, bool);
+    // up — true (приблизить) / false (отдалить), vw/vh — размеры viewport (px) —
+    // нужны для клампа offset «край в край» (4.3f). Расчёт новых zoom/offset — в Rust.
+    callback viewer-zoom-at(float, float, bool, float, float);
+    // 4.3f — инкрементальный pan: добавить к offset дельту (dx, dy) (px) с клампом
+    // «край в край» по размерам viewport vw×vh. Кламп — в Rust (чистая функция).
+    callback viewer-pan-by(float, float, float, float);
     // 4.3e — сообщение об ошибке просмотра (битый файл). Пусто = скрыто.
     // Показывается только если все соседние файлы битые и скип невозможен.
     in-out property <string> viewer-error: "";
@@ -365,12 +369,15 @@ export component GalleryScreen inherits Window {
             // ЛКМ по фону/фото НЕ закрывает просмотр: закрытие только по Esc и ✕.
             // Любое движение мыши в viewer — показываем управление (автоскрытие).
             TouchArea {
-                // 4.3c — pan «лапкой»: при zoom>1 запоминаем стартовые offset/mouse
-                // при нажатии ЛКМ, при движении (drag) — двигаем offset на дельту мыши.
-                property <length> pan-start-mouse-x: 0px;
-                property <length> pan-start-mouse-y: 0px;
-                property <length> pan-start-offset-x: 0px;
-                property <length> pan-start-offset-y: 0px;
+                // 4.3f — pan «лапкой» стал ИНКРЕМЕНТАЛЬНЫМ: на каждом move добавляем
+                // к offset дельту между соседними позициями мыши (mouse − prev-mouse).
+                // Старая схема (offset = pan-start-offset + (mouse − pan-start-mouse))
+                // конфликтовала с зумом: pan-start-offset замораживался ДО зума колесом,
+                // и первый же move после зума ОТКАТЫВАЛ offset к старому значению →
+                // фото «прыгало» и улетало. Инкрементальная схема не опирается на
+                // замороженный старт — зум и pan больше не дерутся за offset.
+                property <length> prev-mouse-x: 0px;
+                property <length> prev-mouse-y: 0px;
                 // Курсор-«лапка» при увеличении (grab — наведение, grabbing — перетаскивание).
                 mouse-cursor: root.viewer-zoom > 1.0
                     ? (self.pressed ? grab : grab)
@@ -378,13 +385,16 @@ export component GalleryScreen inherits Window {
 
                 scroll-event(e) => {
                     if self.pressed {
-                        // Зум к курсору: mx,my — позиция курсора относительно центра viewport (px).
+                        // Зум к курсору: mx,my — позиция курсора относительно центра viewport (px),
+                        // vw,vh — размеры viewport (px) — нужны для клампа offset «край в край».
                         let mx = (self.mouse-x - parent.width / 2) / 1px;
                         let my = (self.mouse-y - parent.height / 2) / 1px;
+                        let vw = parent.width / 1px;
+                        let vh = parent.height / 1px;
                         // Инверсия колеса (по просьбе заказчика): колесо ВНИЗ → приблизить,
                         // колесо ВВЕРХ → отдалить.
                         let up = e.delta-y > 0px;
-                        root.viewer-zoom-at(mx, my, up);
+                        root.viewer-zoom-at(mx, my, up, vw, vh);
                     } else {
                         // Листание (без зажатой ЛКМ).
                         if e.delta-y < 0px {
@@ -399,20 +409,24 @@ export component GalleryScreen inherits Window {
                     if e.kind == PointerEventKind.move {
                         root.mouse-moved();
                     }
-                    // 4.3c — pan: при нажатии ЛКМ (zoom>1) запоминаем старт;
-                    // при движении с зажатой ЛКМ — двигаем offset на дельту.
+                    // 4.3f — pan: при нажатии ЛКМ (zoom>1) запоминаем ТЕКУЩУЮ позицию
+                    // мыши как prev; при каждом move с зажатой ЛКМ добавляем дельту
+                    // (mouse − prev) к offset и обновляем prev. Кламп «край в край»
+                    // выполняет Rust-колбэк viewer-pan-by (не даём утащить фото за экран).
                     if e.kind == PointerEventKind.down && root.viewer-zoom > 1.0 {
-                        self.pan-start-mouse-x = self.mouse-x;
-                        self.pan-start-mouse-y = self.mouse-y;
-                        self.pan-start-offset-x = root.viewer-offset-x;
-                        self.pan-start-offset-y = root.viewer-offset-y;
+                        self.prev-mouse-x = self.mouse-x;
+                        self.prev-mouse-y = self.mouse-y;
                     }
                     if e.kind == PointerEventKind.move && self.pressed
                         && root.viewer-zoom > 1.0 {
-                        root.viewer-offset-x =
-                            self.pan-start-offset-x + (self.mouse-x - self.pan-start-mouse-x);
-                        root.viewer-offset-y =
-                            self.pan-start-offset-y + (self.mouse-y - self.pan-start-mouse-y);
+                        root.viewer-pan-by(
+                            (self.mouse-x - self.prev-mouse-x) / 1px,
+                            (self.mouse-y - self.prev-mouse-y) / 1px,
+                            parent.width / 1px,
+                            parent.height / 1px,
+                        );
+                        self.prev-mouse-x = self.mouse-x;
+                        self.prev-mouse-y = self.mouse-y;
                     }
                 }
             }
