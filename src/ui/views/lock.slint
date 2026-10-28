@@ -162,16 +162,23 @@ export component GalleryScreen inherits Window {
     in-out property <float> viewer-zoom: 1.0;
     in-out property <length> viewer-offset-x: 0px;
     in-out property <length> viewer-offset-y: 0px;
+    // 4.3g — размеры КАРТИНКИ (px) текущего фото. Нужны для клампа «край в край»
+    // по КАРТИНКЕ (contain-fit): у узких/широких фото картинка меньше элемента
+    // vp*zoom — кламп по элементу позволял утащить фото за экран (чёрный экран).
+    in-out property <float> viewer-img-w: 1.0;
+    in-out property <float> viewer-img-h: 1.0;
     // Автоскрытие управления: кнопки видны, пока мышь двигали; гаснут через 2.5с.
     in-out property <bool> controls-visible: true;
     callback mouse-moved();   // сообщать из Rust, что мышь двигалась в viewer
     // 4.3b — зум к курсору: (mx, my) — позиция курсора относительно центра viewport (px),
-    // up — true (приблизить) / false (отдалить), vw/vh — размеры viewport (px) —
-    // нужны для клампа offset «край в край» (4.3f). Расчёт новых zoom/offset — в Rust.
-    callback viewer-zoom-at(float, float, bool, float, float);
+    // up — true (приблизить) / false (отдалить), vw/vh — размеры viewport (px),
+    // iw/ih — размеры КАРТИНКИ (px). Кламп «край в край» считаем по картинке
+    // (contain-fit): у узких/широких фото картинка меньше элемента vp*zoom.
+    // Расчёт новых zoom/offset — в Rust.
+    callback viewer-zoom-at(float, float, bool, float, float, float, float);
     // 4.3f — инкрементальный pan: добавить к offset дельту (dx, dy) (px) с клампом
-    // «край в край» по размерам viewport vw×vh. Кламп — в Rust (чистая функция).
-    callback viewer-pan-by(float, float, float, float);
+    // «край в край» по viewport vw×vh и картинке iw×ih. Кламп — в Rust.
+    callback viewer-pan-by(float, float, float, float, float, float);
     // 4.3e — сообщение об ошибке просмотра (битый файл). Пусто = скрыто.
     // Показывается только если все соседние файлы битые и скип невозможен.
     in-out property <string> viewer-error: "";
@@ -386,15 +393,18 @@ export component GalleryScreen inherits Window {
                 scroll-event(e) => {
                     if self.pressed {
                         // Зум к курсору: mx,my — позиция курсора относительно центра viewport (px),
-                        // vw,vh — размеры viewport (px) — нужны для клампа offset «край в край».
+                        // vw,vh — размеры viewport (px), iw,ih — размеры КАРТИНКИ (px) —
+                        // кламп считаем по картинке (contain-fit), а не по элементу.
                         let mx = (self.mouse-x - parent.width / 2) / 1px;
                         let my = (self.mouse-y - parent.height / 2) / 1px;
                         let vw = parent.width / 1px;
                         let vh = parent.height / 1px;
+                        let iw = root.viewer-img-w;
+                        let ih = root.viewer-img-h;
                         // Инверсия колеса (по просьбе заказчика): колесо ВНИЗ → приблизить,
                         // колесо ВВЕРХ → отдалить.
                         let up = e.delta-y > 0px;
-                        root.viewer-zoom-at(mx, my, up, vw, vh);
+                        root.viewer-zoom-at(mx, my, up, vw, vh, iw, ih);
                     } else {
                         // Листание (без зажатой ЛКМ).
                         if e.delta-y < 0px {
@@ -409,11 +419,11 @@ export component GalleryScreen inherits Window {
                     if e.kind == PointerEventKind.move {
                         root.mouse-moved();
                     }
-                    // 4.3f — pan: при нажатии ЛКМ (zoom>1) запоминаем ТЕКУЩУЮ позицию
-                    // мыши как prev; при каждом move с зажатой ЛКМ добавляем дельту
-                    // (mouse − prev) к offset и обновляем prev. Кламп «край в край»
-                    // выполняет Rust-колбэк viewer-pan-by (не даём утащить фото за экран).
-                    if e.kind == PointerEventKind.down && root.viewer-zoom > 1.0 {
+                    // 4.3g — фикс: prev-mouse запоминаем при ЛЮБОМ нажатии ЛКМ
+                    // (раньше — только при zoom>1; сценарий «зажал ЛКМ при zoom=1 →
+                    // зазумил → двинул мышь» давал дельту от устаревшего (0,0) →
+                    // фото прыгало к краю).
+                    if e.kind == PointerEventKind.down {
                         self.prev-mouse-x = self.mouse-x;
                         self.prev-mouse-y = self.mouse-y;
                     }
@@ -424,6 +434,8 @@ export component GalleryScreen inherits Window {
                             (self.mouse-y - self.prev-mouse-y) / 1px,
                             parent.width / 1px,
                             parent.height / 1px,
+                            root.viewer-img-w,
+                            root.viewer-img-h,
                         );
                         self.prev-mouse-x = self.mouse-x;
                         self.prev-mouse-y = self.mouse-y;

@@ -32,12 +32,30 @@ pub fn next_valid_index(next_index: i32, dir: i32, count: i32) -> i32 {
     }
 }
 
-/// 4.3f — кламп смещения фото «край в край» (как в классических просмотрщиках).
-/// Фото масштабируется на zoom и центрируется; максимальное смещение, при котором
-/// фото ещё ЗАКРЫВАЕТ viewport по этой оси: max = (vp * zoom − vp) / 2.
-/// При zoom=1 максимум 0 (вписанное фото не двигается). Чистая функция — легко тестировать.
-pub fn clamp_offset(offset: f32, zoom: f32, viewport: f32) -> f32 {
-    let max = ((viewport * zoom - viewport) / 2.0).max(0.0);
+/// 4.3g — кламп смещения фото «край в край» ПО КАРТИНКЕ (contain-fit).
+/// Элемент Image имеет размер vp*zoom, но картинка вписана (contain) и у
+/// узких/широких фото МЕНЬШЕ элемента. Кламп по элементу позволял утащить
+/// фото целиком за экран (чёрный экран). Считаем реальный размер картинки:
+/// scale = min(vp_w/iw, vp_h/ih) — во сколько раз вписана картинка при zoom=1;
+/// размер картинки на экране = iw * scale * zoom. Если картинка по оси меньше
+/// viewport — двигать нельзя (max=0), иначе max = (size − vp)/2.
+/// Чистая функция — легко тестировать.
+pub fn clamp_offset(
+    offset: f32,
+    zoom: f32,
+    viewport: f32,
+    img: f32,
+    other_img: f32,
+    other_vp: f32,
+) -> f32 {
+    // Размер картинки по этой оси при вписывании (contain) и текущем zoom.
+    let contain_scale = if img > 0.0 && other_img > 0.0 {
+        (viewport / img).min(other_vp / other_img)
+    } else {
+        1.0
+    };
+    let size = img * contain_scale * zoom;
+    let max = ((size - viewport) / 2.0).max(0.0);
     offset.clamp(-max, max)
 }
 
@@ -505,6 +523,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                             dst.b = chunk[2];
                                             dst.a = chunk[3];
                                         }
+                                        // 4.3g — размеры картинки для клампа «край в край».
+                                        w.set_viewer_img_w(w_px as f32);
+                                        w.set_viewer_img_h(h_px as f32);
                                         w.set_viewer_image(slint::Image::from_rgba8(buf));
                                         // 4.3e — успешный показ: гасим плашку ошибки.
                                         w.set_viewer_error("".into());
@@ -604,6 +625,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     path.display()
                 );
                 if let Some(w) = ui_weak.upgrade() {
+                    // 4.3g — размеры картинки для клампа «край в край» (contain-fit).
+                    // size() — физические px; в формуле contain_scale DPI сокращается.
+                    let sz = img.size();
+                    w.set_viewer_img_w(sz.width as f32);
+                    w.set_viewer_img_h(sz.height as f32);
                     w.set_viewer_image(img);
                     w.set_viewer_error("".into()); // 4.3e — успешный показ, гасим плашку.
                 }
@@ -639,6 +665,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         }
                     }
                     ic.insert(path.clone(), img.clone());
+                    // 4.3g — размеры картинки для клампа «край в край».
+                    w.set_viewer_img_w(w_px as f32);
+                    w.set_viewer_img_h(h_px as f32);
                     w.set_viewer_image(img);
                     w.set_viewer_error("".into()); // 4.3e — успешный показ, гасим плашку.
                 }
@@ -1012,7 +1041,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let ui_weak = ui.as_weak();
         let generation = viewer_generation.clone();
         let load_tx = load_tx.clone();
-        ui.on_request_skip(move |next_index, dir, skip_depth| {
+        // 4.3g — dir больше не используется здесь (воркер уже прибавил его к
+        // next_index); параметр остаётся в сигнатуре колбэка, помечаем _dir.
+        ui.on_request_skip(move |next_index, _dir, skip_depth| {
             let count = lock_or_recover(&photos).len() as i32;
             // Защита от зацикливания: перепробовали больше, чем файлов в списке.
             if skip_depth > count || count == 0 {
@@ -1025,8 +1056,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 }
                 return;
             }
-            // Клампим индекс по границам списка (без зацикливания — стоп на краю).
-            let idx = next_valid_index(next_index, dir, count);
+            // 4.3g — фикс «скипа через один»: воркер уже прислал ЦЕЛЕВОЙ next_index
+            // (= битый index + dir), поэтому здесь НЕ прибавляем dir повторно —
+            // только проверяем границы самого next_index. Раньше next_valid_index
+            // делал next_index + dir ещё раз → шаг 2 вместо 1 → перепрыгивались
+            // годные файлы (в логе: 742→744→746 при серии битых).
+            let idx = next_index;
             if idx < 0 || idx >= count {
                 // Достигли края и дальше годных нет — показываем плашку.
                 log::error!("request-skip: край списка (idx={idx}, count={count}) — плашка");
@@ -1095,7 +1130,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         const ZOOM_STEP: f32 = 1.2; // шаг масштаба на одно деление колеса
         const ZOOM_MIN: f32 = 1.0; // не меньше вписанного
         const ZOOM_MAX: f32 = 10.0; // предел приближения
-        ui.on_viewer_zoom_at(move |mx, my, up, vw, vh| {
+        ui.on_viewer_zoom_at(move |mx, my, up, vw, vh, iw, ih| {
             if let Some(w) = ui_weak.upgrade() {
                 let zoom = w.get_viewer_zoom();
                 let new_zoom = if up {
@@ -1112,9 +1147,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 let k = new_zoom / zoom;
                 let new_ox = mx - (mx - ox) * k;
                 let new_oy = my - (my - oy) * k;
-                // 4.3f — кламп «край в край»: фото всегда закрывает viewport.
-                let new_ox = clamp_offset(new_ox, new_zoom, vw);
-                let new_oy = clamp_offset(new_oy, new_zoom, vh);
+                // 4.3g — кламп «край в край» ПО КАРТИНКЕ (contain-fit):
+                // у узких/широких фото картинка меньше элемента vp*zoom.
+                let new_ox = clamp_offset(new_ox, new_zoom, vw, iw, ih, vh);
+                let new_oy = clamp_offset(new_oy, new_zoom, vh, ih, iw, vw);
                 // При возврате к zoom=1 центрируем (offset=0), чтобы фото встало ровно.
                 if (new_zoom - 1.0).abs() < 1e-6 {
                     w.set_viewer_offset_x(0.0);
@@ -1136,11 +1172,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // с зумом: pan не опирается на замороженный стартовый offset.
     {
         let ui_weak = ui.as_weak();
-        ui.on_viewer_pan_by(move |dx, dy, vw, vh| {
+        ui.on_viewer_pan_by(move |dx, dy, vw, vh, iw, ih| {
             if let Some(w) = ui_weak.upgrade() {
                 let zoom = w.get_viewer_zoom();
-                let new_ox = clamp_offset(w.get_viewer_offset_x() + dx, zoom, vw);
-                let new_oy = clamp_offset(w.get_viewer_offset_y() + dy, zoom, vh);
+                // 4.3g — кламп по КАРТИНКЕ (contain-fit), не по элементу.
+                let new_ox = clamp_offset(w.get_viewer_offset_x() + dx, zoom, vw, iw, ih, vh);
+                let new_oy = clamp_offset(w.get_viewer_offset_y() + dy, zoom, vh, ih, iw, vw);
                 w.set_viewer_offset_x(new_ox);
                 w.set_viewer_offset_y(new_oy);
             }
