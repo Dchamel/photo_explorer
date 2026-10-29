@@ -47,6 +47,9 @@ pub struct Session {
 ///
 /// Стартовый экран «Проекты / Недавние» рисуется из лёгкого index.json —
 /// без чтения полных сессий (списки из 8000 файлов не нужны, пока не кликнули).
+/// 4.7g — cover_path (первое фото, для обложки карточки) и photo_count
+/// (счётчик в подписи карточки). serde(default): старые index.json без этих
+/// полей продолжают читаться (обложка — пустая, счётчик — 0).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionSummary {
     pub id: String,
@@ -54,6 +57,12 @@ pub struct SessionSummary {
     pub folder: PathBuf,
     pub last_opened: u64,
     pub is_project: bool,
+    /// Путь к первому фото сессии (обложка карточки на стартовом экране).
+    #[serde(default)]
+    pub cover_path: Option<PathBuf>,
+    /// Сколько фото в сессии (подпись карточки).
+    #[serde(default)]
+    pub photo_count: u64,
 }
 
 impl From<&Session> for SessionSummary {
@@ -64,6 +73,8 @@ impl From<&Session> for SessionSummary {
             folder: s.folder.clone(),
             last_opened: s.last_opened,
             is_project: s.is_project,
+            cover_path: s.photos.first().map(|p| p.path.clone()),
+            photo_count: s.photos.len() as u64,
         }
     }
 }

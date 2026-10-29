@@ -388,8 +388,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
     }
 
-    /// 4.7 — обновляет список сессий на стартовом экране из хранилища.
-    fn refresh_session_list(store: &JsonSessionStore, ui_weak: &slint::Weak<GalleryScreen>) {
+    /// 4.7g — обновляет список сессий на стартовом экране из хранилища.
+    /// Карточки получают обложку (миниатюра первого фото из дискового кэша —
+    /// мгновенно, без декодирования оригиналов) и счётчик фото.
+    fn refresh_session_list(
+        store: &JsonSessionStore,
+        thumbs: &Arc<FileSystemThumbnailProvider>,
+        ui_weak: &slint::Weak<GalleryScreen>,
+    ) {
         let summaries: Vec<SessionSummary> = match store.summaries() {
             Ok(list) => list,
             Err(e) => {
@@ -400,12 +406,45 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         if let Some(w) = ui_weak.upgrade() {
             let items: Vec<SessionItem> = summaries
                 .into_iter()
-                .map(|s| SessionItem {
-                    id: s.id.into(),
-                    name: s.name.into(),
-                    folder: s.folder.to_string_lossy().to_string().into(),
-                    opened_label: opened_label(s.last_opened).into(),
-                    is_project: s.is_project,
+                .map(|s| {
+                    // Обложка: миниатюра первого фото (кэш на диске — быстро).
+                    let cover = s.cover_path.as_ref().map(|p| {
+                        let photo = Photo {
+                            path: p.clone(),
+                            file_name: p
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default(),
+                            size_bytes: 0,
+                            modified: 0,
+                        };
+                        match thumbs.thumbnail(&photo) {
+                            Ok(t) => {
+                                let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
+                                    t.width, t.height,
+                                );
+                                let pixels = buf.make_mut_slice();
+                                for (dst, chunk) in pixels.iter_mut().zip(t.data.as_chunks::<4>().0)
+                                {
+                                    dst.r = chunk[0];
+                                    dst.g = chunk[1];
+                                    dst.b = chunk[2];
+                                    dst.a = chunk[3];
+                                }
+                                slint::Image::from_rgba8(buf)
+                            }
+                            Err(_) => slint::Image::default(),
+                        }
+                    });
+                    SessionItem {
+                        id: s.id.into(),
+                        name: s.name.into(),
+                        folder: s.folder.to_string_lossy().to_string().into(),
+                        opened_label: opened_label(s.last_opened).into(),
+                        is_project: s.is_project,
+                        photo_count: s.photo_count as i32,
+                        cover: cover.unwrap_or_default(),
+                    }
                 })
                 .collect();
             w.set_session_list(slint::ModelRc::new(slint::VecModel::from(items)));
@@ -445,7 +484,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         .join("photo_explorer")
         .join("sessions");
     let store = Arc::new(JsonSessionStore::new(sessions_dir));
-    // Показываем экран «Старт» при входе (если есть сохранённые сессии).
+    // Показываем экран «Проекты» при входе (если есть сохранённые сессии).
     {
         let ui_weak = ui.as_weak();
         let has_any = store.summaries().map(|l| !l.is_empty()).unwrap_or(false);
@@ -454,7 +493,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 w.set_show_start(true);
             }
         }
-        refresh_session_list(&store, &ui_weak);
+        refresh_session_list(&store, &thumbs, &ui_weak);
     }
 
     // LRU-кэш полных изображений (сырой RGBA, Send) — для воркера.
@@ -871,6 +910,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             let ui_weak = ui_weak.clone();
             let photos_for_store = photos.clone();
             let store_for_save = store.clone();
+            let thumbs_for_refresh = thumbs.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(w) = ui_weak.upgrade() {
                     w.set_scanning(false);
@@ -926,7 +966,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             if let Err(e) = store_for_save.save(&session) {
                                 log::error!("sessions: не удалось сохранить сессию: {e}");
                             }
-                            refresh_session_list(&store_for_save, &ui_weak);
+                            // 4.7g — имя нового проекта сразу в верхнюю панель.
+                            if let Some(w) = ui_weak.upgrade() {
+                                w.set_current_session_id(session.id.clone().into());
+                                w.set_current_project_name(session.name.clone().into());
+                            }
+                            refresh_session_list(&store_for_save, &thumbs_for_refresh, &ui_weak);
                             let items: Vec<ThumbItem> = thumbs
                                 .into_iter()
                                 .map(|t| {
@@ -1079,7 +1124,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             if let Err(e) = store.save(&updated) {
                 log::error!("sessions: не удалось обновить last_opened: {e}");
             }
-            refresh_session_list(&store, &ui_weak);
+            // 4.7g — фиксируем открытый проект в верхней панели.
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_current_session_id(updated.id.clone().into());
+                w.set_current_project_name(updated.name.clone().into());
+            }
+            refresh_session_list(&store, &thumbs, &ui_weak);
 
             // 4.7d — ФОНОВАЯ проверка актуальности: сканируем папку заново
             // (метаданные, быстро) и сверяем fingerprint. Показ уже на экране —
@@ -1197,6 +1247,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // 4.7e — подтвердить переименование: имя из диалога, сессия = проект.
     {
         let store = store.clone();
+        let thumbs = thumbs.clone();
         let ui_weak = ui.as_weak();
         ui.on_rename_confirm(move || {
             let (id, name) = {
@@ -1220,8 +1271,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
             if let Some(w) = ui_weak.upgrade() {
                 w.set_rename_visible(false);
+                // 4.7g — если переименовали ОТКРЫТЫЙ проект, обновляем панель.
+                if w.get_current_session_id() == id {
+                    w.set_current_project_name(session.name.clone().into());
+                }
             }
-            refresh_session_list(&store, &ui_weak);
+            refresh_session_list(&store, &thumbs, &ui_weak);
         });
     }
     // 4.7e — отменить переименование.
@@ -1236,12 +1291,40 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // 4.7e — удалить сессию.
     {
         let store = store.clone();
+        let thumbs = thumbs.clone();
         let ui_weak = ui.as_weak();
         ui.on_delete_session(move |id| {
             if let Err(e) = store.delete(&id) {
                 log::error!("sessions: delete — не удалось: {e}");
             }
-            refresh_session_list(&store, &ui_weak);
+            refresh_session_list(&store, &thumbs, &ui_weak);
+        });
+    }
+    // 4.7g — «← Проекты»: вернуться на стартовый экран из открытого проекта.
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_show_projects(move || {
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_show_start(true);
+            }
+        });
+    }
+    // 4.7g — открыть панель настроек проекта (каркас под 4.4).
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_open_settings(move || {
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_settings_visible(true);
+            }
+        });
+    }
+    // 4.7g — закрыть панель настроек.
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_close_settings(move || {
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_settings_visible(false);
+            }
         });
     }
 
