@@ -375,11 +375,42 @@ pub fn run_lock_screen(controller: Arc<LockController>) -> Result<(), slint::Pla
 
 /// Запускает главный экран галереи.
 pub fn run_gallery() -> Result<(), slint::PlatformError> {
-    use crate::core::models::{Photo, ScanMode};
-    use crate::core::ports::{PhotoScanner, ThumbnailProvider};
+    use crate::core::models::{Photo, ScanMode, Session, SessionSummary};
+    use crate::core::ports::{PhotoScanner, SessionStore, ThumbnailProvider};
     use crate::scanner::FileSystemScanner;
+    use crate::session::{fingerprint_of, JsonSessionStore};
     use crate::thumbnails::FileSystemThumbnailProvider;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// 4.7 — подпись даты открытия сессии для человека («2026-10-29 10:30»).
+    fn opened_label(secs: u64) -> String {
+        let (y, mo, d, h, mi, _s) = crate::logging::epoch_to_local(secs as i64);
+        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
+    }
+
+    /// 4.7 — обновляет список сессий на стартовом экране из хранилища.
+    fn refresh_session_list(store: &JsonSessionStore, ui_weak: &slint::Weak<GalleryScreen>) {
+        let summaries: Vec<SessionSummary> = match store.summaries() {
+            Ok(list) => list,
+            Err(e) => {
+                log::error!("sessions: не удалось прочитать index.json: {e}");
+                return;
+            }
+        };
+        if let Some(w) = ui_weak.upgrade() {
+            let items: Vec<SessionItem> = summaries
+                .into_iter()
+                .map(|s| SessionItem {
+                    id: s.id.into(),
+                    name: s.name.into(),
+                    folder: s.folder.to_string_lossy().to_string().into(),
+                    opened_label: opened_label(s.last_opened).into(),
+                    is_project: s.is_project,
+                })
+                .collect();
+            w.set_session_list(slint::ModelRc::new(slint::VecModel::from(items)));
+        }
+    }
 
     /// LRU-кэш полных изображений в памяти: путь -> (RGBA-данные, ширина, высота).
     type ViewerCache = lru::LruCache<std::path::PathBuf, (Vec<u8>, u32, u32)>;
@@ -406,6 +437,25 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
 
     // Список Photo (с путями к оригиналам) — нужен для viewer. Arc<Mutex> — доступ из потоков.
     let photos: Arc<Mutex<Vec<Photo>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // 4.7 — сессионное хранилище: %LOCALAPPDATA%/photo_explorer/sessions.
+    // Один раз отсканировали папку — при повторном входе открываем мгновенно.
+    let sessions_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("photo_explorer")
+        .join("sessions");
+    let store = Arc::new(JsonSessionStore::new(sessions_dir));
+    // Показываем экран «Старт» при входе (если есть сохранённые сессии).
+    {
+        let ui_weak = ui.as_weak();
+        let has_any = store.summaries().map(|l| !l.is_empty()).unwrap_or(false);
+        if has_any {
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_show_start(true);
+            }
+        }
+        refresh_session_list(&store, &ui_weak);
+    }
 
     // LRU-кэш полных изображений (сырой RGBA, Send) — для воркера.
     let viewer_cache: Arc<Mutex<ViewerCache>> =
@@ -772,9 +822,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // Это убирает std::thread::spawn на каждую задачу — теперь всегда 1 поток.
 
     /// Запускает выбор папки + скан + генерацию миниатюр в фоновом потоке.
+    /// 4.7 — после успешного скана сохраняет сессию (recent) в хранилище:
+    /// при следующем входе папка откроется мгновенно, без пересканирования.
     fn scan_and_show(
         scanner: Arc<FileSystemScanner>,
         thumbs: Arc<FileSystemThumbnailProvider>,
+        store: Arc<JsonSessionStore>,
         ui_weak: slint::Weak<GalleryScreen>,
         photos: Arc<Mutex<Vec<Photo>>>,
         recursive: bool,
@@ -783,39 +836,97 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         if let Some(w) = ui_weak.upgrade() {
             w.set_scanning(true);
             w.set_error_text("".into());
+            w.set_show_start(false); // выбрали папку — уходим с экрана «Старт»
         }
         std::thread::spawn(move || {
             let folder = rfd::FileDialog::new()
                 .set_title("Выберите папку с фотографиями")
                 .pick_folder();
 
-            let result: Result<(Vec<Photo>, Vec<crate::core::models::Thumbnail>), String> =
-                (|| {
-                    let folder = folder.ok_or("Папка не выбрана")?;
-                    log::info!("scan_and_show: выбрана папка «{}»", folder.display());
-                    let mode = if recursive {
-                        ScanMode::FolderRecursive(folder)
-                    } else {
-                        ScanMode::SingleFolder(folder)
-                    };
-                    let photos = scanner
-                        .scan(&mode)
-                        .map_err(|e| format!("Ошибка скана: {e}"))?;
-                    let thumb_results = thumbs.thumbnails(&photos);
-                    let out: Vec<_> = thumb_results.into_iter().flatten().collect();
-                    Ok((photos, out))
-                })();
+            let result: Result<
+                (
+                    Vec<Photo>,
+                    Vec<crate::core::models::Thumbnail>,
+                    std::path::PathBuf,
+                    String,
+                ),
+                String,
+            > = (|| {
+                let folder = folder.ok_or("Папка не выбрана")?;
+                log::info!("scan_and_show: выбрана папка «{}»", folder.display());
+                let mode_str = if recursive { "recursive" } else { "flat" };
+                let mode = if recursive {
+                    ScanMode::FolderRecursive(folder.clone())
+                } else {
+                    ScanMode::SingleFolder(folder.clone())
+                };
+                let photos = scanner
+                    .scan(&mode)
+                    .map_err(|e| format!("Ошибка скана: {e}"))?;
+                let thumb_results = thumbs.thumbnails(&photos);
+                let out: Vec<_> = thumb_results.into_iter().flatten().collect();
+                Ok((photos, out, folder, mode_str.to_string()))
+            })();
 
             let ui_weak = ui_weak.clone();
             let photos_for_store = photos.clone();
+            let store_for_save = store.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(w) = ui_weak.upgrade() {
                     w.set_scanning(false);
                     match result {
-                        Ok((scanned_photos, thumbs)) => {
+                        Ok((scanned_photos, thumbs, folder, mode_str)) => {
                             let count = thumbs.len();
                             // Сохраняем пути оригиналов для viewer.
-                            *lock_or_recover(&photos_for_store) = scanned_photos;
+                            *lock_or_recover(&photos_for_store) = scanned_photos.clone();
+                            // 4.7 — сохраняем сессию (upsert по папке+режиму):
+                            // уже существующий проект сохраняет имя и флаг.
+                            let existing = store_for_save
+                                .find_by_folder(&folder, &mode_str)
+                                .ok()
+                                .flatten();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let session = match &existing {
+                                Some(prev) => Session {
+                                    id: prev.id.clone(),
+                                    name: prev.name.clone(),
+                                    is_project: prev.is_project,
+                                    fingerprint: fingerprint_of(&scanned_photos),
+                                    photos: scanned_photos.clone(),
+                                    last_opened: now,
+                                    folder: folder.clone(),
+                                    mode: mode_str.clone(),
+                                },
+                                None => {
+                                    let name = folder
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| folder.to_string_lossy().to_string());
+                                    Session {
+                                        // id = хеш от (путь+режим) — стабилен между запусками.
+                                        id: fingerprint_of(&[Photo {
+                                            path: folder.clone(),
+                                            file_name: name.clone(),
+                                            size_bytes: 0,
+                                            modified: 0,
+                                        }]),
+                                        name,
+                                        folder: folder.clone(),
+                                        mode: mode_str.clone(),
+                                        fingerprint: fingerprint_of(&scanned_photos),
+                                        photos: scanned_photos.clone(),
+                                        last_opened: now,
+                                        is_project: false,
+                                    }
+                                }
+                            };
+                            if let Err(e) = store_for_save.save(&session) {
+                                log::error!("sessions: не удалось сохранить сессию: {e}");
+                            }
+                            refresh_session_list(&store_for_save, &ui_weak);
                             let items: Vec<ThumbItem> = thumbs
                                 .into_iter()
                                 .map(|t| {
@@ -866,12 +977,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     {
         let scanner = scanner.clone();
         let thumbs = thumbs.clone();
+        let store = store.clone();
         let ui_weak = ui.as_weak();
         let photos = photos.clone();
         ui.on_pick_folder_flat(move || {
             scan_and_show(
                 scanner.clone(),
                 thumbs.clone(),
+                store.clone(),
                 ui_weak.clone(),
                 photos.clone(),
                 false,
@@ -882,16 +995,253 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     {
         let scanner = scanner.clone();
         let thumbs = thumbs.clone();
+        let store = store.clone();
         let ui_weak = ui.as_weak();
         let photos = photos.clone();
         ui.on_pick_folder_recursive(move || {
             scan_and_show(
                 scanner.clone(),
                 thumbs.clone(),
+                store.clone(),
                 ui_weak.clone(),
                 photos.clone(),
                 true,
             );
+        });
+    }
+    // 4.7 — открыть сессию по id (мгновенно, из хранилища).
+    // Показ мгновенно из кэша; затем ФОНОМ проверяем fingerprint (4.7d):
+    // совпал — ничего не делаем; изменился — инкрементальный досскан разницы.
+    {
+        let store = store.clone();
+        let thumbs = thumbs.clone();
+        let scanner = scanner.clone();
+        let ui_weak = ui.as_weak();
+        let photos = photos.clone();
+        ui.on_open_session(move |id| {
+            log::info!("sessions: открыть сессию id={id}");
+            let session = match store.load(&id) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("sessions: не удалось загрузить: {e}");
+                    if let Some(w) = ui_weak.upgrade() {
+                        w.set_error_text(format!("Сессия не открылась: {e}").into());
+                    }
+                    return;
+                }
+            };
+            // Мгновенный показ: миниатюры из кэша (генерация пропущена —
+            // они уже на диске с прошлого открытия).
+            let session_photos = session.photos.clone();
+            let n = session_photos.len();
+            let thumb_results = thumbs.thumbnails(&session_photos);
+            let out: Vec<_> = thumb_results.into_iter().flatten().collect();
+            let count = out.len();
+            *lock_or_recover(&photos) = session_photos;
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_show_start(false);
+                let items: Vec<ThumbItem> = out
+                    .into_iter()
+                    .map(|t| {
+                        let mut buf =
+                            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(t.width, t.height);
+                        let pixels = buf.make_mut_slice();
+                        for (dst, chunk) in pixels.iter_mut().zip(t.data.as_chunks::<4>().0) {
+                            dst.r = chunk[0];
+                            dst.g = chunk[1];
+                            dst.b = chunk[2];
+                            dst.a = chunk[3];
+                        }
+                        ThumbItem {
+                            file_name: t
+                                .source_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default()
+                                .into(),
+                            source_path: t.source_path.to_string_lossy().to_string().into(),
+                            image: slint::Image::from_rgba8(buf),
+                        }
+                    })
+                    .collect();
+                w.set_thumbnails(slint::ModelRc::new(slint::VecModel::from(items)));
+                w.set_status_text(
+                    format!("Проект «{}»: фото {count} (из {n})", session.name).into(),
+                );
+            }
+            // Обновляем last_opened (recent поднимается вверх списка).
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut updated = session.clone();
+            updated.last_opened = now;
+            if let Err(e) = store.save(&updated) {
+                log::error!("sessions: не удалось обновить last_opened: {e}");
+            }
+            refresh_session_list(&store, &ui_weak);
+
+            // 4.7d — ФОНОВАЯ проверка актуальности: сканируем папку заново
+            // (метаданные, быстро) и сверяем fingerprint. Показ уже на экране —
+            // пользователь не ждёт. Совпал → ничего; изменился → досскан разницы.
+            let store_bg = store.clone();
+            let thumbs_bg = thumbs.clone();
+            let scanner_bg = scanner.clone();
+            let ui_weak_bg = ui_weak.clone();
+            let photos_bg = photos.clone();
+            let session_bg = updated.clone();
+            std::thread::spawn(move || {
+                let mode = if session_bg.mode == "recursive" {
+                    ScanMode::FolderRecursive(session_bg.folder.clone())
+                } else {
+                    ScanMode::SingleFolder(session_bg.folder.clone())
+                };
+                let fresh = match scanner_bg.scan(&mode) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::warn!("sessions: фоновая проверка — скан не удался: {e}");
+                        return;
+                    }
+                };
+                let fresh_fp = fingerprint_of(&fresh);
+                if fresh_fp == session_bg.fingerprint {
+                    log::info!("sessions: папка не изменилась (fingerprint совпал) — кэш актуален");
+                    return;
+                }
+                // Папка изменилась: инкрементально — только новые/изменённые.
+                // Миниатюры разницы генерируются (и пишутся в дисковый кэш)
+                // вызовом thumbnails(); для показа ниже берём полный список.
+                let changed = crate::session::diff_photos(&session_bg.photos, &fresh);
+                log::info!(
+                    "sessions: папка изменилась — досскан {} из {} фото",
+                    changed.len(),
+                    fresh.len()
+                );
+                let _ = thumbs_bg.thumbnails(&changed);
+                // Обновляем сессию в хранилище (новый список + fingerprint).
+                let mut updated_session = session_bg.clone();
+                updated_session.photos = fresh.clone();
+                updated_session.fingerprint = fresh_fp;
+                if let Err(e) = store_bg.save(&updated_session) {
+                    log::error!("sessions: не удалось обновить сессию: {e}");
+                }
+                // Показываем ПОЛНЫЙ новый список (старые миниатюры из кэша +
+                // свежие для новых) — не блокируя UI (уже показан старый).
+                let all_thumbs = thumbs_bg.thumbnails(&fresh);
+                let all_out: Vec<_> = all_thumbs.into_iter().flatten().collect();
+                let ui_weak = ui_weak_bg.clone();
+                let photos_store = photos_bg.clone();
+                let count = all_out.len();
+                let name = updated_session.name.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    *lock_or_recover(&photos_store) = fresh;
+                    if let Some(w) = ui_weak.upgrade() {
+                        let items: Vec<ThumbItem> = all_out
+                            .into_iter()
+                            .map(|t| {
+                                let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
+                                    t.width, t.height,
+                                );
+                                let pixels = buf.make_mut_slice();
+                                for (dst, chunk) in pixels.iter_mut().zip(t.data.as_chunks::<4>().0)
+                                {
+                                    dst.r = chunk[0];
+                                    dst.g = chunk[1];
+                                    dst.b = chunk[2];
+                                    dst.a = chunk[3];
+                                }
+                                ThumbItem {
+                                    file_name: t
+                                        .source_path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default()
+                                        .into(),
+                                    source_path: t.source_path.to_string_lossy().to_string().into(),
+                                    image: slint::Image::from_rgba8(buf),
+                                }
+                            })
+                            .collect();
+                        w.set_thumbnails(slint::ModelRc::new(slint::VecModel::from(items)));
+                        w.set_status_text(
+                            format!("Проект «{name}»: обновлено, фото {count}").into(),
+                        );
+                    }
+                });
+            });
+        });
+    }
+    // 4.7 — закрыть экран «Старт».
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_close_start(move || {
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_show_start(false);
+            }
+        });
+    }
+    // 4.7e — переименовать проект: открываем Slint-диалог (id запоминаем).
+    {
+        let store = store.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_rename_session(move |id| {
+            // Текущее имя берём из хранилища (надёжнее, чем из UI-модели).
+            let current_name = store.load(&id).map(|s| s.name).unwrap_or_default();
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_rename_text(current_name.into());
+                w.set_rename_id(id);
+                w.set_rename_visible(true);
+            }
+        });
+    }
+    // 4.7e — подтвердить переименование: имя из диалога, сессия = проект.
+    {
+        let store = store.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_rename_confirm(move || {
+            let (id, name) = {
+                let Some(w) = ui_weak.upgrade() else { return };
+                (w.get_rename_id(), w.get_rename_text())
+            };
+            if name.trim().is_empty() {
+                return; // пустое имя не сохраняем
+            }
+            let mut session = match store.load(&id) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("sessions: rename — не найдена: {e}");
+                    return;
+                }
+            };
+            session.name = name.trim().to_string();
+            session.is_project = true; // переименование = стал именованным проектом
+            if let Err(e) = store.save(&session) {
+                log::error!("sessions: rename — не удалось сохранить: {e}");
+            }
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_rename_visible(false);
+            }
+            refresh_session_list(&store, &ui_weak);
+        });
+    }
+    // 4.7e — отменить переименование.
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_rename_cancel(move || {
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_rename_visible(false);
+            }
+        });
+    }
+    // 4.7e — удалить сессию.
+    {
+        let store = store.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_delete_session(move |id| {
+            if let Err(e) = store.delete(&id) {
+                log::error!("sessions: delete — не удалось: {e}");
+            }
+            refresh_session_list(&store, &ui_weak);
         });
     }
 
