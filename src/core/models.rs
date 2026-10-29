@@ -5,7 +5,9 @@ use std::path::PathBuf;
 /// Фотография (минимум для MVP).
 ///
 /// Расширяемость (EXIF, дата съёмки, геолокация) — в бэклоге.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 4.7 — `modified` (unix-секунды) нужен для fingerprint папки: сравниваем
+/// метаданные без чтения тел файлов. Serde — для сериализации сессии в JSON.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Photo {
     /// Абсолютный путь к файлу изображения.
     pub path: PathBuf,
@@ -13,6 +15,57 @@ pub struct Photo {
     pub file_name: String,
     /// Размер файла в байтах.
     pub size_bytes: u64,
+    /// Время последней модификации файла (unix-секунды).
+    pub modified: u64,
+}
+
+/// Сессия просмотра папки (4.7 «Проекты и недавние»).
+///
+/// Один раз отсканировали папку — сохранили список фото; при повторном входе
+/// открываем мгновенно из JSON, если папка не менялась (fingerprint совпал).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Session {
+    /// Уникальный id сессии (uuid-подобная строка).
+    pub id: String,
+    /// Имя проекта (для именованных проектов; у recent — имя папки).
+    pub name: String,
+    /// Путь к отсканированной папке.
+    pub folder: PathBuf,
+    /// Режим скана (flat / recursive) — строка "flat" | "recursive".
+    pub mode: String,
+    /// Отпечаток папки на момент сохранения (хеш метаданных).
+    pub fingerprint: String,
+    /// Список фото на момент сохранения.
+    pub photos: Vec<Photo>,
+    /// Unix-время последнего открытия сессии.
+    pub last_opened: u64,
+    /// Является ли именованным проектом (true) или недавним (false).
+    pub is_project: bool,
+}
+
+/// Краткая запись о сессии для стартового экрана (без списка файлов).
+///
+/// Стартовый экран «Проекты / Недавние» рисуется из лёгкого index.json —
+/// без чтения полных сессий (списки из 8000 файлов не нужны, пока не кликнули).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub name: String,
+    pub folder: PathBuf,
+    pub last_opened: u64,
+    pub is_project: bool,
+}
+
+impl From<&Session> for SessionSummary {
+    fn from(s: &Session) -> Self {
+        Self {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            folder: s.folder.clone(),
+            last_opened: s.last_opened,
+            is_project: s.is_project,
+        }
+    }
 }
 
 /// Режим сканирования папок.

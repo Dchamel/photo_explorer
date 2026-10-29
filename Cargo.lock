@@ -3816,6 +3816,8 @@ dependencies = [
  "raw-window-handle",
  "rayon",
  "rfd",
+ "serde",
+ "serde_json",
  "slint",
  "slint-build",
  "thiserror 1.0.69",

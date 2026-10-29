@@ -3,11 +3,11 @@
 //! Порт описывает ЧТО нужно уметь, но не КАК.
 //! Реализация (КАК) находится в адаптерах: `scanner`, `thumbnails`, `security`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use super::models::{Photo, ScanMode, Thumbnail};
+use super::models::{Photo, ScanMode, Session, SessionSummary, Thumbnail};
 
 /// Ошибки, возникающие при сканировании.
 #[derive(Debug, Error)]
@@ -122,4 +122,41 @@ pub trait SessionLockWatcher {
     fn watch<F>(&self, on_lock: F, on_unlock: F) -> Result<(), SecurityError>
     where
         F: Fn() + Send + 'static;
+}
+
+/// Ошибки сессионного хранилища (4.7 «Проекты и недавние»).
+#[derive(Debug, Error)]
+pub enum SessionError {
+    /// Ошибка ввода-вывода (чтение/запись JSON хранилища).
+    #[error("ошибка ввода-вывода сессии: {0}")]
+    IoError(String),
+    /// JSON повреждён / не соответствует формату.
+    #[error("сессия повреждена (невалидный JSON): {0}")]
+    Corrupted(String),
+    /// Сессия с таким id не найдена.
+    #[error("сессия не найдена: {0}")]
+    NotFound(String),
+}
+
+/// Порт сессионного хранилища (4.7 «Проекты и недавние»).
+///
+/// Хранит результаты сканов папок: один раз отсканировали — при повторном
+/// входе открываем мгновенно из хранилища, если папка не менялась (fingerprint).
+///
+/// Реализация — [`crate::session::JsonSessionStore`] (JSON-файлы на диске).
+pub trait SessionStore {
+    /// Лёгкий список всех сессий (для стартового экрана, без списков файлов).
+    fn summaries(&self) -> Result<Vec<SessionSummary>, SessionError>;
+
+    /// Полная сессия по id (список фото для мгновенного открытия).
+    fn load(&self, id: &str) -> Result<Session, SessionError>;
+
+    /// Сохранить/обновить сессию (upsert). Также обновляет summaries.
+    fn save(&self, session: &Session) -> Result<(), SessionError>;
+
+    /// Удалить сессию по id.
+    fn delete(&self, id: &str) -> Result<(), SessionError>;
+
+    /// Найти сессию по пути папки и режиму скана (для «открывали раньше?»).
+    fn find_by_folder(&self, folder: &Path, mode: &str) -> Result<Option<Session>, SessionError>;
 }

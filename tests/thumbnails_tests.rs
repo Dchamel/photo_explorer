@@ -34,10 +34,17 @@ fn make_png(path: &Path, width: u32, height: u32) {
 
 fn make_photo(path: &Path) -> Photo {
     let metadata = fs::metadata(path).expect("файл должен существовать");
+    let modified = metadata
+        .modified()
+        .expect("mtime должен быть доступен")
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     Photo {
         path: path.to_path_buf(),
         file_name: path.file_name().unwrap().to_string_lossy().into_owned(),
         size_bytes: metadata.len(),
+        modified,
     }
 }
 
@@ -142,6 +149,7 @@ fn returns_error_for_nonexistent_source() {
         path: dir.join("ghost.png"),
         file_name: "ghost.png".to_string(),
         size_bytes: 0,
+        modified: 0,
     };
 
     let provider = FileSystemThumbnailProvider::new(cache_dir, 100);

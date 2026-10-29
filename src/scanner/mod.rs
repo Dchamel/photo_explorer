@@ -29,16 +29,24 @@ fn is_supported_image(path: &Path) -> bool {
 /// Превращает путь к файлу в доменную модель [`Photo`].
 ///
 /// Возвращает `None`, если файл не существует или метаданные недоступны.
+/// 4.7 — заполняем `modified` (unix-секунды) для fingerprint папки.
 fn photo_from_path(path: &Path) -> Option<Photo> {
     if !path.is_file() {
         return None;
     }
     let metadata = std::fs::metadata(path).ok()?;
     let file_name = path.file_name()?.to_string_lossy().into_owned();
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     Some(Photo {
         path: path.to_path_buf(),
         file_name,
         size_bytes: metadata.len(),
+        modified,
     })
 }
 

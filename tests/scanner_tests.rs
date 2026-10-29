@@ -132,6 +132,7 @@ fn photo_model_is_clone_and_eq() {
         path: PathBuf::from("C:/test.jpg"),
         file_name: "test.jpg".to_string(),
         size_bytes: 100,
+        modified: 1700000000,
     };
     let p2 = p1.clone();
     assert_eq!(p1, p2);

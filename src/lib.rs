@@ -7,5 +7,7 @@ pub mod core;
 pub mod logging;
 pub mod scanner;
 pub mod security;
+// 4.7 — сессионное хранилище (проекты/недавние)
+pub mod session;
 pub mod thumbnails;
 pub mod ui;
