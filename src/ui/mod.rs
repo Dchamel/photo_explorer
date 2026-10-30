@@ -595,6 +595,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // Это убирает «мигание» чужими фото и лавину потоков при быстром листании.
     let viewer_generation: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
+    // 4.4b — поколение ГАЛЕРЕИ: инкремент при открытии проекта/скане папки.
+    // Фоновые батчи миниатюр сверяют его перед добавлением в модель — если
+    // пользователь открыл другой проект, батчи старого отменяются (не будут
+    // подмешиваться в чужую сетку).
+    let gallery_gen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
     // 4.3e — направление последнего листания (+1 вперёд / −1 назад).
     // Нужно для авто-скипа битого файла: скип идём в ту же сторону, куда листал
     // пользователь. AtomicI32 — доступ из воркера и UI без блокировок.
@@ -996,6 +1002,106 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // воркер-поток (цикл приёма LoadTask) и enqueue_preload (шлёт в канал).
     // Это убирает std::thread::spawn на каждую задачу — теперь всегда 1 поток.
 
+    /// 4.4b — строит карточку галереи из миниатюры (RGBA → SharedPixelBuffer
+    /// → slint::Image). Раньше этот код копировался в 3 местах (scan_and_show,
+    /// открытие сессии, досскан) — теперь одно место (DRY).
+    fn thumb_item_from(t: crate::core::models::Thumbnail) -> ThumbItem {
+        let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(t.width, t.height);
+        let pixels = buf.make_mut_slice();
+        for (dst, chunk) in pixels.iter_mut().zip(t.data.as_chunks::<4>().0) {
+            dst.r = chunk[0];
+            dst.g = chunk[1];
+            dst.b = chunk[2];
+            dst.a = chunk[3];
+        }
+        ThumbItem {
+            file_name: t
+                .source_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+                .into(),
+            source_path: t.source_path.to_string_lossy().to_string().into(),
+            image: slint::Image::from_rgba8(buf),
+        }
+    }
+
+    /// 4.4b — ПОРЦИОННАЯ загрузка миниатюр в галерею (чинит «тупит 30-60 сек»
+    /// на 10k фото). Первый батч (FIRST_BATCH=200) заменяет модель — сетка
+    /// оживает сразу; остальные добавляются батчами по BATCH=150 в фоне
+    /// через invoke_from_event_loop, между батчами UI успевает отрисовать
+    /// кадр (не давится одним куском на 10k карточек).
+    /// gallery_gen — поколение галереи: батчи старого проекта отменяются,
+    /// если открыли другой (иначе чужие миниатюры подмешаются в сетку).
+    /// Хэндл VecModel (не-Send) живёт в UI-потоке — фон добирается до него
+    /// через invoke_from_event_loop, где берёт модель из UI и downcast'ит.
+    fn load_thumbs_batched(
+        photos: Vec<Photo>,
+        thumbs: &Arc<FileSystemThumbnailProvider>,
+        ui_weak: &slint::Weak<GalleryScreen>,
+        gallery_gen: &Arc<AtomicU64>,
+        status_prefix: String,
+    ) {
+        const FIRST_BATCH: usize = 200;
+        const BATCH: usize = 150;
+        let my_gen = gallery_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let total = photos.len();
+        let thumbs = thumbs.clone();
+        let ui_weak = ui_weak.clone();
+        let gallery_gen = gallery_gen.clone();
+        std::thread::spawn(move || {
+            // Первый батч 200 — сетка оживает сразу; остальные по 150.
+            // ВАЖНО: срез [..200] даёт РОВНО один кусок (chunks не выйдет за
+            // границу среза) — иначе фото 200+ попали бы в модель дважды.
+            let rest_start = FIRST_BATCH.min(total);
+            let mut done = 0usize;
+            for (batch_i, chunk) in photos[..rest_start]
+                .chunks(FIRST_BATCH)
+                .chain(photos[rest_start..].chunks(BATCH))
+                .enumerate()
+            {
+                // Миниатюры (чистый RGBA, Send) — строим в фоне.
+                let results = thumbs.thumbnails(chunk);
+                let raw: Vec<crate::core::models::Thumbnail> =
+                    results.into_iter().flatten().collect();
+                done += chunk.len();
+                let is_first = batch_i == 0;
+                let prefix = status_prefix.clone();
+                let ui_weak = ui_weak.clone();
+                let gallery_gen = gallery_gen.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    // Открыли другой проект/папку — батчи старого отменяем.
+                    if gallery_gen.load(Ordering::SeqCst) != my_gen {
+                        return;
+                    }
+                    if let Some(w) = ui_weak.upgrade() {
+                        // ThumbItem (не-Send) строим ЗДЕСЬ, в UI-потоке.
+                        let items: Vec<ThumbItem> = raw.into_iter().map(thumb_item_from).collect();
+                        if is_first {
+                            w.set_thumbnails(slint::ModelRc::new(slint::VecModel::from(items)));
+                        } else {
+                            // Добавляем в ТУ ЖЕ модель: скролл не сбрасывается.
+                            use slint::Model;
+                            if let Some(model) = w
+                                .get_thumbnails()
+                                .as_any()
+                                .downcast_ref::<slint::VecModel<ThumbItem>>()
+                            {
+                                for it in items {
+                                    model.push(it);
+                                }
+                            }
+                        }
+                        w.set_status_text(format!("{prefix} {done} (из {total})").into());
+                    }
+                });
+                // Пауза между батчами: UI успевает отрисовать кадр.
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            log::info!("gallery: батчи миниатюр завершены ({total})");
+        });
+    }
+
     /// Запускает выбор папки + скан + генерацию миниатюр в фоновом потоке.
     /// 4.7 — после успешного скана сохраняет сессию (recent) в хранилище:
     /// при следующем входе папка откроется мгновенно, без пересканирования.
@@ -1005,6 +1111,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         store: Arc<JsonSessionStore>,
         ui_weak: slint::Weak<GalleryScreen>,
         photos: Arc<Mutex<Vec<Photo>>>,
+        gallery_gen: Arc<AtomicU64>,
         recursive: bool,
     ) {
         log::info!("scan_and_show: старт (recursive={recursive})");
@@ -1018,15 +1125,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 .set_title("Выберите папку с фотографиями")
                 .pick_folder();
 
-            let result: Result<
-                (
-                    Vec<Photo>,
-                    Vec<crate::core::models::Thumbnail>,
-                    std::path::PathBuf,
-                    String,
-                ),
-                String,
-            > = (|| {
+            // 4.4b — миниатюры больше НЕ строим всем списком: скан возвращает
+            // только фото (метаданные), миниатюры пойдут порциями (см. ниже).
+            let result: Result<(Vec<Photo>, std::path::PathBuf, String), String> = (|| {
                 let folder = folder.ok_or("Папка не выбрана")?;
                 log::info!("scan_and_show: выбрана папка «{}»", folder.display());
                 let mode_str = if recursive { "recursive" } else { "flat" };
@@ -1038,21 +1139,21 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 let photos = scanner
                     .scan(&mode)
                     .map_err(|e| format!("Ошибка скана: {e}"))?;
-                let thumb_results = thumbs.thumbnails(&photos);
-                let out: Vec<_> = thumb_results.into_iter().flatten().collect();
-                Ok((photos, out, folder, mode_str.to_string()))
+                Ok((photos, folder, mode_str.to_string()))
             })();
 
             let ui_weak = ui_weak.clone();
             let photos_for_store = photos.clone();
             let store_for_save = store.clone();
             let thumbs_for_refresh = thumbs.clone();
+            let gallery_gen_scan = gallery_gen.clone();
+            let thumbs_scan = thumbs.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(w) = ui_weak.upgrade() {
                     w.set_scanning(false);
                     match result {
-                        Ok((scanned_photos, thumbs, folder, mode_str)) => {
-                            let count = thumbs.len();
+                        Ok((scanned_photos, folder, mode_str)) => {
+                            let count = scanned_photos.len();
                             // Сохраняем пути оригиналов для viewer.
                             *lock_or_recover(&photos_for_store) = scanned_photos.clone();
                             // 4.7 — сохраняем сессию (upsert по папке+режиму):
@@ -1113,41 +1214,16 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                 w.set_current_project_name(session.name.clone().into());
                             }
                             refresh_session_list(&store_for_save, &thumbs_for_refresh, &ui_weak);
-                            let items: Vec<ThumbItem> = thumbs
-                                .into_iter()
-                                .map(|t| {
-                                    let mut buf =
-                                        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
-                                            t.width, t.height,
-                                        );
-                                    let pixels = buf.make_mut_slice();
-                                    for (dst, chunk) in
-                                        pixels.iter_mut().zip(t.data.as_chunks::<4>().0)
-                                    {
-                                        dst.r = chunk[0];
-                                        dst.g = chunk[1];
-                                        dst.b = chunk[2];
-                                        dst.a = chunk[3];
-                                    }
-                                    ThumbItem {
-                                        file_name: t
-                                            .source_path
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().to_string())
-                                            .unwrap_or_default()
-                                            .into(),
-                                        source_path: t
-                                            .source_path
-                                            .to_string_lossy()
-                                            .to_string()
-                                            .into(),
-                                        image: slint::Image::from_rgba8(buf),
-                                    }
-                                })
-                                .collect();
-                            let model = slint::VecModel::from(items);
-                            w.set_thumbnails(slint::ModelRc::new(model));
-                            w.set_status_text(format!("Найдено фото: {count}").into());
+                            // 4.4b — порционные миниатюры: первый батч сразу,
+                            // остальное батчами по 150 в фоне (см. функцию).
+                            let prefix = format!("Найдено фото: {count}");
+                            load_thumbs_batched(
+                                scanned_photos,
+                                &thumbs_scan,
+                                &ui_weak,
+                                &gallery_gen_scan,
+                                prefix,
+                            );
                         }
                         Err(e) => {
                             w.set_error_text(e.into());
@@ -1166,6 +1242,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let store = store.clone();
         let ui_weak = ui.as_weak();
         let photos = photos.clone();
+        let gallery_gen = gallery_gen.clone();
         ui.on_pick_folder_flat(move || {
             scan_and_show(
                 scanner.clone(),
@@ -1173,6 +1250,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 store.clone(),
                 ui_weak.clone(),
                 photos.clone(),
+                gallery_gen.clone(),
                 false,
             );
         });
@@ -1184,6 +1262,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let store = store.clone();
         let ui_weak = ui.as_weak();
         let photos = photos.clone();
+        let gallery_gen = gallery_gen.clone();
         ui.on_pick_folder_recursive(move || {
             scan_and_show(
                 scanner.clone(),
@@ -1191,6 +1270,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 store.clone(),
                 ui_weak.clone(),
                 photos.clone(),
+                gallery_gen.clone(),
                 true,
             );
         });
@@ -1205,6 +1285,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let ui_weak = ui.as_weak();
         let photos = photos.clone();
         let viewer_ctx = viewer_ctx.clone();
+        let gallery_gen = gallery_gen.clone();
         ui.on_open_session(move |id| {
             log::info!("sessions: открыть сессию id={id}");
             let session = match store.load(&id) {
@@ -1252,50 +1333,22 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             let scanner_bg = scanner.clone();
             let ui_weak_bg = ui_weak.clone();
             let photos_bg = photos.clone();
+            let gallery_gen_bg = gallery_gen.clone();
             let session_bg = updated.clone();
             std::thread::spawn(move || {
-                // 1) Миниатюры всех фото проекта: тёплый дисковый кэш — быстро;
-                // холодный — генерация здесь же, в фоне (UI не блокируется).
-                let thumb_results = thumbs_bg.thumbnails(&session_bg.photos);
-                let out: Vec<_> = thumb_results.into_iter().flatten().collect();
-                let count = out.len();
-                let n_bg = session_bg.photos.len();
-                let name = session_bg.name.clone();
-                let ui_weak = ui_weak_bg.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(w) = ui_weak.upgrade() {
-                        let items: Vec<ThumbItem> = out
-                            .into_iter()
-                            .map(|t| {
-                                let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
-                                    t.width, t.height,
-                                );
-                                let pixels = buf.make_mut_slice();
-                                for (dst, chunk) in pixels.iter_mut().zip(t.data.as_chunks::<4>().0)
-                                {
-                                    dst.r = chunk[0];
-                                    dst.g = chunk[1];
-                                    dst.b = chunk[2];
-                                    dst.a = chunk[3];
-                                }
-                                ThumbItem {
-                                    file_name: t
-                                        .source_path
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_default()
-                                        .into(),
-                                    source_path: t.source_path.to_string_lossy().to_string().into(),
-                                    image: slint::Image::from_rgba8(buf),
-                                }
-                            })
-                            .collect();
-                        w.set_thumbnails(slint::ModelRc::new(slint::VecModel::from(items)));
-                        w.set_status_text(
-                            format!("Проект «{name}»: фото {count} (из {n_bg})").into(),
-                        );
-                    }
-                });
+                // 1) 4.4b — порционные миниатюры: первый батч (200) оживляет
+                // сетку сразу, остальные добавляются батчами по 150 в фоне —
+                // UI-поток получает маленькие порции вместо одного куска на
+                // 10k карточек (раньше «тупило» 30-60 сек даже из тёплого кэша:
+                // 10k PNG декодировались + 10k карточек создавались разом).
+                let prefix = format!("Проект «{}»: фото", session_bg.name);
+                load_thumbs_batched(
+                    session_bg.photos.clone(),
+                    &thumbs_bg,
+                    &ui_weak_bg,
+                    &gallery_gen_bg,
+                    prefix,
+                );
                 // 2) Сохраняем last_opened (диск I/O — в фоне, не в UI).
                 if let Err(e) = store_bg.save(&session_bg) {
                     log::error!("sessions: не удалось обновить last_opened: {e}");
@@ -1347,49 +1400,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 if let Err(e) = store_bg.save(&updated_session) {
                     log::error!("sessions: не удалось обновить сессию: {e}");
                 }
-                // Показываем ПОЛНЫЙ новый список (старые миниатюры из кэша +
-                // свежие для новых) — не блокируя UI (уже показан старый).
-                let all_thumbs = thumbs_bg.thumbnails(&fresh);
-                let all_out: Vec<_> = all_thumbs.into_iter().flatten().collect();
-                let ui_weak = ui_weak_bg.clone();
-                let photos_store = photos_bg.clone();
-                let count = all_out.len();
-                let name = updated_session.name.clone();
-                let _ = slint::invoke_from_event_loop(move || {
-                    *lock_or_recover(&photos_store) = fresh;
-                    if let Some(w) = ui_weak.upgrade() {
-                        let items: Vec<ThumbItem> = all_out
-                            .into_iter()
-                            .map(|t| {
-                                let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
-                                    t.width, t.height,
-                                );
-                                let pixels = buf.make_mut_slice();
-                                for (dst, chunk) in pixels.iter_mut().zip(t.data.as_chunks::<4>().0)
-                                {
-                                    dst.r = chunk[0];
-                                    dst.g = chunk[1];
-                                    dst.b = chunk[2];
-                                    dst.a = chunk[3];
-                                }
-                                ThumbItem {
-                                    file_name: t
-                                        .source_path
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().to_string())
-                                        .unwrap_or_default()
-                                        .into(),
-                                    source_path: t.source_path.to_string_lossy().to_string().into(),
-                                    image: slint::Image::from_rgba8(buf),
-                                }
-                            })
-                            .collect();
-                        w.set_thumbnails(slint::ModelRc::new(slint::VecModel::from(items)));
-                        w.set_status_text(
-                            format!("Проект «{name}»: обновлено, фото {count}").into(),
-                        );
-                    }
-                });
+                // Показываем ПОЛНЫЙ новый список — порционно (4.4b): первый
+                // батч заменит модель, остальное добавится в фоне. Список
+                // путей для viewer обновляем сразу (метаданные уже в памяти).
+                *lock_or_recover(&photos_bg) = fresh.clone();
+                let prefix = format!("Проект «{}»: обновлено, фото", updated_session.name);
+                load_thumbs_batched(fresh, &thumbs_bg, &ui_weak_bg, &gallery_gen_bg, prefix);
             });
         });
     }
