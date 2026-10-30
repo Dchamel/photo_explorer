@@ -1630,6 +1630,16 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         ui.on_open_viewer(move |index| {
             log::info!("viewer: открыть фото index={index}");
             ctx.last_direction.store(1, Ordering::SeqCst); // 4.3e — открытие = «вперёд».
+                                                           // 4.4c-2 — открытие кликом в random: синхронизируем shuffle_pos с
+                                                           // открытым фото (иначе next/prev считали бы от старой позиции).
+            if *ctx.nav_mode.borrow() == NavMode::Random {
+                let order = ctx.shuffle_order.borrow();
+                if let Some(order) = order.as_ref() {
+                    if let Some(p) = order.iter().position(|&i| i == index) {
+                        ctx.shuffle_pos.set(p as i32);
+                    }
+                }
+            }
             if let Some(w) = ctx.ui_weak.upgrade() {
                 w.set_viewer_index(index);
                 w.set_show_viewer(true);
@@ -1759,10 +1769,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // next-index и dir приходят из воркера; skip_depth — сколько уже скипнули.
     {
         let ctx = viewer_ctx.clone();
-        // 4.3g — dir больше не используется здесь (воркер уже прибавил его к
-        // next_index); параметр остаётся в сигнатуре колбэка, помечаем _dir.
+        // 4.4c-2 — в random dir ВАЖЕН: это направление шага по shuffle-списку
+        // (воркер его не знает, но last_direction хранит последнее листание).
+        // В edge/cycle dir по-прежнему не нужен (воркер прислал готовый
+        // линейный next_index).
         // 4.3h — my_gen: поколение, при котором воркер нашёл битый файл.
-        ui.on_request_skip(move |next_index, _dir, skip_depth, my_gen| {
+        ui.on_request_skip(move |next_index, dir, skip_depth, my_gen| {
             // 4.3h — ГЛАВНЫЙ фикс: скип, как и обычная загрузка, сверяет
             // поколение. Если пользователь уже листнул дальше (generation ушёл
             // вперёд), устаревший скип игнорируется — он больше не накладывает
@@ -1786,22 +1798,61 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 }
                 return;
             }
-            // 4.3g — фикс «скипа через один»: воркер уже прислал ЦЕЛЕВОЙ next_index
-            // (= битый index + dir), поэтому здесь НЕ прибавляем dir повторно —
-            // только проверяем границы самого next_index. Раньше next_valid_index
-            // делал next_index + dir ещё раз → шаг 2 вместо 1 → перепрыгивались
-            // годные файлы (в логе: 742→744→746 при серии битых).
-            let idx = next_index;
-            if idx < 0 || idx >= count {
-                // Достигли края и дальше годных нет — показываем плашку.
-                log::error!("request-skip: край списка (idx={idx}, count={count}) — плашка");
-                if let Some(w) = ctx.ui_weak.upgrade() {
-                    w.set_viewer_image(slint::Image::default());
-                    w.set_viewer_error("Файл не открывается".into());
+            // 4.4c-2 — в random скип идёт ПО ПЕРЕМЕШАННОМУ СПИСКУ, а не к
+            // линейному соседу: иначе случайный кадр «убегал» на линейного
+            // соседа (в логе: random дал 1531 → битый → скип линейно прыгал
+            // 1532→1533→1534, кадр «сам сменялся», shuffle_pos рассинхронился).
+            // Берём следующую позицию порядка от текущей shuffle_pos в
+            // направлении dir; shuffle_pos синхронно обновляем.
+            let mode = *ctx.nav_mode.borrow();
+            let idx = if mode == NavMode::Random {
+                let order = ctx.shuffle_order.borrow();
+                let Some(order) = order.as_ref() else {
+                    // Список не построен (пустая сессия) — плашка.
+                    if let Some(w) = ctx.ui_weak.upgrade() {
+                        w.set_viewer_image(slint::Image::default());
+                        w.set_viewer_error("Файл не открывается".into());
+                    }
+                    return;
+                };
+                let dir_list = if dir == 0 { 1 } else { dir };
+                match nav_random_next(order, ctx.shuffle_pos.get(), dir_list) {
+                    Some((np, photo)) => {
+                        ctx.shuffle_pos.set(np); // синхронизация с показанным
+                        photo
+                    }
+                    None => {
+                        // Край перемешанного списка — плашка (как edge).
+                        log::error!(
+                            "request-skip: край shuffle-списка (pos={}, dir={dir_list}) — плашка",
+                            ctx.shuffle_pos.get()
+                        );
+                        if let Some(w) = ctx.ui_weak.upgrade() {
+                            w.set_viewer_image(slint::Image::default());
+                            w.set_viewer_error("Файл не открывается".into());
+                        }
+                        return;
+                    }
                 }
-                return;
-            }
-            log::debug!("request-skip: скип → index={idx} (depth={skip_depth})");
+            } else {
+                // 4.3g — фикс «скипа через один»: воркер уже прислал ЦЕЛЕВОЙ
+                // next_index (= битый index + dir), повторно dir НЕ прибавляем.
+                let idx = next_index;
+                if idx < 0 || idx >= count {
+                    // Достигли края и дальше годных нет — показываем плашку.
+                    log::error!("request-skip: край списка (idx={idx}, count={count}) — плашка");
+                    if let Some(w) = ctx.ui_weak.upgrade() {
+                        w.set_viewer_image(slint::Image::default());
+                        w.set_viewer_error("Файл не открывается".into());
+                    }
+                    return;
+                }
+                idx
+            };
+            log::debug!(
+                "request-skip: скип → index={idx} (depth={skip_depth}, mode={})",
+                mode.as_str()
+            );
             if let Some(w) = ctx.ui_weak.upgrade() {
                 w.set_viewer_index(idx);
                 w.set_viewer_zoom(1.0);
