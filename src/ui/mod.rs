@@ -965,7 +965,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         /// 4.3i — единый слой: миниатюра пишется в viewer-image (второго слоя
         /// больше нет). Как любая запись в слой, сверяет поколение: устаревший
         /// вызов не перезапишет кадр более нового перехода.
-        /// Миниатюры уже в памяти (модель галереи) — показ без задержки.
+        /// 4.4c-6 — миниатюра ищется по ПУТИ файла (photos[index].path) —
+        /// ТОМУ ЖЕ ключу, по которому request_load грузит чёткое. Раньше брали
+        /// thumbnails.row_data(index): модель галереи и photos — ДВА списка,
+        /// которые расходятся при досскане/догрузке батчей → index указывал
+        /// на РАЗНЫЕ фото («миниатюра одна, чёткое другое»). По пути —
+        /// миниатюра и чёткое гарантированно одного файла.
         fn show_thumbnail(&self, index: i32, my_gen: u64) {
             use slint::Model; // trait Model::row_data
             if self.generation.load(Ordering::SeqCst) != my_gen {
@@ -976,9 +981,21 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             if self.broken.borrow().contains(&index) {
                 return;
             }
+            // Истина — путь из photos (его же грузит чёткое).
+            let path = {
+                let p = lock_or_recover(&self.photos);
+                match p.get(index as usize) {
+                    Some(ph) => ph.path.to_string_lossy().to_string(),
+                    None => return, // индекс вне списка — нечего показывать
+                }
+            };
             if let Some(w) = self.ui_weak.upgrade() {
                 let thumbs = w.get_thumbnails();
-                match thumbs.row_data(index as usize) {
+                // Ищем миниатюру по ПУТИ, не по индексу модели.
+                let found = (0..thumbs.row_count())
+                    .filter_map(|i| thumbs.row_data(i))
+                    .find(|item| item.source_path == path.as_str());
+                match found {
                     Some(item) => {
                         // Размеры для клампа зума: у миниатюры то же соотношение
                         // сторон, что у полного фото, поэтому contain-fit считается
@@ -988,7 +1005,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         w.set_viewer_img_h(sz.height as f32);
                         w.set_viewer_image(item.image);
                     }
-                    // Миниатюры нет (модель рассинхронизирована) — чистим слой,
+                    // Миниатюры по пути нет (батч не дошёл) — чистим слой,
                     // чтобы не показывать кадр предыдущего перехода.
                     None => w.set_viewer_image(slint::Image::default()),
                 }
