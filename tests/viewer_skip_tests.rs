@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use photo_explorer::ui::{
-    clamp_offset, nav_next, nav_random_next, next_valid_index, shuffled_order, NavMode,
+    clamp_offset, nav_next, nav_random_next, next_valid_index, preload_neighbors, shuffled_order,
+    NavMode,
 };
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -305,6 +306,41 @@ fn nav_random_next_skips_broken_positions() {
 fn nav_random_next_empty_order_returns_none() {
     assert_eq!(nav_random_next(&[], 0, 1, &no_broken()), None);
     assert_eq!(nav_random_next(&[], 0, -1, &no_broken()), None);
+}
+
+// --- 4.4c-4 — предзагрузка соседей ПО ТЕКУЩЕМУ ПОРЯДКУ ---
+
+#[test]
+fn preload_neighbors_linear_order() {
+    // Обычный порядок: 3 соседа в каждую сторону от index=5.
+    let got = preload_neighbors(5, 10, 3, None, 0, &no_broken());
+    assert_eq!(got, vec![6, 4, 7, 3, 8, 2]);
+}
+
+#[test]
+fn preload_neighbors_linear_clamps_edges() {
+    // index=1: вперёд 2,3,4; назад только 0 (дальше край).
+    let got = preload_neighbors(1, 10, 3, None, 0, &no_broken());
+    assert_eq!(got, vec![2, 0, 3, 4]);
+}
+
+#[test]
+fn preload_neighbors_random_follows_shuffle_order() {
+    // Random: соседи — фото с СОСЕДНИХ ПОЗИЦИЙ перемешанного списка,
+    // не линейные index±1. Порядок [4,2,3,0,1] (перестановка 0..5),
+    // позиция 2 (фото 3): соседи = фото с позиций 3,1,4,0 → 0,2,1,4.
+    let order = vec![4, 2, 3, 0, 1];
+    let got = preload_neighbors(3, 5, 3, Some(&order), 2, &no_broken());
+    assert_eq!(got, vec![0, 2, 1, 4]);
+}
+
+#[test]
+fn preload_neighbors_skips_broken() {
+    // Битые (3, 7) не предзагружаем — не тратим время воркера.
+    // index=5, radius=2: step1 → 6,4; step2 → 7(битый, скип),3(битый, скип).
+    let broken = broken_of(&[3, 7]);
+    let got = preload_neighbors(5, 10, 2, None, 0, &broken);
+    assert_eq!(got, vec![6, 4]);
 }
 
 #[test]

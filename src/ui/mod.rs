@@ -172,6 +172,55 @@ pub fn nav_random_next(
     None // край перемешанного списка — стоп
 }
 
+/// 4.4c-4 — соседи для ПРЕДЗАГРУЗКИ по текущему порядку листания.
+/// Возвращает до `radius` индексов фото в каждую сторону:
+///   • обычный порядок (edge/cycle): index±1..radius;
+///   • random: фото с позиций shuffle_pos±1..radius ПЕРЕМЕШАННОГО списка
+///     (раньше грузили линейных index±1 — в random это чужие кадры, и их
+///     результат перебивал текущий: «чёткое само меняется на иное»).
+/// broken-индексы пропускаем (заведомо битые — не тратим время воркера).
+/// Чистая функция — легко тестировать.
+pub fn preload_neighbors(
+    index: i32,
+    count: i32,
+    radius: i32,
+    order: Option<&[i32]>,
+    shuffle_pos: i32,
+    broken: &std::collections::HashSet<i32>,
+) -> Vec<i32> {
+    let mut out = Vec::new();
+    if count <= 0 {
+        return out;
+    }
+    for step in 1..=radius.max(0) {
+        for dir in [1, -1] {
+            let photo = match order {
+                // random: сосед = фото с соседней ПОЗИЦИИ перемешанного списка.
+                Some(ord) => {
+                    let np = shuffle_pos + dir * step;
+                    match ord.get(np.max(0) as usize) {
+                        Some(&p) if np >= 0 && np < ord.len() as i32 => p,
+                        _ => continue, // край списка — нет соседа
+                    }
+                }
+                // обычный порядок: линейный сосед.
+                None => {
+                    let ni = index + dir * step;
+                    if ni < 0 || ni >= count {
+                        continue; // край — нет соседа
+                    }
+                    ni
+                }
+            };
+            if photo < 0 || photo >= count || broken.contains(&photo) {
+                continue; // битое или вне списка — не грузим
+            }
+            out.push(photo);
+        }
+    }
+    out
+}
+
 /// 4.3g — кламп смещения фото «край в край» ПО КАРТИНКЕ (contain-fit).
 /// Элемент Image имеет размер vp*zoom, но картинка вписана (contain) и у
 /// узких/широких фото МЕНЬШЕ элемента. Кламп по элементу позволял утащить
@@ -637,8 +686,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     }
 
     // LRU-кэш полных изображений (сырой RGBA, Send) — для воркера.
+    // 4.4c-4 — 40 (было 20): предзагрузка 3×2 соседей + текущие кадры
+    // должны помещаться, иначе соседи вытесняют друг друга до показа.
     let viewer_cache: Arc<Mutex<ViewerCache>> =
-        Arc::new(Mutex::new(ViewerCache::new(20.try_into().unwrap())));
+        Arc::new(Mutex::new(ViewerCache::new(40.try_into().unwrap())));
 
     // 4.3d-v7 — UI-кэш ГОТОВЫХ slint::Image (ключ — путь).
     // КОРЕНЬ фикса затупа: раньше на КАЖДЫЙ кадр (даже из кэша) UI-поток строил
@@ -652,7 +703,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     use std::rc::Rc;
     type ImageCache = Rc<RefCell<HashMap<std::path::PathBuf, slint::Image>>>;
     let image_cache: ImageCache = Rc::new(RefCell::new(HashMap::new()));
-    const IMAGE_CACHE_MAX: usize = 20;
+    const IMAGE_CACHE_MAX: usize = 40; // 4.4c-4 — под предзагрузку 3 соседей
 
     // Поколение загрузки: инкрементируется при каждом переключении фото.
     // Фоновый поток сверяет своё поколение перед применением результата —
@@ -743,6 +794,18 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                 return;
                             }
                             if let Some(w) = ui_weak.upgrade() {
+                                // 4.4c-4 — двойная защита: результат применяется
+                                // к экрану ТОЛЬКО если текущий viewer-index всё
+                                // ещё равен индексу задачи (поколение уже
+                                // сверено выше). Устраняет «чёткое само
+                                // меняется на иное» при гонках предзагрузки.
+                                if w.get_viewer_index() != index {
+                                    log::debug!(
+                                        "worker: индекс ушёл (задача={index}, текущий={}) — не показываем",
+                                        w.get_viewer_index()
+                                    );
+                                    return;
+                                }
                                 match result {
                                     Ok((data, w_px, h_px)) => {
                                         let mut buf =
@@ -1019,14 +1082,27 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             });
         }
 
-        /// Ставит в канал задачи на предзагрузку соседей (index-1, index+1).
-        /// Воркер обработает их после текущего фото (низкий приоритет).
+        /// 4.4c-4 — ставит задачи на предзагрузку соседей ПО ТЕКУЩЕМУ ПОРЯДКУ.
+        /// 3 соседа в каждую сторону; в random — соседи по ПЕРЕМЕШАННОМУ
+        /// списку (позиции shuffle_pos±1..3), не линейные index±1 (раньше
+        /// линейные чужие кадры перебивали текущий в random).
+        /// Сосед кладётся ТОЛЬКО в кэш — на экран не пишется (это делает
+        /// LoadTask::Photo при реальном переходе).
         fn enqueue_preload(&self, index: i32) {
+            const PRELOAD_RADIUS: i32 = 3;
             let count = lock_or_recover(&self.photos).len() as i32;
-            for ni in [index - 1, index + 1] {
-                if ni < 0 || ni >= count {
-                    continue;
+            // В random соседи — по перемешанному списку от текущей позиции.
+            let (order, pos) = {
+                let ord = self.shuffle_order.borrow();
+                match ord.as_ref() {
+                    Some(o) => (Some(o.to_vec()), self.shuffle_pos.get()),
+                    None => (None, 0),
                 }
+            };
+            let broken = self.broken.borrow().clone();
+            for ni in
+                preload_neighbors(index, count, PRELOAD_RADIUS, order.as_deref(), pos, &broken)
+            {
                 let path = {
                     let p = lock_or_recover(&self.photos);
                     match p.get(ni as usize) {
