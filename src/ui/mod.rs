@@ -624,10 +624,17 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                         // показать следующий кадр в текущем направлении.
                                         // UI-колбэк request-skip сам решает границы и
                                         // защиту от зацикливания (ему доступен Rc-кэш).
+                                        // 4.3h — передаём my_gen: если пользователь уже
+                                        // ушёл дальше, скип будет проигнорирован.
                                         log::error!("worker: битый файл index={index}: {e}");
                                         let next = index + dir;
                                         let next_depth = skip_depth.saturating_add(1);
-                                        w.invoke_request_skip(next, dir, next_depth as i32);
+                                        w.invoke_request_skip(
+                                            next,
+                                            dir,
+                                            next_depth as i32,
+                                            my_gen as i32,
+                                        );
                                     }
                                 }
                             }
@@ -1476,7 +1483,19 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let load_tx = load_tx.clone();
         // 4.3g — dir больше не используется здесь (воркер уже прибавил его к
         // next_index); параметр остаётся в сигнатуре колбэка, помечаем _dir.
-        ui.on_request_skip(move |next_index, _dir, skip_depth| {
+        // 4.3h — my_gen: поколение, при котором воркер нашёл битый файл.
+        ui.on_request_skip(move |next_index, _dir, skip_depth, my_gen| {
+            // 4.3h — ГЛАВНЫЙ фикс: скип, как и обычная загрузка, сверяет
+            // поколение. Если пользователь уже листнул дальше (generation ушёл
+            // вперёд), устаревший скип игнорируется — он больше не накладывает
+            // свой кадр поверх актуального («в фоне один, поверх другой»).
+            if generation.load(Ordering::SeqCst) != my_gen as u64 {
+                log::debug!(
+                    "request-skip: устарел my={my_gen} cur={}",
+                    generation.load(Ordering::SeqCst)
+                );
+                return;
+            }
             let count = lock_or_recover(&photos).len() as i32;
             // Защита от зацикливания: перепробовали больше, чем файлов в списке.
             if skip_depth > count || count == 0 {
