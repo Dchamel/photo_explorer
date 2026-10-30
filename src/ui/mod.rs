@@ -1021,6 +1021,17 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         path.display()
                     );
                     if let Some(w) = self.ui_weak.upgrade() {
+                        // 4.4c-5 — ИНВАРИАНТ ЭКРАНА: пишем чёткое ТОЛЬКО если
+                        // текущий viewer-index равен индексу задачи. Поколение
+                        // сверяется выше, но его недостаточно: кэш-хиты разных
+                        // индексов в одном поколении могли перебивать кадр.
+                        if w.get_viewer_index() != index {
+                            log::debug!(
+                                "request_load(UI-кэш): индекс ушёл (задача={index}, текущий={}) — не пишем",
+                                w.get_viewer_index()
+                            );
+                            return;
+                        }
                         // 4.3g — размеры картинки для клампа «край в край» (contain-fit).
                         // size() — физические px; в формуле contain_scale DPI сокращается.
                         let sz = img.size();
@@ -1042,6 +1053,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         path.display()
                     );
                     if let Some(w) = self.ui_weak.upgrade() {
+                        // 4.4c-5 — ИНВАРИАНТ ЭКРАНА: та же сверка индекса.
+                        if w.get_viewer_index() != index {
+                            log::debug!(
+                                "request_load(RGBA-кэш): индекс ушёл (задача={index}, текущий={}) — не пишем",
+                                w.get_viewer_index()
+                            );
+                            return;
+                        }
                         let (data, w_px, h_px) = cached;
                         let mut buf =
                             slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w_px, h_px);
