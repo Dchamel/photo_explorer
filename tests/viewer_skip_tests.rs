@@ -11,7 +11,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use photo_explorer::ui::{clamp_offset, nav_next, next_valid_index, NavMode};
+use photo_explorer::ui::{
+    clamp_offset, nav_next, nav_random_next, next_valid_index, shuffled_order, NavMode,
+};
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -206,9 +208,11 @@ fn nav_next_random_always_in_range() {
 
 #[test]
 fn nav_next_random_single_file_returns_zero() {
-    // 1 фото: случайный выбор из одного — всегда 0.
-    assert_eq!(nav_next(0, 1, 1, NavMode::Random), Some(0));
-    assert_eq!(nav_next(0, 1, -1, NavMode::Random), Some(0));
+    // 4.4c — random идёт по перемешанному списку (nav_random_next);
+    // nav_next для Random — edge-семантика (страховочная ветка). 1 фото:
+    // соседних позиций нет → None (стоп).
+    assert_eq!(nav_next(0, 1, 1, NavMode::Random), None);
+    assert_eq!(nav_next(0, 1, -1, NavMode::Random), None);
 }
 
 #[test]
@@ -224,6 +228,41 @@ fn nav_next_edge_single_file_never_moves() {
     // 1 фото в edge: next и prev → None (соседей нет, стоп).
     assert_eq!(nav_next(0, 1, 1, NavMode::Edge), None);
     assert_eq!(nav_next(0, 1, -1, NavMode::Edge), None);
+}
+
+// --- 4.4c — random через перемешанный список (shuffle) ---
+
+#[test]
+fn shuffled_order_is_bijection() {
+    // Перестановка: каждый индекс 0..count встречается РОВНО один раз.
+    for count in [0, 1, 2, 5, 100] {
+        let order = shuffled_order(count);
+        assert_eq!(order.len(), count as usize);
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(sorted, (0..count).collect::<Vec<i32>>());
+    }
+}
+
+#[test]
+fn nav_random_next_walks_order_back_and_forth() {
+    // Фиксированный порядок: prev/next ходят по нему честно — «назад»
+    // возвращает предыдущий элемент, а не новый случайный.
+    let order = vec![7, 2, 9, 0, 4];
+    // next с позиции 1 (фото 2) → позиция 2 (фото 9).
+    assert_eq!(nav_random_next(&order, 1, 1), Some((2, 9)));
+    // prev с позиции 2 → позиция 1 (фото 2) — честный возврат.
+    assert_eq!(nav_random_next(&order, 2, -1), Some((1, 2)));
+    // prev с позиции 0 → None (начало списка — стоп).
+    assert_eq!(nav_random_next(&order, 0, -1), None);
+    // next с последней позиции 4 → None (конец списка — стоп).
+    assert_eq!(nav_random_next(&order, 4, 1), None);
+}
+
+#[test]
+fn nav_random_next_empty_order_returns_none() {
+    assert_eq!(nav_random_next(&[], 0, 1), None);
+    assert_eq!(nav_random_next(&[], 0, -1), None);
 }
 
 #[test]

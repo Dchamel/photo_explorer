@@ -7,7 +7,7 @@
 
 slint::include_modules!();
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -70,14 +70,13 @@ impl std::str::FromStr for NavMode {
     }
 }
 
-/// 4.4a — следующий индекс листания по режиму.
+/// 4.4a — следующий индекс листания по режиму (edge/cycle).
 /// cur — текущий индекс, dir — +1 (next) / −1 (prev), count — размер списка.
 /// Возвращает Some(новый индекс) или None (стоп: в edge-режиме дошли до края).
 /// Чистая функция — легко тестировать без UI.
-///   • edge:   cur+dir; за границей [0, count) → None (стоим на месте).
-///   • cycle:  cur+dir с заворачиванием (0−1 → count−1; count−1+1 → 0).
-///   • random: случайный индекс из [0, count); dir игнорируется (обе кнопки
-///             случайные — решение заказчика).
+///   • edge:  cur+dir; за границей [0, count) → None (стоим на месте).
+///   • cycle: cur+dir с заворачиванием (0−1 → count−1; count−1+1 → 0).
+/// Random-режим обрабатывает nav_random_next (шаг по перемешанному списку).
 pub fn nav_next(cur: i32, count: i32, dir: i32, mode: NavMode) -> Option<i32> {
     if count <= 0 {
         return None; // пустой список — листать нечего
@@ -100,11 +99,45 @@ pub fn nav_next(cur: i32, count: i32, dir: i32, mode: NavMode) -> Option<i32> {
             }
             Some(ni)
         }
+        // 4.4c — random идёт по перемешанному списку (см. nav_random_next);
+        // сюда не попадаем, но вернуть что-то безопасное нужно для полноты.
         NavMode::Random => {
-            use rand::Rng;
-            Some(rand::thread_rng().gen_range(0..count))
+            let ni = cur + dir;
+            if ni < 0 || ni >= count {
+                None
+            } else {
+                Some(ni)
+            }
         }
     }
+}
+
+/// 4.4c — перемешанный порядок индексов [0..count): биекция, каждый индекс
+/// ровно один раз (идея заказчика: «мешаем номера и листаем по списку»).
+/// Порядок фиксируется ОДИН раз при включении random — поэтому «назад»
+/// честно возвращает предыдущее просмотренное фото, а не новый случайный.
+pub fn shuffled_order(count: i32) -> Vec<i32> {
+    use rand::seq::SliceRandom;
+    let mut v: Vec<i32> = (0..count.max(0)).collect();
+    v.shuffle(&mut rand::thread_rng());
+    v
+}
+
+/// 4.4c — шаг по перемешанному списку (random-режим).
+/// order — перестановка индексов фото; pos — текущая ПОЗИЦИЯ в списке;
+/// dir — +1 (next) / −1 (prev) по СПИСКУ. Возвращает Some((новая позиция,
+/// индекс фото)) или None (дошли до края списка — стоп, как в edge).
+/// Чистая функция — легко тестировать.
+pub fn nav_random_next(order: &[i32], pos: i32, dir: i32) -> Option<(i32, i32)> {
+    let len = order.len() as i32;
+    if len <= 0 {
+        return None; // пустой список — листать нечего
+    }
+    let np = pos + dir;
+    if np < 0 || np >= len {
+        return None; // край перемешанного списка — стоп
+    }
+    order.get(np as usize).map(|&photo| (np, photo))
 }
 
 /// 4.3g — кламп смещения фото «край в край» ПО КАРТИНКЕ (contain-fit).
@@ -776,9 +809,42 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         /// 4.4a — режим листания текущего проекта (edge/cycle/random).
         /// Меняется при открытии сессии и из панели ⚙; UI-поток — RefCell ок.
         nav_mode: Rc<RefCell<NavMode>>,
+        /// 4.4c — перемешанный порядок индексов для random-режима.
+        /// Строится ОДИН раз при включении random (биекция 0..count);
+        /// None в edge/cycle. Порядок фиксирован → «назад» честно
+        /// возвращает предыдущее просмотренное фото.
+        shuffle_order: RefCell<Option<Vec<i32>>>,
+        /// 4.4c — текущая ПОЗИЦИЯ в перемешанном списке (не индекс фото!).
+        shuffle_pos: Cell<i32>,
     }
 
     impl ViewerCtx {
+        /// 4.4c — сменить режим листания. При включении random строит
+        /// перемешанный список (один раз — порядок фиксируется, «назад»
+        /// честный); при выключении — сбрасывает. Из on_open_session и ⚙.
+        fn set_nav(&self, mode: NavMode) {
+            *self.nav_mode.borrow_mut() = mode;
+            match mode {
+                NavMode::Random => {
+                    let count = lock_or_recover(&self.photos).len() as i32;
+                    let order = shuffled_order(count);
+                    // Текущее фото — стартовая позиция, если оно в списке.
+                    let cur = self
+                        .ui_weak
+                        .upgrade()
+                        .map(|w| w.get_viewer_index())
+                        .unwrap_or(0);
+                    let start = order.iter().position(|&i| i == cur).unwrap_or(0) as i32;
+                    *self.shuffle_order.borrow_mut() = Some(order);
+                    self.shuffle_pos.set(start);
+                }
+                NavMode::Edge | NavMode::Cycle => {
+                    *self.shuffle_order.borrow_mut() = None;
+                    self.shuffle_pos.set(0);
+                }
+            }
+        }
+
         /// ЕДИНЫЙ переход к фото (4.3i): инкрементирует поколение, мгновенно
         /// пишет миниатюру в единый viewer-image и запрашивает чёткое фото
         /// ТОЙ ЖЕ генерацией. Открытие, next/prev и скип используют только
@@ -942,6 +1008,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         last_direction: last_direction.clone(),
         load_tx: load_tx.clone(),
         nav_mode: Rc::new(RefCell::new(NavMode::Edge)), // 4.4a — до края по умолчанию
+        shuffle_order: RefCell::new(None),              // 4.4c — строится при random
+        shuffle_pos: Cell::new(0),
     });
 
     /// Загружает полное изображение по пути и возвращает сырые RGBA-данные (Send).
@@ -1309,8 +1377,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             *lock_or_recover(&photos) = session_photos;
             // 4.4a — режим листания проекта: в контекст вьюера и панель ⚙.
             // parse() — трейт FromStr; пустая строка/мусор → Edge (по умолчанию).
+            // 4.4c — set_nav строит перемешанный список, если режим random.
             let nav: NavMode = session.nav_mode.parse().unwrap_or(NavMode::Edge);
-            *viewer_ctx.nav_mode.borrow_mut() = nav;
+            viewer_ctx.set_nav(nav);
             if let Some(w) = ui_weak.upgrade() {
                 w.set_show_start(false);
                 w.set_nav_mode(nav.as_str().into());
@@ -1525,7 +1594,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         ui.on_set_nav_mode(move |mode| {
             let nav: NavMode = mode.parse().unwrap_or(NavMode::Edge);
             log::info!("settings: режим листания → {}", nav.as_str());
-            *viewer_ctx.nav_mode.borrow_mut() = nav;
+            // 4.4c — set_nav строит перемешанный список при включении random
+            // (и сбрасывает при выключении).
+            viewer_ctx.set_nav(nav);
             if let Some(w) = ui_weak.upgrade() {
                 w.set_nav_mode(nav.as_str().into());
             }
@@ -1605,8 +1676,26 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 .map(|w| w.get_viewer_index())
                 .unwrap_or(0);
             let mode = *ctx.nav_mode.borrow();
-            let Some(idx) = nav_next(cur, count, 1, mode) else {
-                return; // edge: дошли до края — стоп, ничего не грузим
+            // 4.4c — random идёт по перемешанному списку: next = следующая
+            // ПОЗИЦИЯ в нём (порядок фиксирован — «назад» будет честным).
+            let idx = match mode {
+                NavMode::Random => {
+                    let order = ctx.shuffle_order.borrow();
+                    let Some(order) = order.as_ref() else {
+                        return; // список не построен (сессия пуста) — выходим
+                    };
+                    let Some((np, photo)) = nav_random_next(order, ctx.shuffle_pos.get(), 1) else {
+                        return; // край перемешанного списка — стоп
+                    };
+                    ctx.shuffle_pos.set(np);
+                    photo
+                }
+                _ => {
+                    let Some(idx) = nav_next(cur, count, 1, mode) else {
+                        return; // edge: дошли до края — стоп, ничего не грузим
+                    };
+                    idx
+                }
             };
             if let Some(w) = ctx.ui_weak.upgrade() {
                 log::debug!("viewer: next → index={idx} (mode={})", mode.as_str());
@@ -1619,7 +1708,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             ctx.switch_to_photo(idx, 0);
         });
     }
-    // Предыдущее фото — та же схема через nav_next (dir = −1).
+    // Предыдущее фото — та же схема (dir = −1); в random — предыдущая
+    // позиция перемешанного списка (честный возврат просмотренного).
     {
         let ctx = viewer_ctx.clone();
         ui.on_viewer_prev(move || {
@@ -1631,8 +1721,25 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 .map(|w| w.get_viewer_index())
                 .unwrap_or(0);
             let mode = *ctx.nav_mode.borrow();
-            let Some(idx) = nav_next(cur, count, -1, mode) else {
-                return; // edge: дошли до первого фото — стоп (фикс «в минус»)
+            let idx = match mode {
+                NavMode::Random => {
+                    let order = ctx.shuffle_order.borrow();
+                    let Some(order) = order.as_ref() else {
+                        return;
+                    };
+                    let Some((np, photo)) = nav_random_next(order, ctx.shuffle_pos.get(), -1)
+                    else {
+                        return; // начало перемешанного списка — стоп
+                    };
+                    ctx.shuffle_pos.set(np);
+                    photo
+                }
+                _ => {
+                    let Some(idx) = nav_next(cur, count, -1, mode) else {
+                        return; // edge: дошли до первого фото — стоп (фикс «в минус»)
+                    };
+                    idx
+                }
             };
             if let Some(w) = ctx.ui_weak.upgrade() {
                 log::debug!("viewer: prev → index={idx} (mode={})", mode.as_str());
