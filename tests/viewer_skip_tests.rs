@@ -158,52 +158,83 @@ fn clamp_offset_negative_viewport_safe() {
 }
 
 // --- 4.4a — nav_next: режимы листания (edge / cycle / random) ---
+// 4.4c-3 — все функции принимают broken: множество битых индексов,
+// которые навигация ПРОПУСКАЕТ (не грузит заведомо битое).
+
+use std::collections::HashSet;
+
+/// Пустое множество битых (ничего не исключено).
+fn no_broken() -> HashSet<i32> {
+    HashSet::new()
+}
+
+/// Множество из перечисленных индексов.
+fn broken_of(items: &[i32]) -> HashSet<i32> {
+    items.iter().copied().collect()
+}
 
 #[test]
 fn nav_next_edge_stops_at_last_photo() {
     // 5 фото, стоим на последнем (4), next → None (стоп, не прыгаем на 0).
-    assert_eq!(nav_next(4, 5, 1, NavMode::Edge), None);
+    assert_eq!(nav_next(4, 5, 1, NavMode::Edge, &no_broken()), None);
 }
 
 #[test]
 fn nav_next_edge_stops_at_first_photo() {
     // 5 фото, стоим на первом (0), prev → None (стоп — фикс «листает в минус»).
-    assert_eq!(nav_next(0, 5, -1, NavMode::Edge), None);
+    assert_eq!(nav_next(0, 5, -1, NavMode::Edge, &no_broken()), None);
 }
 
 #[test]
 fn nav_next_edge_moves_in_bounds() {
-    assert_eq!(nav_next(2, 5, 1, NavMode::Edge), Some(3));
-    assert_eq!(nav_next(2, 5, -1, NavMode::Edge), Some(1));
+    assert_eq!(nav_next(2, 5, 1, NavMode::Edge, &no_broken()), Some(3));
+    assert_eq!(nav_next(2, 5, -1, NavMode::Edge, &no_broken()), Some(1));
+}
+
+#[test]
+fn nav_next_edge_skips_broken_forward() {
+    // 4.4c-3: 3 и 4 битые → next с 2 перепрыгивает их на 5.
+    let broken = broken_of(&[3, 4]);
+    assert_eq!(nav_next(2, 6, 1, NavMode::Edge, &broken), Some(5));
+}
+
+#[test]
+fn nav_next_edge_skips_broken_backward() {
+    // 4.4c-3: 1 и 0 битые → prev с 2 перепрыгивает на… край → None (стоп).
+    let broken = broken_of(&[0, 1]);
+    assert_eq!(nav_next(2, 6, -1, NavMode::Edge, &broken), None);
+}
+
+#[test]
+fn nav_next_cycle_skips_broken_with_wrap() {
+    // 4.4c-3: 0 битый → cycle next с 4 заворачивает на 0, видит битый, идёт на 1.
+    let broken = broken_of(&[0]);
+    assert_eq!(nav_next(4, 5, 1, NavMode::Cycle, &broken), Some(1));
+}
+
+#[test]
+fn nav_next_cycle_all_broken_returns_none() {
+    // Весь список битый → None (нечего показывать).
+    let broken = broken_of(&[0, 1, 2, 3, 4]);
+    assert_eq!(nav_next(2, 5, 1, NavMode::Cycle, &broken), None);
 }
 
 #[test]
 fn nav_next_cycle_wraps_forward() {
     // Последний (4) + next → первый (0).
-    assert_eq!(nav_next(4, 5, 1, NavMode::Cycle), Some(0));
+    assert_eq!(nav_next(4, 5, 1, NavMode::Cycle, &no_broken()), Some(0));
 }
 
 #[test]
 fn nav_next_cycle_wraps_backward() {
     // Первый (0) + prev → последний (4).
-    assert_eq!(nav_next(0, 5, -1, NavMode::Cycle), Some(4));
+    assert_eq!(nav_next(0, 5, -1, NavMode::Cycle, &no_broken()), Some(4));
 }
 
 #[test]
 fn nav_next_cycle_in_bounds() {
-    assert_eq!(nav_next(2, 5, 1, NavMode::Cycle), Some(3));
-    assert_eq!(nav_next(2, 5, -1, NavMode::Cycle), Some(1));
-}
-
-#[test]
-fn nav_next_random_always_in_range() {
-    // 100 попыток: обе кнопки (dir ±1) дают индекс строго внутри [0, count).
-    for _ in 0..100 {
-        let f = nav_next(2, 5, 1, NavMode::Random).expect("random всегда Some");
-        assert!((0..5).contains(&f), "индекс вне диапазона: {f}");
-        let b = nav_next(2, 5, -1, NavMode::Random).expect("random всегда Some");
-        assert!((0..5).contains(&b), "индекс вне диапазона: {b}");
-    }
+    assert_eq!(nav_next(2, 5, 1, NavMode::Cycle, &no_broken()), Some(3));
+    assert_eq!(nav_next(2, 5, -1, NavMode::Cycle, &no_broken()), Some(1));
 }
 
 #[test]
@@ -211,23 +242,23 @@ fn nav_next_random_single_file_returns_zero() {
     // 4.4c — random идёт по перемешанному списку (nav_random_next);
     // nav_next для Random — edge-семантика (страховочная ветка). 1 фото:
     // соседних позиций нет → None (стоп).
-    assert_eq!(nav_next(0, 1, 1, NavMode::Random), None);
-    assert_eq!(nav_next(0, 1, -1, NavMode::Random), None);
+    assert_eq!(nav_next(0, 1, 1, NavMode::Random, &no_broken()), None);
+    assert_eq!(nav_next(0, 1, -1, NavMode::Random, &no_broken()), None);
 }
 
 #[test]
 fn nav_next_empty_list_returns_none_any_mode() {
     // Пустой список — листать нечего ни в каком режиме.
-    assert_eq!(nav_next(0, 0, 1, NavMode::Edge), None);
-    assert_eq!(nav_next(0, 0, 1, NavMode::Cycle), None);
-    assert_eq!(nav_next(0, 0, 1, NavMode::Random), None);
+    assert_eq!(nav_next(0, 0, 1, NavMode::Edge, &no_broken()), None);
+    assert_eq!(nav_next(0, 0, 1, NavMode::Cycle, &no_broken()), None);
+    assert_eq!(nav_next(0, 0, 1, NavMode::Random, &no_broken()), None);
 }
 
 #[test]
 fn nav_next_edge_single_file_never_moves() {
     // 1 фото в edge: next и prev → None (соседей нет, стоп).
-    assert_eq!(nav_next(0, 1, 1, NavMode::Edge), None);
-    assert_eq!(nav_next(0, 1, -1, NavMode::Edge), None);
+    assert_eq!(nav_next(0, 1, 1, NavMode::Edge, &no_broken()), None);
+    assert_eq!(nav_next(0, 1, -1, NavMode::Edge, &no_broken()), None);
 }
 
 // --- 4.4c — random через перемешанный список (shuffle) ---
@@ -250,19 +281,30 @@ fn nav_random_next_walks_order_back_and_forth() {
     // возвращает предыдущий элемент, а не новый случайный.
     let order = vec![7, 2, 9, 0, 4];
     // next с позиции 1 (фото 2) → позиция 2 (фото 9).
-    assert_eq!(nav_random_next(&order, 1, 1), Some((2, 9)));
+    assert_eq!(nav_random_next(&order, 1, 1, &no_broken()), Some((2, 9)));
     // prev с позиции 2 → позиция 1 (фото 2) — честный возврат.
-    assert_eq!(nav_random_next(&order, 2, -1), Some((1, 2)));
+    assert_eq!(nav_random_next(&order, 2, -1, &no_broken()), Some((1, 2)));
     // prev с позиции 0 → None (начало списка — стоп).
-    assert_eq!(nav_random_next(&order, 0, -1), None);
+    assert_eq!(nav_random_next(&order, 0, -1, &no_broken()), None);
     // next с последней позиции 4 → None (конец списка — стоп).
-    assert_eq!(nav_random_next(&order, 4, 1), None);
+    assert_eq!(nav_random_next(&order, 4, 1, &no_broken()), None);
+}
+
+#[test]
+fn nav_random_next_skips_broken_positions() {
+    // 4.4c-3: фото 9 (позиция 2) битое → next с позиции 1 перепрыгивает
+    // на позицию 3 (фото 0), не показывая битое.
+    let order = vec![7, 2, 9, 0, 4];
+    let broken = broken_of(&[9]);
+    assert_eq!(nav_random_next(&order, 1, 1, &broken), Some((3, 0)));
+    // prev с позиции 3 → тоже перепрыгивает битое 9 → позиция 1 (фото 2).
+    assert_eq!(nav_random_next(&order, 3, -1, &broken), Some((1, 2)));
 }
 
 #[test]
 fn nav_random_next_empty_order_returns_none() {
-    assert_eq!(nav_random_next(&[], 0, 1), None);
-    assert_eq!(nav_random_next(&[], 0, -1), None);
+    assert_eq!(nav_random_next(&[], 0, 1, &no_broken()), None);
+    assert_eq!(nav_random_next(&[], 0, -1, &no_broken()), None);
 }
 
 #[test]

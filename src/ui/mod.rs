@@ -76,28 +76,49 @@ impl std::str::FromStr for NavMode {
 /// Чистая функция — легко тестировать без UI.
 ///   • edge:  cur+dir; за границей [0, count) → None (стоим на месте).
 ///   • cycle: cur+dir с заворачиванием (0−1 → count−1; count−1+1 → 0).
+/// 4.4c-3 — broken: индексы битых файлов; навигация их ПРОПУСКАЕТ (шагает
+/// дальше, не грузя заведомо битое). Битые исключены из листания во всех
+/// режимах — иначе random постоянно попадал в битые серии (миниатюра битого
+/// мелькала, скип уводил на другой кадр).
 /// Random-режим обрабатывает nav_random_next (шаг по перемешанному списку).
-pub fn nav_next(cur: i32, count: i32, dir: i32, mode: NavMode) -> Option<i32> {
+pub fn nav_next(
+    cur: i32,
+    count: i32,
+    dir: i32,
+    mode: NavMode,
+    broken: &std::collections::HashSet<i32>,
+) -> Option<i32> {
     if count <= 0 {
         return None; // пустой список — листать нечего
     }
     match mode {
         NavMode::Edge => {
-            let ni = cur + dir;
-            if ni < 0 || ni >= count {
-                None // край — стоп, не переходим
-            } else {
-                Some(ni)
+            let mut ni = cur + dir;
+            loop {
+                if ni < 0 || ni >= count {
+                    return None; // край — стоп, не переходим
+                }
+                if !broken.contains(&ni) {
+                    return Some(ni); // годное — сюда
+                }
+                ni += dir; // битое — шагаем дальше в том же направлении
             }
         }
         NavMode::Cycle => {
+            // Заворачиваем и шагаем, пока не найдём годное (или не обойдём всё).
             let mut ni = cur + dir;
-            if ni >= count {
-                ni = 0;
-            } else if ni < 0 {
-                ni = count - 1;
+            for _ in 0..count {
+                if ni >= count {
+                    ni = 0;
+                } else if ni < 0 {
+                    ni = count - 1;
+                }
+                if !broken.contains(&ni) {
+                    return Some(ni);
+                }
+                ni += dir;
             }
-            Some(ni)
+            None // весь список битый — стоп
         }
         // 4.4c — random идёт по перемешанному списку (см. nav_random_next);
         // сюда не попадаем, но вернуть что-то безопасное нужно для полноты.
@@ -127,17 +148,28 @@ pub fn shuffled_order(count: i32) -> Vec<i32> {
 /// order — перестановка индексов фото; pos — текущая ПОЗИЦИЯ в списке;
 /// dir — +1 (next) / −1 (prev) по СПИСКУ. Возвращает Some((новая позиция,
 /// индекс фото)) или None (дошли до края списка — стоп, как в edge).
+/// 4.4c-3 — broken: битые позиции списка ПРОПУСКАЕМ (шагаем дальше, пока
+/// не найдём годное) — random больше не попадает в битые серии.
 /// Чистая функция — легко тестировать.
-pub fn nav_random_next(order: &[i32], pos: i32, dir: i32) -> Option<(i32, i32)> {
+pub fn nav_random_next(
+    order: &[i32],
+    pos: i32,
+    dir: i32,
+    broken: &std::collections::HashSet<i32>,
+) -> Option<(i32, i32)> {
     let len = order.len() as i32;
     if len <= 0 {
         return None; // пустой список — листать нечего
     }
-    let np = pos + dir;
-    if np < 0 || np >= len {
-        return None; // край перемешанного списка — стоп
+    let mut np = pos + dir;
+    while np >= 0 && np < len {
+        let photo = order[np as usize];
+        if !broken.contains(&photo) {
+            return Some((np, photo)); // годное — сюда
+        }
+        np += dir; // битое — следующая позиция списка
     }
-    order.get(np as usize).map(|&photo| (np, photo))
+    None // край перемешанного списка — стоп
 }
 
 /// 4.3g — кламп смещения фото «край в край» ПО КАРТИНКЕ (contain-fit).
@@ -816,6 +848,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         shuffle_order: RefCell<Option<Vec<i32>>>,
         /// 4.4c — текущая ПОЗИЦИЯ в перемешанном списке (не индекс фото!).
         shuffle_pos: Cell<i32>,
+        /// 4.4c-3 — индексы битых файлов (воркер помечает при ошибке декода).
+        /// Навигация всех режимов их ПРОПУСКАЕТ: random больше не попадает в
+        /// битые серии (миниатюра битого не мелькает, скип не уводит на другой
+        /// кадр). UI-поток — RefCell ок; растёт по ходу просмотра.
+        broken: Rc<RefCell<std::collections::HashSet<i32>>>,
     }
 
     impl ViewerCtx {
@@ -850,9 +887,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         /// ТОЙ ЖЕ генерацией. Открытие, next/prev и скип используют только
         /// эту схему — она существует в одном месте (DRY), и все записи в
         /// слой сверяются с одним поколением.
-        fn switch_to_photo(&self, index: i32, skip_depth: u32) {
+        /// 4.4c-3 — show_thumb=false для кандидата скипа: не показываем
+        /// миниатюру, пока не знаем, что файл годный (иначе миниатюра битого
+        /// мелькала перед уходом на другой кадр).
+        fn switch_to_photo(&self, index: i32, skip_depth: u32, show_thumb: bool) {
             let my_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-            self.show_thumbnail(index, my_gen);
+            if show_thumb {
+                self.show_thumbnail(index, my_gen);
+            }
             self.request_load(index, my_gen, skip_depth);
         }
 
@@ -865,6 +907,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             use slint::Model; // trait Model::row_data
             if self.generation.load(Ordering::SeqCst) != my_gen {
                 return; // переход неактуален — слой принадлежит новому поколению
+            }
+            // 4.4c-3 — битые не показываем: их миниатюра «врёт» (файл не
+            // декодируется), а скип сейчас уведёт на другой кадр.
+            if self.broken.borrow().contains(&index) {
+                return;
             }
             if let Some(w) = self.ui_weak.upgrade() {
                 let thumbs = w.get_thumbnails();
@@ -1010,6 +1057,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         nav_mode: Rc::new(RefCell::new(NavMode::Edge)), // 4.4a — до края по умолчанию
         shuffle_order: RefCell::new(None),              // 4.4c — строится при random
         shuffle_pos: Cell::new(0),
+        broken: Rc::new(RefCell::new(std::collections::HashSet::new())), // 4.4c-3
     });
 
     /// Загружает полное изображение по пути и возвращает сырые RGBA-данные (Send).
@@ -1653,7 +1701,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
             // 4.3i — единый переход: одно поколение делят миниатюра (мгновенно
             // в единый viewer-image) и чёткое фото (перезапишет тот же слой).
-            ctx.switch_to_photo(index, 0);
+            ctx.switch_to_photo(index, 0, true);
         });
     }
     // Закрыть viewer: выходим из полноэкранного режима, возвращаем оконный.
@@ -1694,14 +1742,19 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     let Some(order) = order.as_ref() else {
                         return; // список не построен (сессия пуста) — выходим
                     };
-                    let Some((np, photo)) = nav_random_next(order, ctx.shuffle_pos.get(), 1) else {
+                    let broken = ctx.broken.borrow();
+                    let Some((np, photo)) =
+                        nav_random_next(order, ctx.shuffle_pos.get(), 1, &broken)
+                    else {
                         return; // край перемешанного списка — стоп
                     };
+                    drop(broken);
                     ctx.shuffle_pos.set(np);
                     photo
                 }
                 _ => {
-                    let Some(idx) = nav_next(cur, count, 1, mode) else {
+                    let broken = ctx.broken.borrow();
+                    let Some(idx) = nav_next(cur, count, 1, mode, &broken) else {
                         return; // edge: дошли до края — стоп, ничего не грузим
                     };
                     idx
@@ -1715,7 +1768,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 w.set_viewer_offset_y(0.0);
             }
             // 4.3i — единый переход: одно поколение делят миниатюра и чёткое.
-            ctx.switch_to_photo(idx, 0);
+            ctx.switch_to_photo(idx, 0, true);
         });
     }
     // Предыдущее фото — та же схема (dir = −1); в random — предыдущая
@@ -1737,15 +1790,19 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     let Some(order) = order.as_ref() else {
                         return;
                     };
-                    let Some((np, photo)) = nav_random_next(order, ctx.shuffle_pos.get(), -1)
+                    let broken = ctx.broken.borrow();
+                    let Some((np, photo)) =
+                        nav_random_next(order, ctx.shuffle_pos.get(), -1, &broken)
                     else {
                         return; // начало перемешанного списка — стоп
                     };
+                    drop(broken);
                     ctx.shuffle_pos.set(np);
                     photo
                 }
                 _ => {
-                    let Some(idx) = nav_next(cur, count, -1, mode) else {
+                    let broken = ctx.broken.borrow();
+                    let Some(idx) = nav_next(cur, count, -1, mode, &broken) else {
                         return; // edge: дошли до первого фото — стоп (фикс «в минус»)
                     };
                     idx
@@ -1759,7 +1816,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 w.set_viewer_offset_y(0.0);
             }
             // 4.3i — единый переход: одно поколение делят миниатюра и чёткое.
-            ctx.switch_to_photo(idx, 0);
+            ctx.switch_to_photo(idx, 0, true);
         });
     }
 
@@ -1798,6 +1855,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 }
                 return;
             }
+            // 4.4c-3 — помечаем битый индекс (пришёл от воркера как next_index
+            // минус dir = сам битый): навигация всех режимов его пропустит.
+            let broken_idx = next_index - dir;
+            if broken_idx >= 0 && broken_idx < count {
+                ctx.broken.borrow_mut().insert(broken_idx);
+            }
             // 4.4c-2 — в random скип идёт ПО ПЕРЕМЕШАННОМУ СПИСКУ, а не к
             // линейному соседу: иначе случайный кадр «убегал» на линейного
             // соседа (в логе: random дал 1531 → битый → скип линейно прыгал
@@ -1816,7 +1879,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     return;
                 };
                 let dir_list = if dir == 0 { 1 } else { dir };
-                match nav_random_next(order, ctx.shuffle_pos.get(), dir_list) {
+                let broken = ctx.broken.borrow();
+                match nav_random_next(order, ctx.shuffle_pos.get(), dir_list, &broken) {
                     Some((np, photo)) => {
                         ctx.shuffle_pos.set(np); // синхронизация с показанным
                         photo
@@ -1837,15 +1901,26 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             } else {
                 // 4.3g — фикс «скипа через один»: воркер уже прислал ЦЕЛЕВОЙ
                 // next_index (= битый index + dir), повторно dir НЕ прибавляем.
-                let idx = next_index;
-                if idx < 0 || idx >= count {
-                    // Достигли края и дальше годных нет — показываем плашку.
-                    log::error!("request-skip: край списка (idx={idx}, count={count}) — плашка");
-                    if let Some(w) = ctx.ui_weak.upgrade() {
-                        w.set_viewer_image(slint::Image::default());
-                        w.set_viewer_error("Файл не открывается".into());
+                // 4.4c-3 — если ЦЕЛЕВОЙ тоже битый (уже в broken) — шагаем
+                // дальше по направлению, пока не найдём годное (без загрузки).
+                let broken = ctx.broken.borrow();
+                let mut idx = next_index;
+                loop {
+                    if idx < 0 || idx >= count {
+                        // Достигли края и дальше годных нет — плашка.
+                        log::error!(
+                            "request-skip: край списка (idx={idx}, count={count}) — плашка"
+                        );
+                        if let Some(w) = ctx.ui_weak.upgrade() {
+                            w.set_viewer_image(slint::Image::default());
+                            w.set_viewer_error("Файл не открывается".into());
+                        }
+                        return;
                     }
-                    return;
+                    if !broken.contains(&idx) {
+                        break; // годное — сюда
+                    }
+                    idx += dir; // битое — дальше по направлению
                 }
                 idx
             };
@@ -1863,7 +1938,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             // switch_to_photo (одно поколение делят миниатюра и чёткое).
             // skip_depth уходит в задачу воркера: если и этот файл битый,
             // воркер снова попросит скип.
-            ctx.switch_to_photo(idx, skip_depth as u32);
+            // 4.4c-3 — show_thumb=false: НЕ показываем миниатюру кандидата
+            // скипа — он ещё не проверен (если битый, миниатюра не мелькнёт).
+            ctx.switch_to_photo(idx, skip_depth as u32, false);
         });
     }
 
