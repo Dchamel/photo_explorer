@@ -32,6 +32,81 @@ pub fn next_valid_index(next_index: i32, dir: i32, count: i32) -> i32 {
     }
 }
 
+/// 4.4a — режим листания в просмотрщике (per-project, хранится в сессии).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavMode {
+    /// До края: на первом/последнем фото стоп (не заворачиваем).
+    Edge,
+    /// Циклично: на границе заворачиваем на противоположный край.
+    Cycle,
+    /// Случайный порядок: next/prev выбирают случайный кадр из всего списка.
+    Random,
+}
+
+impl NavMode {
+    /// Обратно в строку для сохранения в сессию.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NavMode::Edge => "edge",
+            NavMode::Cycle => "cycle",
+            NavMode::Random => "random",
+        }
+    }
+}
+
+/// Разбор режима из строки сессии: "edge" | "cycle" | "random".
+/// Пустая строка (старые JSON без поля) и неизвестные значения → Edge
+/// (по умолчанию — самое предсказуемое, чинит «прыжок в конец»).
+/// Реализуем стандартный трейт FromStr (идиоматично, как советует clippy).
+impl std::str::FromStr for NavMode {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "cycle" => NavMode::Cycle,
+            "random" => NavMode::Random,
+            _ => NavMode::Edge,
+        })
+    }
+}
+
+/// 4.4a — следующий индекс листания по режиму.
+/// cur — текущий индекс, dir — +1 (next) / −1 (prev), count — размер списка.
+/// Возвращает Some(новый индекс) или None (стоп: в edge-режиме дошли до края).
+/// Чистая функция — легко тестировать без UI.
+///   • edge:   cur+dir; за границей [0, count) → None (стоим на месте).
+///   • cycle:  cur+dir с заворачиванием (0−1 → count−1; count−1+1 → 0).
+///   • random: случайный индекс из [0, count); dir игнорируется (обе кнопки
+///             случайные — решение заказчика).
+pub fn nav_next(cur: i32, count: i32, dir: i32, mode: NavMode) -> Option<i32> {
+    if count <= 0 {
+        return None; // пустой список — листать нечего
+    }
+    match mode {
+        NavMode::Edge => {
+            let ni = cur + dir;
+            if ni < 0 || ni >= count {
+                None // край — стоп, не переходим
+            } else {
+                Some(ni)
+            }
+        }
+        NavMode::Cycle => {
+            let mut ni = cur + dir;
+            if ni >= count {
+                ni = 0;
+            } else if ni < 0 {
+                ni = count - 1;
+            }
+            Some(ni)
+        }
+        NavMode::Random => {
+            use rand::Rng;
+            Some(rand::thread_rng().gen_range(0..count))
+        }
+    }
+}
+
 /// 4.3g — кламп смещения фото «край в край» ПО КАРТИНКЕ (contain-fit).
 /// Элемент Image имеет размер vp*zoom, но картинка вписана (contain) и у
 /// узких/широких фото МЕНЬШЕ элемента. Кламп по элементу позволял утащить
@@ -692,6 +767,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         generation: Arc<AtomicU64>,
         last_direction: Arc<AtomicI32>,
         load_tx: mpsc::Sender<LoadTask>,
+        /// 4.4a — режим листания текущего проекта (edge/cycle/random).
+        /// Меняется при открытии сессии и из панели ⚙; UI-поток — RefCell ок.
+        nav_mode: Rc<RefCell<NavMode>>,
     }
 
     impl ViewerCtx {
@@ -857,6 +935,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         generation: viewer_generation.clone(),
         last_direction: last_direction.clone(),
         load_tx: load_tx.clone(),
+        nav_mode: Rc::new(RefCell::new(NavMode::Edge)), // 4.4a — до края по умолчанию
     });
 
     /// Загружает полное изображение по пути и возвращает сырые RGBA-данные (Send).
@@ -991,6 +1070,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                     id: prev.id.clone(),
                                     name: prev.name.clone(),
                                     is_project: prev.is_project,
+                                    // 4.4a — настройка листания проекта переживает
+                                    // перескан (per-project, не сбрасывается).
+                                    nav_mode: prev.nav_mode.clone(),
                                     fingerprint: fingerprint_of(&scanned_photos),
                                     photos: scanned_photos.clone(),
                                     last_opened: now,
@@ -1017,6 +1099,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                         photos: scanned_photos.clone(),
                                         last_opened: now,
                                         is_project: false,
+                                        // 4.4a — новый проект: "" = edge (до края).
+                                        nav_mode: String::new(),
                                     }
                                 }
                             };
@@ -1120,6 +1204,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let scanner = scanner.clone();
         let ui_weak = ui.as_weak();
         let photos = photos.clone();
+        let viewer_ctx = viewer_ctx.clone();
         ui.on_open_session(move |id| {
             log::info!("sessions: открыть сессию id={id}");
             let session = match store.load(&id) {
@@ -1132,44 +1217,26 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     return;
                 }
             };
-            // Мгновенный показ: миниатюры из кэша (генерация пропущена —
-            // они уже на диске с прошлого открытия).
+            // 4.4a — МГНОВЕННЫЙ показ без фриза: в UI-потоке только дешёвые
+            // операции (JSON уже прочитан, список путей склонирован). Тяжёлое —
+            // миниатюры всех фото (у заказчика 10653 шт.), сохранение сессии
+            // и проверка fingerprint — уходит в ОДИН фоновый поток со строгим
+            // порядком: сначала миниатюры на экран, потом проверка папки.
+            // Раньше thumbnails() звался синхронно в UI-потоке → окно
+            // «зависало» на 10-60 секунд на больших проектах.
             let session_photos = session.photos.clone();
-            let n = session_photos.len();
-            let thumb_results = thumbs.thumbnails(&session_photos);
-            let out: Vec<_> = thumb_results.into_iter().flatten().collect();
-            let count = out.len();
             *lock_or_recover(&photos) = session_photos;
+            // 4.4a — режим листания проекта: в контекст вьюера и панель ⚙.
+            // parse() — трейт FromStr; пустая строка/мусор → Edge (по умолчанию).
+            let nav: NavMode = session.nav_mode.parse().unwrap_or(NavMode::Edge);
+            *viewer_ctx.nav_mode.borrow_mut() = nav;
             if let Some(w) = ui_weak.upgrade() {
                 w.set_show_start(false);
-                let items: Vec<ThumbItem> = out
-                    .into_iter()
-                    .map(|t| {
-                        let mut buf =
-                            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(t.width, t.height);
-                        let pixels = buf.make_mut_slice();
-                        for (dst, chunk) in pixels.iter_mut().zip(t.data.as_chunks::<4>().0) {
-                            dst.r = chunk[0];
-                            dst.g = chunk[1];
-                            dst.b = chunk[2];
-                            dst.a = chunk[3];
-                        }
-                        ThumbItem {
-                            file_name: t
-                                .source_path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_default()
-                                .into(),
-                            source_path: t.source_path.to_string_lossy().to_string().into(),
-                            image: slint::Image::from_rgba8(buf),
-                        }
-                    })
-                    .collect();
-                w.set_thumbnails(slint::ModelRc::new(slint::VecModel::from(items)));
-                w.set_status_text(
-                    format!("Проект «{}»: фото {count} (из {n})", session.name).into(),
-                );
+                w.set_nav_mode(nav.as_str().into());
+                // 4.7g — фиксируем открытый проект в верхней панели.
+                w.set_current_session_id(session.id.clone().into());
+                w.set_current_project_name(session.name.clone().into());
+                w.set_status_text(format!("Открываю проект «{}»…", session.name).into());
             }
             // Обновляем last_opened (recent поднимается вверх списка).
             let now = std::time::SystemTime::now()
@@ -1178,19 +1245,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 .unwrap_or(0);
             let mut updated = session.clone();
             updated.last_opened = now;
-            if let Err(e) = store.save(&updated) {
-                log::error!("sessions: не удалось обновить last_opened: {e}");
-            }
-            // 4.7g — фиксируем открытый проект в верхней панели.
-            if let Some(w) = ui_weak.upgrade() {
-                w.set_current_session_id(updated.id.clone().into());
-                w.set_current_project_name(updated.name.clone().into());
-            }
-            refresh_session_list(&store, &thumbs, &ui_weak);
 
-            // 4.7d — ФОНОВАЯ проверка актуальности: сканируем папку заново
-            // (метаданные, быстро) и сверяем fingerprint. Показ уже на экране —
-            // пользователь не ждёт. Совпал → ничего; изменился → досскан разницы.
+            // 4.4a — ФОНОВЫЙ поток: миниатюры → сохранение → fingerprint.
             let store_bg = store.clone();
             let thumbs_bg = thumbs.clone();
             let scanner_bg = scanner.clone();
@@ -1198,6 +1254,65 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             let photos_bg = photos.clone();
             let session_bg = updated.clone();
             std::thread::spawn(move || {
+                // 1) Миниатюры всех фото проекта: тёплый дисковый кэш — быстро;
+                // холодный — генерация здесь же, в фоне (UI не блокируется).
+                let thumb_results = thumbs_bg.thumbnails(&session_bg.photos);
+                let out: Vec<_> = thumb_results.into_iter().flatten().collect();
+                let count = out.len();
+                let n_bg = session_bg.photos.len();
+                let name = session_bg.name.clone();
+                let ui_weak = ui_weak_bg.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(w) = ui_weak.upgrade() {
+                        let items: Vec<ThumbItem> = out
+                            .into_iter()
+                            .map(|t| {
+                                let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
+                                    t.width, t.height,
+                                );
+                                let pixels = buf.make_mut_slice();
+                                for (dst, chunk) in pixels.iter_mut().zip(t.data.as_chunks::<4>().0)
+                                {
+                                    dst.r = chunk[0];
+                                    dst.g = chunk[1];
+                                    dst.b = chunk[2];
+                                    dst.a = chunk[3];
+                                }
+                                ThumbItem {
+                                    file_name: t
+                                        .source_path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default()
+                                        .into(),
+                                    source_path: t.source_path.to_string_lossy().to_string().into(),
+                                    image: slint::Image::from_rgba8(buf),
+                                }
+                            })
+                            .collect();
+                        w.set_thumbnails(slint::ModelRc::new(slint::VecModel::from(items)));
+                        w.set_status_text(
+                            format!("Проект «{name}»: фото {count} (из {n_bg})").into(),
+                        );
+                    }
+                });
+                // 2) Сохраняем last_opened (диск I/O — в фоне, не в UI).
+                if let Err(e) = store_bg.save(&session_bg) {
+                    log::error!("sessions: не удалось обновить last_opened: {e}");
+                }
+                // Стартовый экран обновится с новым порядком recent.
+                {
+                    let store_r = store_bg.clone();
+                    let thumbs_r = thumbs_bg.clone();
+                    let ui_weak_r = ui_weak_bg.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        refresh_session_list(&store_r, &thumbs_r, &ui_weak_r);
+                    });
+                }
+                // 3) 4.7d — ФОНОВАЯ проверка актуальности: сканируем папку
+                // заново (метаданные, быстро) и сверяем fingerprint. Показ уже
+                // на экране — пользователь не ждёт. Совпал → ничего;
+                // изменился → досскан разницы.
                 let mode = if session_bg.mode == "recursive" {
                     ScanMode::FolderRecursive(session_bg.folder.clone())
                 } else {
@@ -1384,6 +1499,39 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
         });
     }
+    // 4.4a — сменить режим листания проекта (edge/cycle/random) из панели ⚙.
+    // Обновляем: контекст вьюера (листание сразу в новом режиме), property UI
+    // (подсветка переключателя) и сессию в хранилище (переживает перезапуск).
+    {
+        let store = store.clone();
+        let ui_weak = ui.as_weak();
+        let viewer_ctx = viewer_ctx.clone();
+        ui.on_set_nav_mode(move |mode| {
+            let nav: NavMode = mode.parse().unwrap_or(NavMode::Edge);
+            log::info!("settings: режим листания → {}", nav.as_str());
+            *viewer_ctx.nav_mode.borrow_mut() = nav;
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_nav_mode(nav.as_str().into());
+            }
+            // Сохраняем в сессию, если открыт проект (id непустой).
+            let id: String = ui_weak
+                .upgrade()
+                .map(|w| w.get_current_session_id().to_string())
+                .unwrap_or_default();
+            if id.is_empty() {
+                return; // галерея открыта из диалога, не сессия — сохранять некуда
+            }
+            match store.load(&id) {
+                Ok(mut s) => {
+                    s.nav_mode = nav.as_str().to_string();
+                    if let Err(e) = store.save(&s) {
+                        log::error!("settings: не удалось сохранить nav_mode: {e}");
+                    }
+                }
+                Err(e) => log::error!("settings: сессия {id} не читается: {e}"),
+            }
+        });
+    }
 
     // --- Viewer колбэги ---
     // Открыть фото по индексу.
@@ -1423,63 +1571,60 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
         });
     }
-    // Следующее фото. Без debounce (он затормаживал листание): грузим сразу.
+    // Следующее/предыдущее фото — единая схема 4.4a: индекс считает ЧИСТАЯ
+    // функция nav_next по режиму проекта (edge — стоп на краю / cycle —
+    // заворот / random — случайный кадр; обе кнопки случайные — решение
+    // заказчика). None = стоп на границе: остаёмся, ничего не грузим.
+    // Без debounce (он затормаживал листание): грузим сразу.
     // 4.3i — слой один: миниатюра нового кадра сама перезаписывает viewer-image,
     // промежуточная очистка не нужна (она давала бы чёрный кадр-вспышку).
     {
         let ctx = viewer_ctx.clone();
         ui.on_viewer_next(move || {
             ctx.last_direction.store(1, Ordering::SeqCst); // 4.3e — листаем вперёд.
+            let count = lock_or_recover(&ctx.photos).len() as i32;
+            let cur = ctx
+                .ui_weak
+                .upgrade()
+                .map(|w| w.get_viewer_index())
+                .unwrap_or(0);
+            let mode = *ctx.nav_mode.borrow();
+            let Some(idx) = nav_next(cur, count, 1, mode) else {
+                return; // edge: дошли до края — стоп, ничего не грузим
+            };
             if let Some(w) = ctx.ui_weak.upgrade() {
-                let count = lock_or_recover(&ctx.photos).len() as i32;
-                if count == 0 {
-                    return;
-                }
-                let mut idx = w.get_viewer_index() + 1;
-                if idx >= count {
-                    idx = 0;
-                }
-                log::debug!("viewer: next → index={idx}");
+                log::debug!("viewer: next → index={idx} (mode={})", mode.as_str());
                 w.set_viewer_index(idx);
                 w.set_viewer_zoom(1.0); // сброс зума для нового фото
                 w.set_viewer_offset_x(0.0);
                 w.set_viewer_offset_y(0.0);
             }
-            let idx = ctx
-                .ui_weak
-                .upgrade()
-                .map(|w| w.get_viewer_index())
-                .unwrap_or(0);
             // 4.3i — единый переход: одно поколение делят миниатюра и чёткое.
             ctx.switch_to_photo(idx, 0);
         });
     }
-    // Предыдущее фото. Без debounce: грузим сразу; миниатюра мгновенно в
-    // единый слой (4.3i), чёткое перезапишет его по готовности.
+    // Предыдущее фото — та же схема через nav_next (dir = −1).
     {
         let ctx = viewer_ctx.clone();
         ui.on_viewer_prev(move || {
             ctx.last_direction.store(-1, Ordering::SeqCst); // 4.3e — листаем назад.
+            let count = lock_or_recover(&ctx.photos).len() as i32;
+            let cur = ctx
+                .ui_weak
+                .upgrade()
+                .map(|w| w.get_viewer_index())
+                .unwrap_or(0);
+            let mode = *ctx.nav_mode.borrow();
+            let Some(idx) = nav_next(cur, count, -1, mode) else {
+                return; // edge: дошли до первого фото — стоп (фикс «в минус»)
+            };
             if let Some(w) = ctx.ui_weak.upgrade() {
-                let count = lock_or_recover(&ctx.photos).len() as i32;
-                if count == 0 {
-                    return;
-                }
-                let mut idx = w.get_viewer_index() - 1;
-                if idx < 0 {
-                    idx = count - 1;
-                }
-                log::debug!("viewer: prev → index={idx}");
+                log::debug!("viewer: prev → index={idx} (mode={})", mode.as_str());
                 w.set_viewer_index(idx);
                 w.set_viewer_zoom(1.0); // сброс зума для нового фото
                 w.set_viewer_offset_x(0.0);
                 w.set_viewer_offset_y(0.0);
             }
-            let idx = ctx
-                .ui_weak
-                .upgrade()
-                .map(|w| w.get_viewer_index())
-                .unwrap_or(0);
             // 4.3i — единый переход: одно поколение делят миниатюра и чёткое.
             ctx.switch_to_photo(idx, 0);
         });

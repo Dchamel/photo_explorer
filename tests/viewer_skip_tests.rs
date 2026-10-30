@@ -1,7 +1,9 @@
-//! Тесты авто-скипа битых файлов в просмотрщике (4.3e).
+//! Тесты авто-скипа битых файлов в просмотрщике (4.3e) и режимов листания (4.4a).
 //!
 //! `next_valid_index` — чистая функция выбора следующего индекса при скипе:
 //!dir = +1 (вперёд) / −1 (назад), кламп по границам, −1 = «годных больше нет».
+//! `nav_next` (4.4a) — следующий индекс по режиму проекта: edge (стоп на краю),
+//! cycle (заворачивание), random (случайный кадр; обе кнопки случайные).
 //! Дополнительно: реальный файл .png с мусорным содержимым не декодируется
 //! (image::open → Err) — это и есть условие скипа в воркере.
 
@@ -9,7 +11,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use photo_explorer::ui::{clamp_offset, next_valid_index};
+use photo_explorer::ui::{clamp_offset, nav_next, next_valid_index, NavMode};
 
 static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -151,4 +153,91 @@ fn clamp_offset_negative_viewport_safe() {
     // img=1000 ≤ vp=0 → size=1000*1*2=2000, max=(2000−0)/2=1000? Нет: contain_scale
     // при vp=0 → 0/480=0 → size=0 → max=0. Проверяем фактическое поведение.
     assert_eq!(clamp_offset(123.0, 2.0, 0.0, 1000.0, 1000.0, 0.0), 0.0);
+}
+
+// --- 4.4a — nav_next: режимы листания (edge / cycle / random) ---
+
+#[test]
+fn nav_next_edge_stops_at_last_photo() {
+    // 5 фото, стоим на последнем (4), next → None (стоп, не прыгаем на 0).
+    assert_eq!(nav_next(4, 5, 1, NavMode::Edge), None);
+}
+
+#[test]
+fn nav_next_edge_stops_at_first_photo() {
+    // 5 фото, стоим на первом (0), prev → None (стоп — фикс «листает в минус»).
+    assert_eq!(nav_next(0, 5, -1, NavMode::Edge), None);
+}
+
+#[test]
+fn nav_next_edge_moves_in_bounds() {
+    assert_eq!(nav_next(2, 5, 1, NavMode::Edge), Some(3));
+    assert_eq!(nav_next(2, 5, -1, NavMode::Edge), Some(1));
+}
+
+#[test]
+fn nav_next_cycle_wraps_forward() {
+    // Последний (4) + next → первый (0).
+    assert_eq!(nav_next(4, 5, 1, NavMode::Cycle), Some(0));
+}
+
+#[test]
+fn nav_next_cycle_wraps_backward() {
+    // Первый (0) + prev → последний (4).
+    assert_eq!(nav_next(0, 5, -1, NavMode::Cycle), Some(4));
+}
+
+#[test]
+fn nav_next_cycle_in_bounds() {
+    assert_eq!(nav_next(2, 5, 1, NavMode::Cycle), Some(3));
+    assert_eq!(nav_next(2, 5, -1, NavMode::Cycle), Some(1));
+}
+
+#[test]
+fn nav_next_random_always_in_range() {
+    // 100 попыток: обе кнопки (dir ±1) дают индекс строго внутри [0, count).
+    for _ in 0..100 {
+        let f = nav_next(2, 5, 1, NavMode::Random).expect("random всегда Some");
+        assert!((0..5).contains(&f), "индекс вне диапазона: {f}");
+        let b = nav_next(2, 5, -1, NavMode::Random).expect("random всегда Some");
+        assert!((0..5).contains(&b), "индекс вне диапазона: {b}");
+    }
+}
+
+#[test]
+fn nav_next_random_single_file_returns_zero() {
+    // 1 фото: случайный выбор из одного — всегда 0.
+    assert_eq!(nav_next(0, 1, 1, NavMode::Random), Some(0));
+    assert_eq!(nav_next(0, 1, -1, NavMode::Random), Some(0));
+}
+
+#[test]
+fn nav_next_empty_list_returns_none_any_mode() {
+    // Пустой список — листать нечего ни в каком режиме.
+    assert_eq!(nav_next(0, 0, 1, NavMode::Edge), None);
+    assert_eq!(nav_next(0, 0, 1, NavMode::Cycle), None);
+    assert_eq!(nav_next(0, 0, 1, NavMode::Random), None);
+}
+
+#[test]
+fn nav_next_edge_single_file_never_moves() {
+    // 1 фото в edge: next и prev → None (соседей нет, стоп).
+    assert_eq!(nav_next(0, 1, 1, NavMode::Edge), None);
+    assert_eq!(nav_next(0, 1, -1, NavMode::Edge), None);
+}
+
+#[test]
+fn nav_mode_parses_strings() {
+    // FromStr-трейт: явные значения; пустая строка (старые JSON) и мусор
+    // → Edge (по умолчанию).
+    let parse = |s: &str| -> NavMode { s.parse().unwrap_or(NavMode::Edge) };
+    assert_eq!(parse("edge"), NavMode::Edge);
+    assert_eq!(parse("cycle"), NavMode::Cycle);
+    assert_eq!(parse("random"), NavMode::Random);
+    assert_eq!(parse(""), NavMode::Edge);
+    assert_eq!(parse("мусор"), NavMode::Edge);
+    // Обратное преобразование — стабильные строки для сессии.
+    assert_eq!(NavMode::Edge.as_str(), "edge");
+    assert_eq!(NavMode::Cycle.as_str(), "cycle");
+    assert_eq!(NavMode::Random.as_str(), "random");
 }

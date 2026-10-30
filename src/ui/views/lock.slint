@@ -20,6 +20,49 @@ component KeyButton inherits Rectangle {
     }
 }
 
+// 4.4a — строка-переключатель режима листания (панель ⚙ Настройки проекта).
+// value — строка режима ("edge" | "cycle" | "random"); selected — текущий
+// выбранный режим (для подсветки); selected() — сигнал «выбрали меня».
+component NavOption inherits Rectangle {
+    in property <string> value;
+    in property <string> label;
+    in property <string> hint;
+    in property <string> selected;
+    callback selected-clicked();
+    height: 44px;
+    border-radius: 8px;
+    background: root.selected == root.value ? #2a4d6f : #ffffff0d;
+    border-width: root.selected == root.value ? 1px : 0px;
+    border-color: Theme.accent;
+    HorizontalLayout {
+        padding: 10px;
+        spacing: 10px;
+        Text {
+            text: root.selected == root.value ? "◉" : "○";
+            color: Theme.accent;
+            font-size: 16px;
+            vertical-alignment: center;
+        }
+        VerticalLayout {
+            padding: 0px;
+            Text {
+                text: root.label;
+                color: Theme.text-primary;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.hint;
+                color: Theme.text-secondary;
+                font-size: 11px;
+                vertical-alignment: center;
+            }
+        }
+        Rectangle { horizontal-stretch: 1; }
+    }
+    TouchArea { clicked => { root.selected-clicked(); } }
+}
+
 // --- Экран блокировки ---
 export component LockScreen inherits Window {
     title: "Photo Explorer — вход";
@@ -174,6 +217,8 @@ export component GalleryScreen inherits Window {
     in-out property <string> current-project-name: "";
     // 4.7g — панель настроек проекта (каркас под 4.4).
     in-out property <bool> settings-visible: false;
+    // 4.4a — режим листания текущего проекта: "edge" | "cycle" | "random".
+    in-out property <string> nav-mode: "edge";
     // Диалог переименования проекта (Slint, без нативных диалогов).
     in-out property <bool> rename-visible: false;
     in-out property <string> rename-text: "";
@@ -187,6 +232,7 @@ export component GalleryScreen inherits Window {
     callback rename-cancel();        // отменить переименование
     callback open-settings();        // открыть панель настроек проекта
     callback close-settings();       // закрыть панель настроек
+    callback set-nav-mode(string);   // 4.4a — сменить режим листания проекта
 
     // --- Viewer (просмотр фото в полном размере) ---
     in-out property <bool> show-viewer: false;
@@ -905,13 +951,14 @@ export component GalleryScreen inherits Window {
         }
     }
 
-    // --- 4.7g — Панель настроек проекта (каркас под 4.4) ---
-    // Пока показывает имя проекта и заглушку «настройки появятся в 4.4».
+    // --- 4.4a — Панель настроек проекта: режим листания ---
+    // Три варианта: до края (стоп на первом/последнем), циклично (по кругу),
+    // случайно (хаотичный порядок). Выбор сохраняется в сессию проекта.
     if root.settings-visible : Rectangle {
         background: #000000b4;
         Rectangle {
-            width: 420px;
-            height: 300px;
+            width: 440px;
+            height: 360px;
             border-radius: 12px;
             background: Theme.panel;
             border-width: 1px;
@@ -934,9 +981,31 @@ export component GalleryScreen inherits Window {
                 }
                 Rectangle { height: 1px; background: #ffffff22; }
                 Text {
-                    text: "Настройки просмотра (фон, интерполяция, зум)\nпоявятся здесь на этапе 4.4.";
-                    color: Theme.text-secondary;
-                    font-size: 12px;
+                    text: "Листание в просмотрщике:";
+                    color: Theme.text-primary;
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+                NavOption {
+                    value: "edge";
+                    label: "До края";
+                    hint: "на первом/последнем фото стоп — без прыжка в конец";
+                    selected: root.nav-mode;
+                    selected-clicked() => { root.set-nav-mode("edge"); }
+                }
+                NavOption {
+                    value: "cycle";
+                    label: "Циклично";
+                    hint: "после последнего — снова первое (по кругу)";
+                    selected: root.nav-mode;
+                    selected-clicked() => { root.set-nav-mode("cycle"); }
+                }
+                NavOption {
+                    value: "random";
+                    label: "Случайно";
+                    hint: "кнопки листания выбирают случайное фото";
+                    selected: root.nav-mode;
+                    selected-clicked() => { root.set-nav-mode("random"); }
                 }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
@@ -948,7 +1017,7 @@ export component GalleryScreen inherits Window {
                         border-radius: 8px;
                         background: Theme.accent;
                         TouchArea { clicked => { root.close-settings(); } }
-                        Text { text: "Понятно"; color: white; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                        Text { text: "Готово"; color: white; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
                     }
                 }
             }

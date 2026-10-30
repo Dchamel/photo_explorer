@@ -41,6 +41,7 @@ fn sample_session(id: &str, folder: &str) -> Session {
         photos: vec![photo("C:/x/1.jpg", 10, 100), photo("C:/x/2.jpg", 20, 200)],
         last_opened: 1700000000,
         is_project: true,
+        nav_mode: "edge".to_string(), // 4.4a — режим листания по умолчанию
     }
 }
 
