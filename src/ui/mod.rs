@@ -678,136 +678,186 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         (index, path, generation, skip_depth)
     }
 
-    /// Мгновенно показывает миниатюру фото по индексу как placeholder (моргание).
-    /// Миниатюры уже в памяти (модель галереи) — показ без задержки.
-    fn show_thumbnail(ui_weak: &slint::Weak<GalleryScreen>, index: i32) {
-        use slint::Model; // trait Model::row_data
-        if let Some(w) = ui_weak.upgrade() {
-            let thumbs = w.get_thumbnails();
-            if let Some(item) = thumbs.row_data(index as usize) {
-                w.set_viewer_thumbnail(item.image);
-            }
-        }
-    }
-
-    /// Запросить показ фото по индексу (v7 — кэш готовых slint::Image + воркер).
-    /// 1) UI-кэш готовых slint::Image — МГНОВЕННО (дешёвый clone, без копирования).
-    /// 2) Сырой RGBA в кэше — строим slint::Image ОДИН раз, сохраняем в UI-кэш,
-    ///    показываем. При повторе — уже мгновенно из UI-кэша.
-    /// 3) Мимо кэша — задача воркеру (1 поток).
-    fn request_viewer_load(
+    /// 4.3i — контекст вьюера: всё состояние показа фото в одном месте
+    /// (KISS/DRY): список фото, кэши, поколение, направление, канал воркеру.
+    /// ЕДИНЫЙ переход switch_to_photo: одно поколение на переход делят
+    /// миниатюра (мгновенно) и чёткое фото — обе записи идут в ОДИН слой
+    /// viewer-image и сверяются с одним поколением, поэтому два разных
+    /// кадра физически не могут показаться одновременно.
+    struct ViewerCtx {
         photos: Arc<Mutex<Vec<Photo>>>,
-        index: i32,
         ui_weak: slint::Weak<GalleryScreen>,
         cache: Arc<Mutex<ViewerCache>>,
         image_cache: ImageCache,
         generation: Arc<AtomicU64>,
-        load_tx: &mpsc::Sender<LoadTask>,
-    ) {
-        let my_gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let idx = index as usize;
-        let path = {
-            let p = lock_or_recover(&photos);
-            match p.get(idx) {
-                Some(ph) => ph.path.clone(),
-                None => return,
-            }
-        };
-        // 1) UI-кэш готовых slint::Image — мгновенно, без копирования RGBA.
-        if let Some(img) = image_cache.borrow().get(&path).cloned() {
-            if generation.load(Ordering::SeqCst) == my_gen {
-                log::debug!(
-                    "request_viewer_load: «{}» из UI-кэша Image — мгновенно",
-                    path.display()
-                );
-                if let Some(w) = ui_weak.upgrade() {
-                    // 4.3g — размеры картинки для клампа «край в край» (contain-fit).
-                    // size() — физические px; в формуле contain_scale DPI сокращается.
-                    let sz = img.size();
-                    w.set_viewer_img_w(sz.width as f32);
-                    w.set_viewer_img_h(sz.height as f32);
-                    w.set_viewer_image(img);
-                    w.set_viewer_error("".into()); // 4.3e — успешный показ, гасим плашку.
-                }
-                enqueue_preload(&photos, index, cache, load_tx);
-            }
-            return;
-        }
-        // 2) Сырой RGBA в кэше — строим slint::Image ОДИН раз, кэшируем, показываем.
-        let cached_opt = lock_or_recover(&cache).get(&path).cloned();
-        if let Some(cached) = cached_opt {
-            if generation.load(Ordering::SeqCst) == my_gen {
-                log::debug!(
-                    "request_viewer_load: «{}» из RGBA-кэша — строим Image",
-                    path.display()
-                );
-                if let Some(w) = ui_weak.upgrade() {
-                    let (data, w_px, h_px) = cached;
-                    let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w_px, h_px);
-                    let pixels = buf.make_mut_slice();
-                    for (dst, chunk) in pixels.iter_mut().zip(data.as_chunks::<4>().0) {
-                        dst.r = chunk[0];
-                        dst.g = chunk[1];
-                        dst.b = chunk[2];
-                        dst.a = chunk[3];
-                    }
-                    let img = slint::Image::from_rgba8(buf);
-                    // Сохраняем в UI-кэш (с ограничением размера).
-                    let mut ic = image_cache.borrow_mut();
-                    if ic.len() >= IMAGE_CACHE_MAX {
-                        // Удаляем произвольный элемент (простейшая eviction).
-                        if let Some(k) = ic.keys().next().cloned() {
-                            ic.remove(&k);
-                        }
-                    }
-                    ic.insert(path.clone(), img.clone());
-                    // 4.3g — размеры картинки для клампа «край в край».
-                    w.set_viewer_img_w(w_px as f32);
-                    w.set_viewer_img_h(h_px as f32);
-                    w.set_viewer_image(img);
-                    w.set_viewer_error("".into()); // 4.3e — успешный показ, гасим плашку.
-                }
-                enqueue_preload(&photos, index, cache, load_tx);
-            }
-            return;
-        }
-        // 3) Мимо кэша — задача воркеру. Миниатюра-плейсхолдер уже показана,
-        //    индикатор «Загрузка» убран (бесполезен и залипал).
-        let _ = load_tx.send(LoadTask::Photo {
-            index,
-            path,
-            generation: my_gen,
-            skip_depth: 0,
-        });
+        last_direction: Arc<AtomicI32>,
+        load_tx: mpsc::Sender<LoadTask>,
     }
 
-    /// Ставит в канал задачи на предзагрузку соседей (index-1, index+1).
-    /// Воркер обработает их после текущего фото (низкий приоритет).
-    fn enqueue_preload(
-        photos: &Arc<Mutex<Vec<Photo>>>,
-        index: i32,
-        cache: Arc<Mutex<ViewerCache>>,
-        load_tx: &mpsc::Sender<LoadTask>,
-    ) {
-        let count = lock_or_recover(photos).len() as i32;
-        for ni in [index - 1, index + 1] {
-            if ni < 0 || ni >= count {
-                continue;
+    impl ViewerCtx {
+        /// ЕДИНЫЙ переход к фото (4.3i): инкрементирует поколение, мгновенно
+        /// пишет миниатюру в единый viewer-image и запрашивает чёткое фото
+        /// ТОЙ ЖЕ генерацией. Открытие, next/prev и скип используют только
+        /// эту схему — она существует в одном месте (DRY), и все записи в
+        /// слой сверяются с одним поколением.
+        fn switch_to_photo(&self, index: i32, skip_depth: u32) {
+            let my_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            self.show_thumbnail(index, my_gen);
+            self.request_load(index, my_gen, skip_depth);
+        }
+
+        /// Мгновенно показывает миниатюру фото по индексу (моргание).
+        /// 4.3i — единый слой: миниатюра пишется в viewer-image (второго слоя
+        /// больше нет). Как любая запись в слой, сверяет поколение: устаревший
+        /// вызов не перезапишет кадр более нового перехода.
+        /// Миниатюры уже в памяти (модель галереи) — показ без задержки.
+        fn show_thumbnail(&self, index: i32, my_gen: u64) {
+            use slint::Model; // trait Model::row_data
+            if self.generation.load(Ordering::SeqCst) != my_gen {
+                return; // переход неактуален — слой принадлежит новому поколению
             }
+            if let Some(w) = self.ui_weak.upgrade() {
+                let thumbs = w.get_thumbnails();
+                match thumbs.row_data(index as usize) {
+                    Some(item) => {
+                        // Размеры для клампа зума: у миниатюры то же соотношение
+                        // сторон, что у полного фото, поэтому contain-fit считается
+                        // корректно ещё до прихода чёткого кадра (DPI сокращается).
+                        let sz = item.image.size();
+                        w.set_viewer_img_w(sz.width as f32);
+                        w.set_viewer_img_h(sz.height as f32);
+                        w.set_viewer_image(item.image);
+                    }
+                    // Миниатюры нет (модель рассинхронизирована) — чистим слой,
+                    // чтобы не показывать кадр предыдущего перехода.
+                    None => w.set_viewer_image(slint::Image::default()),
+                }
+            }
+        }
+
+        /// Запросить показ чёткого фото по индексу (v7 — кэш готовых slint::Image
+        /// и воркер). 4.3i — my_gen приходит снаружи (от switch_to_photo):
+        /// одно поколение на переход делят миниатюра и чёткое фото — записи
+        /// в единый слой сверяются с одним и тем же поколением. skip_depth
+        /// протаскивается в задачу воркера (авто-скип битых файлов, 4.3e).
+        /// 1) UI-кэш готовых slint::Image — МГНОВЕННО (дешёвый clone, без копирования).
+        /// 2) Сырой RGBA в кэше — строим slint::Image ОДИН раз, сохраняем в UI-кэш,
+        ///    показываем. При повторе — уже мгновенно из UI-кэша.
+        /// 3) Мимо кэша — задача воркеру (1 поток).
+        fn request_load(&self, index: i32, my_gen: u64, skip_depth: u32) {
+            let idx = index as usize;
             let path = {
-                let p = lock_or_recover(photos);
-                match p.get(ni as usize) {
+                let p = lock_or_recover(&self.photos);
+                match p.get(idx) {
                     Some(ph) => ph.path.clone(),
-                    None => continue,
+                    None => return,
                 }
             };
-            // Уже в кэше — не шлём.
-            if lock_or_recover(&cache).contains(&path) {
-                continue;
+            // 1) UI-кэш готовых slint::Image — мгновенно, без копирования RGBA.
+            if let Some(img) = self.image_cache.borrow().get(&path).cloned() {
+                if self.generation.load(Ordering::SeqCst) == my_gen {
+                    log::debug!(
+                        "request_load: «{}» из UI-кэша Image — мгновенно",
+                        path.display()
+                    );
+                    if let Some(w) = self.ui_weak.upgrade() {
+                        // 4.3g — размеры картинки для клампа «край в край» (contain-fit).
+                        // size() — физические px; в формуле contain_scale DPI сокращается.
+                        let sz = img.size();
+                        w.set_viewer_img_w(sz.width as f32);
+                        w.set_viewer_img_h(sz.height as f32);
+                        w.set_viewer_image(img);
+                        w.set_viewer_error("".into()); // 4.3e — успешный показ, гасим плашку.
+                    }
+                    self.enqueue_preload(index);
+                }
+                return;
             }
-            let _ = load_tx.send(LoadTask::Preload { path });
+            // 2) Сырой RGBA в кэше — строим slint::Image ОДИН раз, кэшируем, показываем.
+            let cached_opt = lock_or_recover(&self.cache).get(&path).cloned();
+            if let Some(cached) = cached_opt {
+                if self.generation.load(Ordering::SeqCst) == my_gen {
+                    log::debug!(
+                        "request_load: «{}» из RGBA-кэша — строим Image",
+                        path.display()
+                    );
+                    if let Some(w) = self.ui_weak.upgrade() {
+                        let (data, w_px, h_px) = cached;
+                        let mut buf =
+                            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w_px, h_px);
+                        let pixels = buf.make_mut_slice();
+                        for (dst, chunk) in pixels.iter_mut().zip(data.as_chunks::<4>().0) {
+                            dst.r = chunk[0];
+                            dst.g = chunk[1];
+                            dst.b = chunk[2];
+                            dst.a = chunk[3];
+                        }
+                        let img = slint::Image::from_rgba8(buf);
+                        // Сохраняем в UI-кэш (с ограничением размера).
+                        let mut ic = self.image_cache.borrow_mut();
+                        if ic.len() >= IMAGE_CACHE_MAX {
+                            // Удаляем произвольный элемент (простейшая eviction).
+                            if let Some(k) = ic.keys().next().cloned() {
+                                ic.remove(&k);
+                            }
+                        }
+                        ic.insert(path.clone(), img.clone());
+                        // 4.3g — размеры картинки для клампа «край в край».
+                        w.set_viewer_img_w(w_px as f32);
+                        w.set_viewer_img_h(h_px as f32);
+                        w.set_viewer_image(img);
+                        w.set_viewer_error("".into()); // 4.3e — успешный показ, гасим плашку.
+                    }
+                    self.enqueue_preload(index);
+                }
+                return;
+            }
+            // 3) Мимо кэша — задача воркеру. Миниатюра уже в viewer-image
+            //    (единый слой, 4.3i); индикатор «Загрузка» убран (бесполезен и залипал).
+            let _ = self.load_tx.send(LoadTask::Photo {
+                index,
+                path,
+                generation: my_gen,
+                skip_depth,
+            });
+        }
+
+        /// Ставит в канал задачи на предзагрузку соседей (index-1, index+1).
+        /// Воркер обработает их после текущего фото (низкий приоритет).
+        fn enqueue_preload(&self, index: i32) {
+            let count = lock_or_recover(&self.photos).len() as i32;
+            for ni in [index - 1, index + 1] {
+                if ni < 0 || ni >= count {
+                    continue;
+                }
+                let path = {
+                    let p = lock_or_recover(&self.photos);
+                    match p.get(ni as usize) {
+                        Some(ph) => ph.path.clone(),
+                        None => continue,
+                    }
+                };
+                // Уже в кэше — не шлём.
+                if lock_or_recover(&self.cache).contains(&path) {
+                    continue;
+                }
+                let _ = self.load_tx.send(LoadTask::Preload { path });
+            }
         }
     }
+
+    // 4.3i — единый контекст вьюера: колбэки открытия, next/prev и скипа
+    // работают только через него (Rc-клон в каждое замыкание) — состояние
+    // в одном месте, схема перехода одна (DRY/KISS).
+    let viewer_ctx = Rc::new(ViewerCtx {
+        photos: photos.clone(),
+        ui_weak: ui.as_weak(),
+        cache: viewer_cache.clone(),
+        image_cache: image_cache.clone(),
+        generation: viewer_generation.clone(),
+        last_direction: last_direction.clone(),
+        load_tx: load_tx.clone(),
+    });
 
     /// Загружает полное изображение по пути и возвращает сырые RGBA-данные (Send).
     /// Downscale до VIEWER_MAX_SIZE для скорости. Результат кэшируется.
@@ -1341,17 +1391,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // окно разворачивается на текущий монитор. Само приложение в обычном
     // оконном режиме; на весь экран уходит только просмотр фото.
     {
-        let photos = photos.clone();
-        let ui_weak = ui.as_weak();
-        let viewer_cache = viewer_cache.clone();
-        let image_cache = image_cache.clone();
-        let generation = viewer_generation.clone();
-        let last_direction = last_direction.clone();
-        let load_tx = load_tx.clone();
+        let ctx = viewer_ctx.clone();
         ui.on_open_viewer(move |index| {
             log::info!("viewer: открыть фото index={index}");
-            last_direction.store(1, Ordering::SeqCst); // 4.3e — открытие = «вперёд».
-            if let Some(w) = ui_weak.upgrade() {
+            ctx.last_direction.store(1, Ordering::SeqCst); // 4.3e — открытие = «вперёд».
+            if let Some(w) = ctx.ui_weak.upgrade() {
                 w.set_viewer_index(index);
                 w.set_show_viewer(true);
                 // Сброс зума при открытии нового фото (иначе откроется зумленным).
@@ -1362,18 +1406,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 w.window().set_fullscreen(true);
                 log::info!("viewer: fullscreen ON");
             }
-            // Мгновенный placeholder-миниатюра (моргание), пока грузится чёткое.
-            show_thumbnail(&ui_weak, index);
-            // Кэш покажется мгновенно; мимо кэша — задача воркеру (1 поток).
-            request_viewer_load(
-                photos.clone(),
-                index,
-                ui_weak.clone(),
-                viewer_cache.clone(),
-                image_cache.clone(),
-                generation.clone(),
-                &load_tx,
-            );
+            // 4.3i — единый переход: одно поколение делят миниатюра (мгновенно
+            // в единый viewer-image) и чёткое фото (перезапишет тот же слой).
+            ctx.switch_to_photo(index, 0);
         });
     }
     // Закрыть viewer: выходим из полноэкранного режима, возвращаем оконный.
@@ -1389,20 +1424,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         });
     }
     // Следующее фото. Без debounce (он затормаживал листание): грузим сразу.
-    // При смене индекса очищаем старое чёткое фото и показываем миниатюру-плейсхолдер,
-    // чтобы не было наложения старого фото поверх миниатюры («полоски»).
+    // 4.3i — слой один: миниатюра нового кадра сама перезаписывает viewer-image,
+    // промежуточная очистка не нужна (она давала бы чёрный кадр-вспышку).
     {
-        let photos = photos.clone();
-        let ui_weak = ui.as_weak();
-        let viewer_cache = viewer_cache.clone();
-        let image_cache = image_cache.clone();
-        let generation = viewer_generation.clone();
-        let last_direction = last_direction.clone();
-        let load_tx = load_tx.clone();
+        let ctx = viewer_ctx.clone();
         ui.on_viewer_next(move || {
-            last_direction.store(1, Ordering::SeqCst); // 4.3e — листаем вперёд.
-            if let Some(w) = ui_weak.upgrade() {
-                let count = lock_or_recover(&photos).len() as i32;
+            ctx.last_direction.store(1, Ordering::SeqCst); // 4.3e — листаем вперёд.
+            if let Some(w) = ctx.ui_weak.upgrade() {
+                let count = lock_or_recover(&ctx.photos).len() as i32;
                 if count == 0 {
                     return;
                 }
@@ -1412,37 +1441,27 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 }
                 log::debug!("viewer: next → index={idx}");
                 w.set_viewer_index(idx);
-                w.set_viewer_image(slint::Image::default()); // очистить старое чёткое
                 w.set_viewer_zoom(1.0); // сброс зума для нового фото
                 w.set_viewer_offset_x(0.0);
                 w.set_viewer_offset_y(0.0);
             }
-            let idx = ui_weak.upgrade().map(|w| w.get_viewer_index()).unwrap_or(0);
-            show_thumbnail(&ui_weak, idx); // мгновенный плейсхолдер
-            request_viewer_load(
-                photos.clone(),
-                idx,
-                ui_weak.clone(),
-                viewer_cache.clone(),
-                image_cache.clone(),
-                generation.clone(),
-                &load_tx,
-            );
+            let idx = ctx
+                .ui_weak
+                .upgrade()
+                .map(|w| w.get_viewer_index())
+                .unwrap_or(0);
+            // 4.3i — единый переход: одно поколение делят миниатюра и чёткое.
+            ctx.switch_to_photo(idx, 0);
         });
     }
-    // Предыдущее фото. Без debounce: грузим сразу, плейсхолдер-миниатюра мгновенно.
+    // Предыдущее фото. Без debounce: грузим сразу; миниатюра мгновенно в
+    // единый слой (4.3i), чёткое перезапишет его по готовности.
     {
-        let photos = photos.clone();
-        let ui_weak = ui.as_weak();
-        let viewer_cache = viewer_cache.clone();
-        let image_cache = image_cache.clone();
-        let generation = viewer_generation.clone();
-        let last_direction = last_direction.clone();
-        let load_tx = load_tx.clone();
+        let ctx = viewer_ctx.clone();
         ui.on_viewer_prev(move || {
-            last_direction.store(-1, Ordering::SeqCst); // 4.3e — листаем назад.
-            if let Some(w) = ui_weak.upgrade() {
-                let count = lock_or_recover(&photos).len() as i32;
+            ctx.last_direction.store(-1, Ordering::SeqCst); // 4.3e — листаем назад.
+            if let Some(w) = ctx.ui_weak.upgrade() {
+                let count = lock_or_recover(&ctx.photos).len() as i32;
                 if count == 0 {
                     return;
                 }
@@ -1452,35 +1471,26 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 }
                 log::debug!("viewer: prev → index={idx}");
                 w.set_viewer_index(idx);
-                w.set_viewer_image(slint::Image::default()); // очистить старое чёткое
                 w.set_viewer_zoom(1.0); // сброс зума для нового фото
                 w.set_viewer_offset_x(0.0);
                 w.set_viewer_offset_y(0.0);
             }
-            let idx = ui_weak.upgrade().map(|w| w.get_viewer_index()).unwrap_or(0);
-            show_thumbnail(&ui_weak, idx); // мгновенный плейсхолдер
-            request_viewer_load(
-                photos.clone(),
-                idx,
-                ui_weak.clone(),
-                viewer_cache.clone(),
-                image_cache.clone(),
-                generation.clone(),
-                &load_tx,
-            );
+            let idx = ctx
+                .ui_weak
+                .upgrade()
+                .map(|w| w.get_viewer_index())
+                .unwrap_or(0);
+            // 4.3i — единый переход: одно поколение делят миниатюра и чёткое.
+            ctx.switch_to_photo(idx, 0);
         });
     }
 
     // 4.3e — авто-скип битого файла: воркер через request-skip просит показать
-    // фото next-index в направлении dir. Здесь (в UI-потоке) доступен Rc-кэш,
-    // поэтому можем звать request_viewer_load. Защита от зацикливания: если
+    // фото next-index в направлении dir. Защита от зацикливания: если
     // skip_depth превысил размер списка — все файлы битые, показываем плашку.
     // next-index и dir приходят из воркера; skip_depth — сколько уже скипнули.
     {
-        let photos = photos.clone();
-        let ui_weak = ui.as_weak();
-        let generation = viewer_generation.clone();
-        let load_tx = load_tx.clone();
+        let ctx = viewer_ctx.clone();
         // 4.3g — dir больше не используется здесь (воркер уже прибавил его к
         // next_index); параметр остаётся в сигнатуре колбэка, помечаем _dir.
         // 4.3h — my_gen: поколение, при котором воркер нашёл битый файл.
@@ -1489,20 +1499,20 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             // поколение. Если пользователь уже листнул дальше (generation ушёл
             // вперёд), устаревший скип игнорируется — он больше не накладывает
             // свой кадр поверх актуального («в фоне один, поверх другой»).
-            if generation.load(Ordering::SeqCst) != my_gen as u64 {
+            if ctx.generation.load(Ordering::SeqCst) != my_gen as u64 {
                 log::debug!(
                     "request-skip: устарел my={my_gen} cur={}",
-                    generation.load(Ordering::SeqCst)
+                    ctx.generation.load(Ordering::SeqCst)
                 );
                 return;
             }
-            let count = lock_or_recover(&photos).len() as i32;
+            let count = lock_or_recover(&ctx.photos).len() as i32;
             // Защита от зацикливания: перепробовали больше, чем файлов в списке.
             if skip_depth > count || count == 0 {
                 log::error!(
                     "request-skip: все файлы битые (depth={skip_depth}, count={count}) — плашка"
                 );
-                if let Some(w) = ui_weak.upgrade() {
+                if let Some(w) = ctx.ui_weak.upgrade() {
                     w.set_viewer_image(slint::Image::default());
                     w.set_viewer_error("Файл не открывается".into());
                 }
@@ -1517,34 +1527,24 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             if idx < 0 || idx >= count {
                 // Достигли края и дальше годных нет — показываем плашку.
                 log::error!("request-skip: край списка (idx={idx}, count={count}) — плашка");
-                if let Some(w) = ui_weak.upgrade() {
+                if let Some(w) = ctx.ui_weak.upgrade() {
                     w.set_viewer_image(slint::Image::default());
                     w.set_viewer_error("Файл не открывается".into());
                 }
                 return;
             }
             log::debug!("request-skip: скип → index={idx} (depth={skip_depth})");
-            if let Some(w) = ui_weak.upgrade() {
+            if let Some(w) = ctx.ui_weak.upgrade() {
                 w.set_viewer_index(idx);
-                w.set_viewer_image(slint::Image::default());
                 w.set_viewer_zoom(1.0);
                 w.set_viewer_offset_x(0.0);
                 w.set_viewer_offset_y(0.0);
             }
-            show_thumbnail(&ui_weak, idx);
-            // Передаём skip_depth дальше — воркер снова скипнет, если и этот битый.
-            let _ = load_tx.send(LoadTask::Photo {
-                index: idx,
-                path: {
-                    let p = lock_or_recover(&photos);
-                    match p.get(idx as usize) {
-                        Some(ph) => ph.path.clone(),
-                        None => return,
-                    }
-                },
-                generation: generation.fetch_add(1, Ordering::SeqCst) + 1,
-                skip_depth: skip_depth as u32,
-            });
+            // 4.3i — переход скипа устроен как у next/prev: единый
+            // switch_to_photo (одно поколение делят миниатюра и чёткое).
+            // skip_depth уходит в задачу воркера: если и этот файл битый,
+            // воркер снова попросит скип.
+            ctx.switch_to_photo(idx, skip_depth as u32);
         });
     }
 
