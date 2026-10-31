@@ -1,0 +1,57 @@
+# Сборка релиза: по тегу v* собирает release .exe под Windows и публикует
+# в GitHub Releases (справа в разделе Releases — exe для скачивания).
+# Тег ставится вручную: git tag v0.2.0 && git push --tags.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # право создавать Release и прикладывать артефакты
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Установить Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache (ускоряет повторные сборки)
+        uses: swatinem/rust-cache@v2
+
+      - name: Сборка (release)
+        run: cargo build --release
+
+      - name: Тесты (релиз не публикуем, если тесты красные)
+        run: cargo test --release
+
+      - name: Подготовить артефакт
+        shell: bash
+        run: |
+          # Имя с версией из тега: photo_explorer_v0.2.0.exe
+          TAG="${GITHUB_REF_NAME}"
+          cp "target/release/photo_explorer.exe" "photo_explorer_${TAG}.exe"
+          ls -la photo_explorer_*.exe
+
+      - name: Создать GitHub Release с .exe
+        uses: softprops/action-gh-release@v2
+        with:
+          files: photo_explorer_*.exe
+          generate_release_notes: true
+          body: |
+            Photo Explorer для Windows 11.
+
+            ## Что нового
+            - Просмотрщик: зум/pan, авто-скип битых, режимы листания
+              (до края / циклично / случайно — честный «назад»).
+            - Проекты: мгновенное открытие, фоновая проверка изменений.
+            - Порционная загрузка миниатюр — окно отзывчиво на 10к+ фото.
+
+            ## Установка
+            Скачай .exe и запусти. Сборка не требует установки.
+            PIN-код, кэш и проекты хранятся локально в профиле пользователя.

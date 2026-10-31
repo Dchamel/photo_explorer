@@ -12,6 +12,7 @@
 [![UI](https://img.shields.io/badge/UI-Slint-brightgreen)]()
 [![Platform](https://img.shields.io/badge/Platform-Windows%2011-blue)]()
 [![Architecture](https://img.shields.io/badge/Architecture-Hexagonal-purple)]()
+[![Release](https://img.shields.io/badge/Release-v0.2.0-green)](https://github.com/Dchamel/photo_explorer/releases)
 
 </div>
 
@@ -29,7 +30,19 @@
 
 ---
 
-## ✨ Возможности (MVP)
+## ⬇️ Скачать
+
+**Готовый .exe (Windows 11):** [**Releases → v0.2.0**](https://github.com/Dchamel/photo_explorer/releases) —
+справа в разделе Releases лежит собранный `photo_explorer_v0.2.0.exe`.
+Скачай и запусти, установка не требуется.
+
+> Все личные данные (PIN-хэш, кэш миниатюр, проекты) хранятся локально
+> в профиле пользователя (`%TEMP%`, `%LOCALAPPDATA%`) — в программу и
+> репозиторий не попадают.
+
+---
+
+## ✨ Возможности (v0.2.0)
 
 - 🗂️ **Два режима сканирования:**
   - только выбранная папка (без подпапок);
