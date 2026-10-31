@@ -739,6 +739,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     use std::sync::mpsc;
     // 4.6a [CONC] — идентификатор задачи в логах = generation (уникален
     // на каждый переход); отдельный счётчик не нужен (KISS).
+    // 4.6b (Фаза 1) — ДВА канала на тот же ОДИН поток. Логи [CONC] показали
+    // корень тормоза «размытое висит ~10 сек»: тяжёлый сосед-Preload
+    // (downscale 3840x2160 — 5.5 с) вставал в общей FIFO-очереди ПЕРЕД
+    // текущим кадром. Теперь priority несёт ТОЛЬКО Photo (текущий кадр),
+    // bg — только Preload (соседи); воркер опустошает priority первым и
+    // лишь при пустом берёт ОДНУ bg-задачу (см. recv_priority_aware).
     enum LoadTask {
         Photo {
             index: i32,
@@ -752,7 +758,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             path: std::path::PathBuf,
         },
     }
-    let (load_tx, load_rx) = mpsc::channel::<LoadTask>();
+    let (priority_tx, priority_rx) = mpsc::channel::<LoadTask>();
+    let (bg_tx, bg_rx) = mpsc::channel::<LoadTask>();
     // ui_weak для воркера (Send): Weak<GalleryScreen> — Send.
     let ui_weak_for_viewer = ui.as_weak();
     // Воркер-поток: цикл приёма задач. Send-данные (Vec<u8>) отдаём в UI
@@ -763,11 +770,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let last_direction = last_direction.clone();
         let ui_weak_for_viewer = ui_weak_for_viewer.clone();
         std::thread::spawn(move || {
-            log::info!("viewer worker: запущен (1 поток)");
+            log::info!("viewer worker: запущен (1 поток, каналы priority/bg)");
             let viewer_cache = viewer_cache;
             let viewer_generation = viewer_generation;
             let last_direction = last_direction;
-            while let Ok(task) = load_rx.recv() {
+            // 4.6b — пауза, когда ОБА канала пусты: не жжём CPU холостым
+            // опросом; фоновая задача при простое ждёт максимум это время.
+            let idle_poll = std::time::Duration::from_millis(100);
+            while let Some(task) = recv_priority_aware(&priority_rx, &bg_rx, idle_poll) {
                 match task {
                     LoadTask::Photo {
                         index,
@@ -780,7 +790,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         // 4.6a [CONC] — drain_to_last возвращает также СКОЛЬКО
                         // задач было пропущено (глубина очереди на момент приёма).
                         let (index, path, my_gen, skip_depth, skipped) =
-                            drain_to_last(&load_rx, index, path, my_gen, skip_depth);
+                            drain_to_last(&priority_rx, index, path, my_gen, skip_depth);
                         log::debug!(
                             "[CONC] worker: Photo idx={index} gen={my_gen} depth={skip_depth} skipped={skipped}"
                         );
@@ -883,6 +893,38 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             log::info!("viewer worker: завершён");
         });
     }
+    // 4.6b (Фаза 1) — приём задачи с ПРИОРИТЕТОМ текущего кадра:
+    // 1) пока в priority есть задачи — читаем только его (Photo всегда
+    //    впереди соседей: тяжёлый Preload больше не встаёт в очередь перед
+    //    кадром, который пользователь смотрит прямо сейчас);
+    // 2) priority пуст — ОДНА задача из bg (между соседями снова проверяем
+    //    priority — нажатие пользователя всегда побеждает);
+    // 3) оба пусты — блокируемся на priority с таймаутом idle_poll
+    //    (холостого опроса нет, CPU не жжём).
+    // None = priority-канал закрыт (UI ушёл) — воркер завершается. bg-канал
+    // живёт и закрывается вместе с priority (оба tx лежат в ViewerCtx).
+    fn recv_priority_aware(
+        priority_rx: &mpsc::Receiver<LoadTask>,
+        bg_rx: &mpsc::Receiver<LoadTask>,
+        idle_poll: std::time::Duration,
+    ) -> Option<LoadTask> {
+        loop {
+            match priority_rx.try_recv() {
+                Ok(task) => return Some(task),
+                Err(mpsc::TryRecvError::Disconnected) => return None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            // Фон пуст или отключён — не страшно: живём, пока жив priority.
+            if let Ok(task) = bg_rx.try_recv() {
+                return Some(task);
+            }
+            match priority_rx.recv_timeout(idle_poll) {
+                Ok(task) => return Some(task),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
     // Дренирование: берём последнюю задачу Photo из канала, пропуская промежуточные.
     // 4.6a [CONC] — возвращает также сколько задач было пропущено (видимость
     // глубины очереди в логах).
@@ -926,7 +968,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         image_cache: ImageCache,
         generation: Arc<AtomicU64>,
         last_direction: Arc<AtomicI32>,
-        load_tx: mpsc::Sender<LoadTask>,
+        /// 4.6b — приоритетный канал: ТОЛЬКО текущий кадр (Photo). Воркер
+        /// опустошает его первым — сосед больше не встаёт перед кадром,
+        /// который пользователь смотрит прямо сейчас.
+        priority_tx: mpsc::Sender<LoadTask>,
+        /// 4.6b — фоновый канал: предзагрузка соседей (без приоритета).
+        bg_tx: mpsc::Sender<LoadTask>,
         /// 4.4a — режим листания текущего проекта (edge/cycle/random).
         /// Меняется при открытии сессии и из панели ⚙; UI-поток — RefCell ок.
         nav_mode: Rc<RefCell<NavMode>>,
@@ -1144,7 +1191,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
             // 3) Мимо кэша — задача воркеру. Миниатюра уже в viewer-image
             //    (единый слой, 4.3i); индикатор «Загрузка» убран (бесполезен и залипал).
-            let _ = self.load_tx.send(LoadTask::Photo {
+            let _ = self.priority_tx.send(LoadTask::Photo {
                 index,
                 path,
                 generation: my_gen,
@@ -1184,7 +1231,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 if lock_or_recover(&self.cache).contains(&path) {
                     continue;
                 }
-                let _ = self.load_tx.send(LoadTask::Preload { path });
+                let _ = self.bg_tx.send(LoadTask::Preload { path });
             }
         }
     }
@@ -1199,7 +1246,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         image_cache: image_cache.clone(),
         generation: viewer_generation.clone(),
         last_direction: last_direction.clone(),
-        load_tx: load_tx.clone(),
+        priority_tx: priority_tx.clone(),
+        bg_tx: bg_tx.clone(),
         nav_mode: Rc::new(RefCell::new(NavMode::Edge)), // 4.4a — до края по умолчанию
         shuffle_order: RefCell::new(None),              // 4.4c — строится при random
         shuffle_pos: Cell::new(0),
