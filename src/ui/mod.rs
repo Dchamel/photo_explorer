@@ -737,6 +737,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // consumer). Воркер дренирует очередь (берёт последнюю актуальную по gen),
     // декодирует ОДНО фото и отдаёт в UI. Всегда ровно 1 фоновый поток.
     use std::sync::mpsc;
+    // 4.6a [CONC] — идентификатор задачи в логах = generation (уникален
+    // на каждый переход); отдельный счётчик не нужен (KISS).
     enum LoadTask {
         Photo {
             index: i32,
@@ -775,14 +777,24 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     } => {
                         // Дренируем очередь: если в канале ещё есть задачи —
                         // берём последнюю (промежуточные пропускаем, не декодируя).
-                        let (_, path, my_gen, skip_depth) =
+                        // 4.6a [CONC] — drain_to_last возвращает также СКОЛЬКО
+                        // задач было пропущено (глубина очереди на момент приёма).
+                        let (index, path, my_gen, skip_depth, skipped) =
                             drain_to_last(&load_rx, index, path, my_gen, skip_depth);
+                        log::debug!(
+                            "[CONC] worker: Photo idx={index} gen={my_gen} depth={skip_depth} skipped={skipped}"
+                        );
                         // Устаревшая задача — пропускаем (пользователь ушёл дальше).
                         if viewer_generation.load(Ordering::SeqCst) != my_gen {
-                            log::debug!("worker: устарела gen={my_gen}, пропускаю");
+                            log::debug!("[CONC] worker: устарела gen={my_gen}, пропускаю");
                             continue;
                         }
+                        let decode_start = std::time::Instant::now();
                         let result = load_full_image(path, viewer_cache.clone());
+                        log::debug!(
+                            "[CONC] worker: Photo idx={index} декод за {} мс",
+                            decode_start.elapsed().as_millis()
+                        );
                         let gen = viewer_generation.clone();
                         let dir = last_direction.load(Ordering::SeqCst);
                         let ui_weak = ui_weak_for_viewer.clone();
@@ -827,6 +839,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                         w.set_viewer_image(slint::Image::from_rgba8(buf));
                                         // 4.3e — успешный показ: гасим плашку ошибки.
                                         w.set_viewer_error("".into());
+                                        log::debug!("[CONC] put: worker idx={index} gen={my_gen}");
                                     }
                                     Err(e) => {
                                         // 4.3e — авто-скип битого файла: просим UI
@@ -854,7 +867,16 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         if lock_or_recover(&viewer_cache).contains(&path) {
                             continue;
                         }
+                        // 4.6a [CONC] — фон: тайминг декода соседа (мешал ли
+                        // он текущему кадру — видно в логе). Путь логируем ДО
+                        // перемещения в load_full_image.
+                        let shown = path.display().to_string();
+                        let t0 = std::time::Instant::now();
                         let _ = load_full_image(path, viewer_cache.clone());
+                        log::debug!(
+                            "[CONC] worker: Preload «{shown}» за {} мс",
+                            t0.elapsed().as_millis()
+                        );
                     }
                 }
             }
@@ -862,14 +884,18 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         });
     }
     // Дренирование: берём последнюю задачу Photo из канала, пропуская промежуточные.
+    // 4.6a [CONC] — возвращает также сколько задач было пропущено (видимость
+    // глубины очереди в логах).
     fn drain_to_last(
         rx: &mpsc::Receiver<LoadTask>,
         mut index: i32,
         mut path: std::path::PathBuf,
         mut generation: u64,
         mut skip_depth: u32,
-    ) -> (i32, std::path::PathBuf, u64, u32) {
+    ) -> (i32, std::path::PathBuf, u64, u32, usize) {
+        let mut skipped = 0usize;
         while let Ok(next) = rx.try_recv() {
+            skipped += 1;
             if let LoadTask::Photo {
                 index: i,
                 path: p,
@@ -884,7 +910,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
             // Preload-задачи игнорируем при дренировании (они низкого приоритета).
         }
-        (index, path, generation, skip_depth)
+        (index, path, generation, skip_depth, skipped)
     }
 
     /// 4.3i — контекст вьюера: всё состояние показа фото в одном месте
@@ -1004,10 +1030,16 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         w.set_viewer_img_w(sz.width as f32);
                         w.set_viewer_img_h(sz.height as f32);
                         w.set_viewer_image(item.image);
+                        log::debug!("[CONC] show: thumb idx={index} (по пути, gen={my_gen})");
                     }
                     // Миниатюры по пути нет (батч не дошёл) — чистим слой,
                     // чтобы не показывать кадр предыдущего перехода.
-                    None => w.set_viewer_image(slint::Image::default()),
+                    None => {
+                        w.set_viewer_image(slint::Image::default());
+                        log::debug!(
+                            "[CONC] show: thumb idx={index} НЕТ в модели — слой очищен (gen={my_gen})"
+                        );
+                    }
                 }
             }
         }
@@ -1056,6 +1088,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         w.set_viewer_img_h(sz.height as f32);
                         w.set_viewer_image(img);
                         w.set_viewer_error("".into()); // 4.3e — успешный показ, гасим плашку.
+                        log::debug!("[CONC] put: ui-cache idx={index} gen={my_gen}");
                     }
                     self.enqueue_preload(index);
                 }
@@ -1103,6 +1136,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         w.set_viewer_img_h(h_px as f32);
                         w.set_viewer_image(img);
                         w.set_viewer_error("".into()); // 4.3e — успешный показ, гасим плашку.
+                        log::debug!("[CONC] put: rgba-cache idx={index} gen={my_gen}");
                     }
                     self.enqueue_preload(index);
                 }
