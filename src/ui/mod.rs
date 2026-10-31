@@ -723,6 +723,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     use std::sync::atomic::AtomicI32;
     let last_direction: Arc<AtomicI32> = Arc::new(AtomicI32::new(1));
 
+    // 4.6c (Фаза 2) — глобальные настройки «Ультра-скорость»: галка (ВЫКЛ
+    // по умолчанию — бережёт батарею) + число ядер (по умолчанию половина).
+    // Воркер читает атомики при каждом декоде — смена настройки применяется
+    // к СЛЕДУЮЩЕМУ кадру без перезапуска. Хранение: %LOCALAPPDATA%.
+    let global_settings: Arc<crate::settings::GlobalSettings> = Arc::new(crate::settings::load());
+    let (ultra_on, ultra_threads) = global_settings.snapshot();
+    log::info!("viewer: настройки Ультра-скорости: включена={ultra_on}, ядер={ultra_threads}");
+
     // Максимальная сторона изображения для viewer (downscale до размера экрана).
     const VIEWER_MAX_SIZE: u32 = 2560;
 
@@ -768,12 +776,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let viewer_cache = viewer_cache.clone();
         let viewer_generation = viewer_generation.clone();
         let last_direction = last_direction.clone();
+        let global_settings = global_settings.clone();
         let ui_weak_for_viewer = ui_weak_for_viewer.clone();
         std::thread::spawn(move || {
             log::info!("viewer worker: запущен (1 поток, каналы priority/bg)");
             let viewer_cache = viewer_cache;
             let viewer_generation = viewer_generation;
             let last_direction = last_direction;
+            let global_settings = global_settings;
             // 4.6b — пауза, когда ОБА канала пусты: не жжём CPU холостым
             // опросом; фоновая задача при простое ждёт максимум это время.
             let idle_poll = std::time::Duration::from_millis(100);
@@ -800,10 +810,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             continue;
                         }
                         let decode_start = std::time::Instant::now();
-                        let result = load_full_image(path, viewer_cache.clone());
+                        let result = load_full_image(path, viewer_cache.clone(), &global_settings);
                         log::debug!(
-                            "[CONC] worker: Photo idx={index} декод за {} мс",
-                            decode_start.elapsed().as_millis()
+                            "[CONC] worker: Photo idx={index} декод за {} мс ({})",
+                            decode_start.elapsed().as_millis(),
+                            resize_mode_label(&global_settings)
                         );
                         let gen = viewer_generation.clone();
                         let dir = last_direction.load(Ordering::SeqCst);
@@ -882,10 +893,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         // перемещения в load_full_image.
                         let shown = path.display().to_string();
                         let t0 = std::time::Instant::now();
-                        let _ = load_full_image(path, viewer_cache.clone());
+                        let _ = load_full_image(path, viewer_cache.clone(), &global_settings);
                         log::debug!(
-                            "[CONC] worker: Preload «{shown}» за {} мс",
-                            t0.elapsed().as_millis()
+                            "[CONC] worker: Preload «{shown}» за {} мс ({})",
+                            t0.elapsed().as_millis(),
+                            resize_mode_label(&global_settings)
                         );
                     }
                 }
@@ -1254,13 +1266,29 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         broken: Rc::new(RefCell::new(std::collections::HashSet::new())), // 4.4c-3
     });
 
+    /// Подпись режима ресайза для логов [CONC]: «1 поток» или «ultra N ядер».
+    /// Читает атомики настроек на момент вызова (без блокировок).
+    fn resize_mode_label(settings: &crate::settings::GlobalSettings) -> String {
+        let (on, threads) = settings.snapshot();
+        if on {
+            format!("ultra {threads} ядер")
+        } else {
+            "1 поток".to_string()
+        }
+    }
+
     /// Загружает полное изображение по пути и возвращает сырые RGBA-данные (Send).
     /// Downscale до VIEWER_MAX_SIZE для скорости. Результат кэшируется.
     /// Декодирование обёрнуто в catch_unwind: битый/нестандартный файл не должен
     /// паниковать и отравлять мьютекс — ошибка возвращается как Err.
+    /// 4.6c (Фаза 2): при включённой «Ультра-скорости» downscale идёт через
+    /// fast_image_resize (SIMD) на N ядрах (rayon-пул с числом потоков из
+    /// настройки); выключена — прежний однопоточный image::resize (KISS:
+    /// тяжёлый путь меняется ТОЛЬКО при явном желании пользователя).
     fn load_full_image(
         path: std::path::PathBuf,
         cache: Arc<Mutex<ViewerCache>>,
+        settings: &crate::settings::GlobalSettings,
     ) -> Result<(Vec<u8>, u32, u32), String> {
         log::trace!("load_full_image: запрос «{}»", path.display());
         // Проверяем кэш. ВАЖНО: guard освобождается сразу после клонирования —
@@ -1280,18 +1308,26 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         }))
         .map_err(|_| format!("Паника при декодировании: {}", path.display()))?;
         let img = decode?;
-        // Downscale, если фото больше максимума (быстрый фильтр Triangle).
+        // Downscale, если фото больше максимума. 4.6c — ДВА режима:
+        // «Ультра-скорость» ВКЛ → fast_image_resize на N ядрах (SIMD);
+        // ВЫКЛ (по умолчанию) → прежний однопоточный Triangle.
+        let (ultra_on, ultra_threads) = settings.snapshot();
         let img = if img.width() > VIEWER_MAX_SIZE || img.height() > VIEWER_MAX_SIZE {
             log::debug!(
-                "load_full_image: downscale {}x{} → ≤{VIEWER_MAX_SIZE}",
+                "load_full_image: downscale {}x{} → ≤{VIEWER_MAX_SIZE} ({} режим)",
                 img.width(),
-                img.height()
+                img.height(),
+                if ultra_on { "ultra" } else { "1 поток" }
             );
-            img.resize(
-                VIEWER_MAX_SIZE,
-                VIEWER_MAX_SIZE,
-                image::imageops::FilterType::Triangle,
-            )
+            if ultra_on {
+                resize_ultra(img, ultra_threads)?
+            } else {
+                img.resize(
+                    VIEWER_MAX_SIZE,
+                    VIEWER_MAX_SIZE,
+                    image::imageops::FilterType::Triangle,
+                )
+            }
         } else {
             img
         };
@@ -1306,6 +1342,71 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         // Сохраняем в кэш (короткая блокировка).
         lock_or_recover(&cache).put(path, (data.clone(), w, h));
         Ok((data, w, h))
+    }
+
+    /// 4.6c (Фаза 2) — ускоренный downscale для «Ультра-скорости»:
+    /// fast_image_resize (SIMD-инструкции процессора) на N ядрах.
+    /// Число потоков задаётся ЯВНО пулом rayon — крейт берёт потоки из
+    /// текущего пула (current_num_threads), поэтому ограничиваем
+    /// ThreadPoolBuilder'ом ровно настройкой пользователя, не хватая
+    /// все ядра системы без спроса.
+    /// Фильтр Bilinear ≈ прежний Triangle (быстрый, мягкий) — качество
+    /// картинки не меняется, меняется только скорость.
+    /// Любая ошибка крейта — Err (файл покажется через обычный путь).
+    fn resize_ultra(
+        img: image::DynamicImage,
+        threads: usize,
+    ) -> Result<image::DynamicImage, String> {
+        let threads = threads.max(1);
+        // 1) image → сырой RGBA8 (fast_image_resize работает с буферами).
+        let rgba = img.to_rgba8();
+        let (src_w, src_h) = rgba.dimensions();
+        // 2) Целевой размер — как у image::resize: вписать в квадрат
+        //    VIEWER_MAX_SIZE с сохранением пропорций.
+        let (dst_w, dst_h) = fit_into_max(src_w, src_h, VIEWER_MAX_SIZE);
+        // 3) Собираем исходник/приёмник крейта из сырых буферов.
+        let src = fast_image_resize::images::Image::from_vec_u8(
+            src_w,
+            src_h,
+            rgba.into_raw(),
+            fast_image_resize::PixelType::U8x4,
+        )
+        .map_err(|e| format!("ultra: исходный буфер: {e}"))?;
+        let mut dst =
+            fast_image_resize::images::Image::new(dst_w, dst_h, fast_image_resize::PixelType::U8x4);
+        let options = fast_image_resize::ResizeOptions::new()
+            .resize_alg(fast_image_resize::ResizeAlg::Convolution(
+                fast_image_resize::FilterType::Bilinear,
+            ))
+            .use_alpha(false);
+        // 4) Ресайз в пуле rayon с ЯВНЫМ числом потоков (настройка).
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|e| format!("ultra: пул потоков: {e}"))?;
+        pool.install(|| {
+            fast_image_resize::Resizer::new()
+                .resize(&src, &mut dst, &options)
+                .map_err(|e| format!("ultra: ресайз: {e}"))
+        })?;
+        // 5) Буфер → обратно в image::DynamicImage (RGBA8).
+        let buf = dst.into_vec();
+        let out = image::RgbaImage::from_raw(dst_w, dst_h, buf)
+            .ok_or_else(|| "ultra: буфер результата не сошёлся по размеру".to_string())?;
+        Ok(image::DynamicImage::ImageRgba8(out))
+    }
+
+    /// Целевые размеры вписывания в квадрат max×max с сохранением
+    /// пропорций (та же арифметика, что у image::resize с bounding box).
+    fn fit_into_max(src_w: u32, src_h: u32, max: u32) -> (u32, u32) {
+        if src_w.max(src_h) <= max {
+            return (src_w, src_h); // и так влезает — ресайз не нужен
+        }
+        let scale = max as f64 / src_w.max(src_h) as f64;
+        let w = (src_w as f64 * scale).round() as u32;
+        let h = (src_h as f64 * scale).round() as u32;
+        // Защита от нуля при экстремальных пропорциях.
+        (w.max(1), h.max(1))
     }
 
     // (v6) load_viewer_image и preload_neighbors удалены — их заменили
@@ -1858,6 +1959,52 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     }
                 }
                 Err(e) => log::error!("settings: сессия {id} не читается: {e}"),
+            }
+        });
+    }
+    // 4.6c — инициализация панели «Производительность» из глобальных
+    // настроек (галка + бегунок ядер + максимум бегунка = все ядра).
+    {
+        let ui_weak = ui.as_weak();
+        let (on, threads) = global_settings.snapshot();
+        let max_threads = std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(1);
+        if let Some(w) = ui_weak.upgrade() {
+            w.set_ultra_speed(on);
+            w.set_ultra_threads(threads as i32);
+            w.set_ultra_threads_max(max_threads);
+        }
+    }
+    // 4.6c — галка «Ультра-скорость»: пишем в атомики (воркер применит к
+    // СЛЕДУЮЩЕМУ кадру) и сохраняем на диск (переживает перезапуск).
+    {
+        let ui_weak = ui.as_weak();
+        let settings = global_settings.clone();
+        ui.on_set_ultra_speed(move |on| {
+            log::info!("settings: Ультра-скорость → {on}");
+            settings.ultra_speed.store(on, Ordering::Relaxed);
+            crate::settings::store(&settings);
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_ultra_speed(on);
+            }
+        });
+    }
+    // 4.6c — бегунок числа ядер: клампим 1..max, пишем в атомик,
+    // сохраняем на диск. UI-подпись обновится сама через property.
+    {
+        let ui_weak = ui.as_weak();
+        let settings = global_settings.clone();
+        ui.on_set_ultra_threads(move |n| {
+            let max = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            let n = n.clamp(1, max as i32) as usize;
+            log::info!("settings: ядер для Ультра-скорости → {n}");
+            settings.threads.store(n, Ordering::Relaxed);
+            crate::settings::store(&settings);
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_ultra_threads(n as i32);
             }
         });
     }

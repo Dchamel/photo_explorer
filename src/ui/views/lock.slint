@@ -3,6 +3,7 @@
 // Оба компонента (LockScreen и GalleryScreen) в одном файле, чтобы slint-build компилировал их вместе.
 
 import { Theme } from "theme.slint";
+import { Slider } from "std-widgets.slint";
 
 component KeyButton inherits Rectangle {
     in property <string> label;
@@ -219,6 +220,12 @@ export component GalleryScreen inherits Window {
     in-out property <bool> settings-visible: false;
     // 4.4a — режим листания текущего проекта: "edge" | "cycle" | "random".
     in-out property <string> nav-mode: "edge";
+    // 4.6c — глобальные настройки «Производительность» (не per-project):
+    // галка «Ультра-скорость» (по умолчанию ВЫКЛ — бережёт батарею) и
+    // число ядер для неё (бегунок 1..все; по умолчанию половина ядер).
+    in-out property <bool> ultra-speed: false;
+    in-out property <int> ultra-threads: 1;
+    in-out property <int> ultra-threads-max: 1;
     // Диалог переименования проекта (Slint, без нативных диалогов).
     in-out property <bool> rename-visible: false;
     in-out property <string> rename-text: "";
@@ -233,6 +240,9 @@ export component GalleryScreen inherits Window {
     callback open-settings();        // открыть панель настроек проекта
     callback close-settings();       // закрыть панель настроек
     callback set-nav-mode(string);   // 4.4a — сменить режим листания проекта
+    // 4.6c — «Ультра-скорость»: галка и число ядер (глобальные настройки).
+    callback set-ultra-speed(bool);  // включить/выключить ускорение
+    callback set-ultra-threads(int); // сколько ядер использовать
 
     // --- Viewer (просмотр фото в полном размере) ---
     in-out property <bool> show-viewer: false;
@@ -958,7 +968,7 @@ export component GalleryScreen inherits Window {
         background: #000000b4;
         Rectangle {
             width: 440px;
-            height: 360px;
+            height: 540px;
             border-radius: 12px;
             background: Theme.panel;
             border-width: 1px;
@@ -980,11 +990,20 @@ export component GalleryScreen inherits Window {
                     font-size: 13px;
                 }
                 Rectangle { height: 1px; background: #ffffff22; }
+                // --- Блок «Листание» (per-project) ---
                 Text {
                     text: "Листание в просмотрщике:";
                     color: Theme.text-primary;
                     font-size: 14px;
                     font-weight: 600;
+                }
+                Text {
+                    // Подпись блока: что делает эта секция (по просьбе
+                    // заказчика — понятно пользователю без догадок).
+                    text: "Как ведут себя стрелки и колесо на первом/последнем фото. Выбор сохраняется в этом проекте.";
+                    color: Theme.text-secondary;
+                    font-size: 11px;
+                    wrap: TextWrap.word-wrap;
                 }
                 NavOption {
                     value: "edge";
@@ -1006,6 +1025,93 @@ export component GalleryScreen inherits Window {
                     hint: "кнопки листания выбирают случайное фото";
                     selected: root.nav-mode;
                     selected-clicked() => { root.set-nav-mode("random"); }
+                }
+                Rectangle { height: 1px; background: #ffffff22; }
+                // --- Блок «Производительность» (глобальные, 4.6c) ---
+                Text {
+                    text: "⚡ Производительность:";
+                    color: Theme.text-primary;
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+                Text {
+                    text: "Ускорение открытия тяжёлых фото (4K и больше). Настройка общая для всех проектов — про железо, не про фото.";
+                    color: Theme.text-secondary;
+                    font-size: 11px;
+                    wrap: TextWrap.word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    // Галка «Ультра-скорость» (кликабельная строка).
+                    Rectangle {
+                        height: 44px;
+                        border-radius: 8px;
+                        background: root.ultra-speed ? #2a4d6f : #ffffff0d;
+                        border-width: root.ultra-speed ? 1px : 0px;
+                        border-color: Theme.accent;
+                        TouchArea { clicked => { root.set-ultra-speed(!root.ultra-speed); } }
+                        HorizontalLayout {
+                            padding: 10px;
+                            spacing: 10px;
+                            Text {
+                                text: root.ultra-speed ? "◉" : "○";
+                                color: Theme.accent;
+                                font-size: 16px;
+                                vertical-alignment: center;
+                            }
+                            VerticalLayout {
+                                padding: 0px;
+                                Text {
+                                    text: "Ультра-скорость";
+                                    color: Theme.text-primary;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: "быстрее открывает тяжёлые фото, но сильнее греет ноутбук и расходует батарею";
+                                    color: Theme.text-secondary;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+                    }
+                }
+                // Бегунок числа ядер (виден только при включённой галке).
+                if root.ultra-speed : VerticalLayout {
+                    spacing: 4px;
+                    Text {
+                        text: "Ядер для ускорения: " + root.ultra-threads + " из " + root.ultra-threads-max;
+                        color: Theme.text-primary;
+                        font-size: 12px;
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Text {
+                            text: "1";
+                            color: Theme.text-secondary;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+                        Slider {
+                            minimum: 1;
+                            maximum: root.ultra-threads-max;
+                            value: root.ultra-threads;
+                            changed(f) => { root.set-ultra-threads(Math.round(f)); }
+                        }
+                        Text {
+                            text: root.ultra-threads-max;
+                            color: Theme.text-secondary;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Text {
+                        text: "больше ядер — быстрее декод, но выше нагрузка на процессор";
+                        color: Theme.text-secondary;
+                        font-size: 11px;
+                    }
                 }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout {
