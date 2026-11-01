@@ -810,39 +810,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             continue;
                         }
                         let decode_start = std::time::Instant::now();
-                        // 4.7a — путь для анимации: load_full_image забирает
-                        // path, а аниматору нужен свой (кадры декодируются
-                        // отдельно от первого кадра).
-                        let anim_path = path.clone();
                         let result = load_full_image(path, viewer_cache.clone(), &global_settings);
                         log::debug!(
                             "[CONC] worker: Photo idx={index} декод за {} мс ({})",
                             decode_start.elapsed().as_millis(),
                             resize_mode_label(&global_settings)
                         );
-                        // 4.7a — анимированный файл (GIF/APNG/WEBP с кадрами)?
-                        // Декодируем ВСЕ кадры и запускаем поток-аниматор.
-                        // Не анимированный → пусто → ничего не делаем (статика
-                        // как раньше). Ошибка кадров НЕ роняет показ: первый
-                        // кадр уже в кэше и на экране (фолбэк).
-                        if result.is_ok() && viewer_generation.load(Ordering::SeqCst) == my_gen {
-                            match decode_animated_frames(&anim_path) {
-                                Ok(frames) if !frames.is_empty() => {
-                                    spawn_animator(
-                                        frames,
-                                        index,
-                                        my_gen,
-                                        viewer_generation.clone(),
-                                        ui_weak_for_viewer.clone(),
-                                        global_settings.clone(),
-                                    );
-                                }
-                                Ok(_) => {} // статика — аниматор не нужен
-                                Err(e) => {
-                                    log::debug!("анимация: кадры не декодировались: {e}")
-                                }
-                            }
-                        }
                         let gen = viewer_generation.clone();
                         let dir = last_direction.load(Ordering::SeqCst);
                         let ui_weak = ui_weak_for_viewer.clone();
@@ -1023,11 +996,21 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         shuffle_order: RefCell<Option<Vec<i32>>>,
         /// 4.4c — текущая ПОЗИЦИЯ в перемешанном списке (не индекс фото!).
         shuffle_pos: Cell<i32>,
+        /// 4.7a-fix2 — глобальные настройки (нужны переходу для анимации:
+        /// галка «зациклить» читается аниматором на каждом проходе).
+        settings: Arc<crate::settings::GlobalSettings>,
         /// 4.4c-3 — индексы битых файлов (воркер помечает при ошибке декода).
         /// Навигация всех режимов их ПРОПУСКАЕТ: random больше не попадает в
         /// битые серии (миниатюра битого не мелькает, скип не уводит на другой
         /// кадр). UI-поток — RefCell ок; растёт по ходу просмотра.
         broken: Rc<RefCell<std::collections::HashSet<i32>>>,
+        /// 4.7a-fix2 — (index, generation) ТЕКУЩЕЙ играющей анимации.
+        /// Аниматор — ЕДИНСТВЕННЫЙ писатель viewer-image, пока играет:
+        /// статичные ветки (миниатюра, кэш Photo из request_load) для ЭТОГО
+        /// перехода слой не трогают — иначе кэш перетирает играющие кадры
+        /// первым статичным («GIF замер»). Arc<Mutex> — флаг живёт в
+        /// потоке-аниматоре (Send), читают статичные писатели (UI-поток).
+        anim_playing: Arc<Mutex<Option<(i32, u64)>>>,
     }
 
     impl ViewerCtx {
@@ -1057,6 +1040,17 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
         }
 
+        /// 4.7a-fix2 — играет ли анимация для ЭТОГО перехода (index+gen)?
+        /// Пока аниматор владеет слоем, статичные писатели (миниатюра,
+        /// кэш-ветки request_load) для этого перехода слой не трогают —
+        /// иначе кэш перетирает играющие кадры первым статичным кадром.
+        fn anim_owns_layer(&self, index: i32, my_gen: u64) -> bool {
+            matches!(
+                *lock_or_recover(&self.anim_playing),
+                Some((i, g)) if i == index && g == my_gen
+            )
+        }
+
         /// ЕДИНЫЙ переход к фото (4.3i): инкрементирует поколение, мгновенно
         /// пишет миниатюру в единый viewer-image и запрашивает чёткое фото
         /// ТОЙ ЖЕ генерацией. Открытие, next/prev и скип используют только
@@ -1071,6 +1065,53 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 self.show_thumbnail(index, my_gen);
             }
             self.request_load(index, my_gen, skip_depth);
+            // 4.7a-fix2 — анимация — ответственность ПЕРЕХОДА, а не воркера:
+            // раньше decode кадров жил в воркере, и при повторном открытии
+            // GIF из кэша (кэш-хит минует воркер) аниматор НЕ запускался —
+            // «GIF замер на статике». Теперь: если файл потенциально
+            // анимированный (по расширению), спавним поток-декодер кадров;
+            // он сам решит (0-1 кадр = статика = ничего) и запустит
+            // аниматор. Поколение сверяется на каждом шаге — листание
+            // убивает поток мгновенно.
+            let path_opt = {
+                let p = lock_or_recover(&self.photos);
+                p.get(index as usize).map(|ph| ph.path.clone())
+            };
+            if let Some(path) = path_opt {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .unwrap_or_default();
+                if matches!(ext.as_str(), "gif" | "png" | "apng" | "webp") {
+                    let gen = self.generation.clone();
+                    let ui_weak = self.ui_weak.clone();
+                    let settings = self.settings.clone();
+                    let anim_playing = self.anim_playing.clone();
+                    let idx = index;
+                    std::thread::spawn(move || {
+                        // Поколение уже ушло — не декодируем зря.
+                        if gen.load(Ordering::SeqCst) != my_gen {
+                            return;
+                        }
+                        match decode_animated_frames(&path) {
+                            Ok(frames) if !frames.is_empty() => {
+                                spawn_animator(
+                                    frames,
+                                    idx,
+                                    my_gen,
+                                    gen,
+                                    ui_weak,
+                                    settings,
+                                    anim_playing,
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => log::debug!("анимация: кадры не декодировались: {e}"),
+                        }
+                    });
+                }
+            }
         }
 
         /// Мгновенно показывает миниатюру фото по индексу (моргание).
@@ -1087,6 +1128,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             use slint::Model; // trait Model::row_data
             if self.generation.load(Ordering::SeqCst) != my_gen {
                 return; // переход неактуален — слой принадлежит новому поколению
+            }
+            // 4.7a-fix2 — аниматор владеет слоем этого перехода: не трогаем
+            // (иначе миниатюра перетрёт играющий кадр GIF).
+            if self.anim_owns_layer(index, my_gen) {
+                return;
             }
             // 4.4c-3 — битые не показываем: их миниатюра «врёт» (файл не
             // декодируется), а скип сейчас уведёт на другой кадр.
@@ -1291,6 +1337,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         shuffle_order: RefCell::new(None),              // 4.4c — строится при random
         shuffle_pos: Cell::new(0),
         broken: Rc::new(RefCell::new(std::collections::HashSet::new())), // 4.4c-3
+        anim_playing: Arc::new(Mutex::new(None)), // 4.7a-fix2 — аниматор владеет слоем
+        settings: global_settings.clone(),        // 4.7a-fix2 — анимация из перехода
     });
 
     /// Подпись режима ресайза для логов [CONC]: «1 поток» или «ultra N ядер».
@@ -1481,12 +1529,24 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         generation: Arc<AtomicU64>,
         ui_weak: slint::Weak<GalleryScreen>,
         settings: Arc<crate::settings::GlobalSettings>,
+        anim_playing: Arc<Mutex<Option<(i32, u64)>>>,
     ) {
         std::thread::spawn(move || {
             log::debug!(
                 "[ANIM] аниматор запущен: idx={index} gen={my_gen} кадров={}",
                 frames.len()
             );
+            // 4.7a-fix2 — заявляем владение слоем (в UI-потоке): пока
+            // anim_playing == (index, my_gen), статичные писатели не
+            // трогают viewer-image. Чистим при любом выходе.
+            {
+                let ap = anim_playing.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    *lock_or_recover(&ap) = Some((index, my_gen));
+                });
+            }
+            let total = frames.len();
+            let mut frame_no: usize = 0;
             loop {
                 for f in &frames {
                     // Пауза ДО показа кадра: кадр N показывается, затем
@@ -1495,11 +1555,21 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     // Поколение сменилось — пользователь ушёл, стоп.
                     if generation.load(Ordering::SeqCst) != my_gen {
                         log::debug!("[ANIM] аниматор остановлен (поколение ушло): idx={index}");
+                        let ap = anim_playing.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            *lock_or_recover(&ap) = None;
+                        });
                         return;
                     }
                     let gen = generation.clone();
                     let ui_weak = ui_weak.clone();
                     let (data, w, h) = (f.data.clone(), f.w, f.h);
+                    // 4.7a-fix2 — диагностический лог КАЖДОГО кадра.
+                    log::debug!(
+                        "[ANIM] кадр {}/{total} idx={index} gen={my_gen}",
+                        frame_no + 1
+                    );
+                    frame_no = frame_no.wrapping_add(1);
                     let _ = slint::invoke_from_event_loop(move || {
                         // Двойная сверка (как у воркера): поколение + индекс.
                         let cur = gen.load(Ordering::SeqCst);
@@ -1528,6 +1598,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 // смена настройки применяется к текущей анимации.
                 if !settings.loop_animation_on() {
                     log::debug!("[ANIM] аниматор завершён (один проход): idx={index}");
+                    let ap = anim_playing.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        *lock_or_recover(&ap) = None;
+                    });
                     return;
                 }
             }
