@@ -2330,7 +2330,46 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // оконном режиме; на весь экран уходит только просмотр фото.
     {
         let ctx = viewer_ctx.clone();
-        ui.on_open_viewer(move |index| {
+        ui.on_open_viewer(move |model_index| {
+            // 4.7a-fix — КОРЕНЬ рассинхрона «клик по миниатюре открывает
+            // другое фото»: index из клика — это позиция в МОДЕЛИ
+            // thumbnails, а photos — ДРУГОЙ список (расходятся при
+            // батчах/досскане, урок 4.4c-6). Решение то же, что в
+            // show_thumbnail: истина — ПУТЬ. Берём source_path из модели
+            // и ищем индекс В PHOTOS по пути. Миниатюра-сирота (пути нет
+            // в photos) — не открываем ничего.
+            use slint::Model;
+            let path_str: String = {
+                let Some(w) = ctx.ui_weak.upgrade() else {
+                    return;
+                };
+                let thumbs = w.get_thumbnails();
+                let Some(item) = thumbs.row_data(model_index as usize) else {
+                    log::warn!("viewer: клик по миниатюре {model_index} — нет в модели");
+                    return;
+                };
+                item.source_path.to_string()
+            };
+            let index: i32 = {
+                let p = lock_or_recover(&ctx.photos);
+                match p
+                    .iter()
+                    .position(|ph| ph.path.to_string_lossy() == path_str)
+                {
+                    Some(i) => i as i32,
+                    None => {
+                        log::warn!(
+                            "viewer: миниатюра «{path_str}» не найдена в photos — не открываем"
+                        );
+                        return;
+                    }
+                }
+            };
+            if index != model_index {
+                log::debug!(
+                    "[FIX] клик: модель={model_index}, photos={index} — рассинхрон, открыли по пути"
+                );
+            }
             log::info!("viewer: открыть фото index={index}");
             ctx.last_direction.store(1, Ordering::SeqCst); // 4.3e — открытие = «вперёд».
                                                            // 4.4c-2 — открытие кликом в random: синхронизируем shuffle_pos с
