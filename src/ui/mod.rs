@@ -2057,6 +2057,64 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
         });
     }
+    // 4.6c-fix4 — открыть папку с логами в Проводнике (Windows).
+    // Папку берём из пути лога (logging::log_path), не дублируем знание.
+    {
+        ui.on_open_logs_folder(move || {
+            let dir = crate::logging::log_path()
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            log::info!("debug: открыть папку логов: {}", dir.display());
+            match std::process::Command::new("explorer").arg(&dir).spawn() {
+                Ok(_) => {}
+                Err(e) => log::error!("debug: не открыть папку логов: {e}"),
+            }
+        });
+    }
+    // 4.6c-fix4 — открыть сам лог в программе по умолчанию (блокнот).
+    // «cmd /c start "" путь» — пустой заголовок обязателен: без него
+    // start трактует путь в кавычках как заголовок окна.
+    {
+        ui.on_open_log_file(move || {
+            let path = crate::logging::log_path();
+            log::info!("debug: открыть лог: {}", path.display());
+            match std::process::Command::new("cmd")
+                .args(["/c", "start", "", &path.display().to_string()])
+                .spawn()
+            {
+                Ok(_) => {}
+                Err(e) => log::error!("debug: не открыть лог: {e}"),
+            }
+        });
+    }
+    // 4.6c-fix4 — сохранить копию лога: нативный диалог «куда» (rfd,
+    // как у выбора папки проектов) в ОТДЕЛЬНОМ потоке (диалог блокирующий,
+    // UI не вешаем), затем копируем файл. Ошибки логируем, не паникуем.
+    {
+        ui.on_save_log_copy(move || {
+            std::thread::spawn(move || {
+                let src = crate::logging::log_path();
+                let dst = rfd::FileDialog::new()
+                    .set_title("Куда сохранить копию лога")
+                    .set_file_name("photo_explorer.log")
+                    .save_file();
+                let Some(dst) = dst else {
+                    return; // отменили диалог — ничего не делаем
+                };
+                match std::fs::copy(&src, &dst) {
+                    Ok(bytes) => {
+                        log::info!(
+                            "debug: копия лога сохранена ({} байт) → {}",
+                            bytes,
+                            dst.display()
+                        )
+                    }
+                    Err(e) => log::error!("debug: не сохранить копию лога: {e}"),
+                }
+            });
+        });
+    }
 
     // --- Viewer колбэги ---
     // Открыть фото по индексу.

@@ -275,6 +275,10 @@ export component GalleryScreen inherits Window {
     // 4.6c-fix3 — вкладки и отладочная статистика.
     callback set-settings-tab(int);  // переключить вкладку настроек
     callback set-debug-stats(bool);  // детальная статистика в логах
+    // 4.6c-fix4 — доступ к логам из вкладки «Отладка» (Windows).
+    callback open-logs-folder();     // открыть папку с логами (проводник)
+    callback open-log-file();        // открыть лог в программе по умолчанию
+    callback save-log-copy();        // сохранить копию лога (диалог «куда»)
 
     // --- Viewer (просмотр фото в полном размере) ---
     in-out property <bool> show-viewer: false;
@@ -1232,6 +1236,68 @@ export component GalleryScreen inherits Window {
                                         }
                                     }
                                     Rectangle { horizontal-stretch: 1; }
+                                }
+                            }
+                            // 4.6c-fix4 — кнопки доступа к логам: видны
+                            // ТОЛЬКО при включённой галке (дебаг-режим).
+                            if root.debug-stats : VerticalLayout {
+                                spacing: 8px;
+                                Rectangle { height: 1px; background: #ffffff22; }
+                                Text {
+                                    text: "Логи";
+                                    color: Theme.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Rectangle {
+                                        height: 36px;
+                                        border-radius: 8px;
+                                        background: #ffffff0d;
+                                        border-width: 1px;
+                                        border-color: Theme.accent;
+                                        horizontal-stretch: 1;
+                                        TouchArea { clicked => { root.open-logs-folder(); } }
+                                        Text {
+                                            text: "📁 Папка логов";
+                                            color: Theme.text-primary;
+                                            font-size: 12px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Rectangle {
+                                        height: 36px;
+                                        border-radius: 8px;
+                                        background: #ffffff0d;
+                                        border-width: 1px;
+                                        border-color: Theme.accent;
+                                        horizontal-stretch: 1;
+                                        TouchArea { clicked => { root.open-log-file(); } }
+                                        Text {
+                                            text: "📄 Открыть лог";
+                                            color: Theme.text-primary;
+                                            font-size: 12px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                                Rectangle {
+                                    height: 36px;
+                                    border-radius: 8px;
+                                    background: #ffffff0d;
+                                    border-width: 1px;
+                                    border-color: Theme.accent;
+                                    TouchArea { clicked => { root.save-log-copy(); } }
+                                    Text {
+                                        text: "💾 Сохранить копию лога…";
+                                        color: Theme.text-primary;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
                                 }
                             }
                         }
