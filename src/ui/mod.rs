@@ -248,6 +248,23 @@ pub fn clamp_offset(
     offset.clamp(-max, max)
 }
 
+/// 4.7a-fix4 — задержка кадра в МИЛЛИСЕКУНДАХ из дроби `image::Delay`.
+///
+/// Контракт единиц: `numer_denom_ms()` крейта image отдаёт числитель и
+/// знаменатель дроби, значение которой УЖЕ миллисекунды (кадр GIF «три
+/// сотых секунды» → (30, 1) = 30 мс; см. `impl From<Delay> for Duration`
+/// в крейте — ratio идёт прямо в `from_millis`). Ошибка 4.7a: умножение
+/// на 1000 трактовало дробь как СЕКУНДЫ → кадр 30 мс спал 30 СЕКУНД,
+/// «GIF замер на первом кадре». Защиты: нулевой знаменатель → 100 мс
+/// (кадр без задержки), минимум 20 мс (не мгновенный проскок); длинные
+/// паузы НЕ режем — это легитимные кадры-паузы GIF.
+pub fn anim_delay_ms((numer, denom): (u32, u32)) -> u64 {
+    if denom == 0 {
+        return 100;
+    }
+    (numer as u64 / denom as u64).max(20)
+}
+
 /// Выводит окно приложения на передний план и даёт ему фокус (только Windows).
 ///
 /// Системное окно Windows Hello всплывает активным поверх окна, которое вызвало запрос.
@@ -1436,6 +1453,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     /// длинные обрежутся (лучше обрезать, чем OOM).
     const ANIM_MAX_FRAMES: usize = 200;
 
+    /// 4.7a-fix4 — квант сна аниматора: пауза кадра дробится на куски
+    /// ≤30 мс, после каждого куска сверяется поколение. Старый аниматор
+    /// умирает за ≤30 мс после нового перехода — зомби-потоки, каждый
+    /// со своим invoke в очередь UI, не копятся.
+    const ANIM_SLEEP_QUANTUM_MS: u64 = 30;
+
     /// 4.7a — декодирует ВСЕ кадры анимированного файла (GIF/APNG/WEBP)
     /// через AnimationDecoder крейта image. Не-анимированный файл или
     /// формат без анимации → Ok(vec![]) (пусто = показывать статично,
@@ -1479,14 +1502,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let mut frames = Vec::new();
         for f in frames_iter {
             let f = f.map_err(|e| format!("анимация: кадр: {e}"))?;
-            let (numer, denom) = f.delay().numer_denom_ms();
-            // Задержка: numer/denom мс; ноль у статичных — даём 100 мс
-            // (не мгновенный проскок, если вдруг анимация без задержек).
-            let delay_ms = if denom == 0 {
-                100
-            } else {
-                (numer as u64 * 1000 / denom as u64).max(20)
-            };
+            // 4.7a-fix4 — единицы дроби УЖЕ миллисекунды (см. anim_delay_ms):
+            // формула с ×1000 ошибочно трактовала их как секунды.
+            let delay_ms = anim_delay_ms(f.delay().numer_denom_ms());
             let rgba = f.into_buffer();
             let (w, h) = rgba.dimensions();
             frames.push(AnimFrame {
@@ -1504,11 +1522,19 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         if frames.len() <= 1 {
             return Ok(vec![]);
         }
+        // 4.7a-fix4 — сводка задержек в лог: единицы и длительность цикла
+        // видны сразу, «замер» диагностируется без ручного пересчёта.
+        let sum_ms: u64 = frames.iter().map(|f| f.delay_ms).sum();
+        let dmin = frames.iter().map(|f| f.delay_ms).min().unwrap_or(0);
+        let dmax = frames.iter().map(|f| f.delay_ms).max().unwrap_or(0);
         log::info!(
-            "анимация: {} кадров, {}x{}",
+            "анимация: {} кадров, {}x{}, задержки {}..{} мс, цикл ~{} мс",
             frames.len(),
             frames.first().map(|f| f.w).unwrap_or(0),
-            frames.first().map(|f| f.h).unwrap_or(0)
+            frames.first().map(|f| f.h).unwrap_or(0),
+            dmin,
+            dmax,
+            sum_ms
         );
         Ok(frames)
     }
@@ -1547,40 +1573,42 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
             let total = frames.len();
             let mut frame_no: usize = 0;
-            loop {
+            // 4.7a-fix4 — единая точка выхода: после break 'anim причина
+            // логируется и слой освобождается ОДИН раз (DRY), а не в
+            // трёх местах, как было.
+            let mut stopped = false;
+            'anim: loop {
                 for f in &frames {
                     // Поколение сменилось — пользователь ушёл, стоп.
-                    // 4.7a-fix3 — сверка стоит ПОСЛЕ паузы предыдущего кадра
-                    // и ДО показа текущего: первый кадр проверяется мгновенно
-                    // после старта аниматора (окно гонки — микросекунды),
-                    // каждый следующий — после своей паузы. Раньше пауза шла
-                    // ДО первого кадра: за delay_ms поколение успевало уйти,
-                    // и аниматор умирал, не показав НИ ОДНОГО кадра.
+                    // 4.7a-fix3 — сверка ДО показа кадра: первый кадр
+                    // проверяется мгновенно после старта аниматора
+                    // (окно гонки — микросекунды), каждый следующий —
+                    // после своей паузы.
                     if generation.load(Ordering::SeqCst) != my_gen {
-                        log::debug!("[ANIM] аниматор остановлен (поколение ушло): idx={index}");
-                        let ap = anim_playing.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            *lock_or_recover(&ap) = None;
-                        });
-                        return;
+                        stopped = true;
+                        break 'anim;
                     }
                     let gen = generation.clone();
                     let ui_weak = ui_weak.clone();
                     let (data, w, h) = (f.data.clone(), f.w, f.h);
-                    // 4.7a-fix2 — диагностический лог КАЖДОГО кадра.
+                    // 4.7a-fix2/fix4 — диагностический лог КАЖДОГО кадра
+                    // с его паузой: сразу видно, сколько мс ждём.
                     log::debug!(
-                        "[ANIM] кадр {}/{total} idx={index} gen={my_gen}",
-                        frame_no + 1
+                        "[ANIM] кадр {}/{total} idx={index} gen={my_gen} (пауза {} мс)",
+                        frame_no + 1,
+                        f.delay_ms
                     );
                     frame_no = frame_no.wrapping_add(1);
                     let _ = slint::invoke_from_event_loop(move || {
                         // Двойная сверка (как у воркера): поколение + индекс.
                         let cur = gen.load(Ordering::SeqCst);
                         if cur != my_gen {
+                            log::debug!("[ANIM] кадр отсечён в UI (поколение {cur} ≠ {my_gen})");
                             return;
                         }
                         if let Some(w_ui) = ui_weak.upgrade() {
                             if w_ui.get_viewer_index() != index {
+                                log::debug!("[ANIM] кадр отсечён в UI (индекс ушёл)");
                                 return; // индекс ушёл — не показываем
                             }
                             let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
@@ -1594,25 +1622,40 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             w_ui.set_viewer_img_w(w as f32);
                             w_ui.set_viewer_img_h(h as f32);
                             w_ui.set_viewer_image(slint::Image::from_rgba8(buf));
+                            log::debug!("[ANIM] кадр НА ЭКРАНЕ idx={index}");
                         }
                     });
-                    // 4.7a-fix3 — пауза ПОСЛЕ показа: кадр N висит свой
-                    // delay_ms, затем приходит N+1. Первый кадр появляется
-                    // мгновенно при старте аниматора — до любой гонки
-                    // поколений.
-                    std::thread::sleep(std::time::Duration::from_millis(f.delay_ms));
+                    // 4.7a-fix3/fix4 — пауза ПОСЛЕ показа, квантами
+                    // ≤30 мс со сверкой поколения: старый аниматор умирает
+                    // за ≤30 мс после нового перехода, зомби не копятся и
+                    // не топят очередь событий UI лишними invoke.
+                    let mut left = f.delay_ms;
+                    while left > 0 {
+                        let quantum = left.min(ANIM_SLEEP_QUANTUM_MS);
+                        std::thread::sleep(std::time::Duration::from_millis(quantum));
+                        if generation.load(Ordering::SeqCst) != my_gen {
+                            stopped = true;
+                            break 'anim;
+                        }
+                        left -= quantum;
+                    }
                 }
                 // Проход закончен: галка «зациклить» читается ЗДЕСЬ —
                 // смена настройки применяется к текущей анимации.
                 if !settings.loop_animation_on() {
-                    log::debug!("[ANIM] аниматор завершён (один проход): idx={index}");
-                    let ap = anim_playing.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        *lock_or_recover(&ap) = None;
-                    });
-                    return;
+                    break 'anim; // один проход — стоп на последнем кадре
                 }
             }
+            // Единая точка выхода: лог причины + освобождение слоя.
+            if stopped {
+                log::debug!("[ANIM] аниматор остановлен (поколение ушло): idx={index}");
+            } else {
+                log::debug!("[ANIM] аниматор завершён (один проход): idx={index}");
+            }
+            let ap = anim_playing.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                *lock_or_recover(&ap) = None;
+            });
         });
     }
 
