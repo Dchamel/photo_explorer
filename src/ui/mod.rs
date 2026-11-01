@@ -7,6 +7,10 @@
 
 slint::include_modules!();
 
+mod anim_cache;
+
+use anim_cache::{AnimFrame, AnimFramesCache, ANIM_CACHE_MAX_BYTES};
+
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -1028,6 +1032,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         /// первым статичным («GIF замер»). Arc<Mutex> — флаг живёт в
         /// потоке-аниматоре (Send), читают статичные писатели (UI-поток).
         anim_playing: Arc<Mutex<Option<(i32, u64)>>>,
+        /// 4.7c — LRU-кэш декодированных кадров (по пути, ≤400 МБ):
+        /// повторное открытие GIF — мгновенно, без повторного декода
+        /// сотен кадров. Arc<Mutex> — доступ из потока-декодера (Send).
+        anim_cache: Arc<Mutex<AnimFramesCache>>,
     }
 
     impl ViewerCtx {
@@ -1105,27 +1113,46 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     let ui_weak = self.ui_weak.clone();
                     let settings = self.settings.clone();
                     let anim_playing = self.anim_playing.clone();
+                    let anim_cache = self.anim_cache.clone();
                     let idx = index;
                     std::thread::spawn(move || {
                         // Поколение уже ушло — не декодируем зря.
                         if gen.load(Ordering::SeqCst) != my_gen {
                             return;
                         }
-                        match decode_animated_frames(&path) {
-                            Ok(frames) if !frames.is_empty() => {
-                                spawn_animator(
-                                    frames,
-                                    idx,
-                                    my_gen,
-                                    gen,
-                                    ui_weak,
-                                    settings,
-                                    anim_playing,
+                        // 4.7c — сначала КЭШ: повторное открытие того же GIF
+                        // стартует аниматор мгновенно, без декода сотен
+                        // кадров. Клоны кадров из кэша — аниматор владеет
+                        // своей копией (кэш не отдаёт ссылки наружу).
+                        let cached = lock_or_recover(&anim_cache).get(&path);
+                        let frames = match cached {
+                            Some(frames) => {
+                                log::debug!(
+                                    "[ANIM] кэш кадров: ХИТ «{}» ({} кадров)",
+                                    path.display(),
+                                    frames.len()
                                 );
+                                frames
                             }
-                            Ok(_) => {}
-                            Err(e) => log::debug!("анимация: кадры не декодировались: {e}"),
-                        }
+                            None => {
+                                log::debug!(
+                                    "[ANIM] кэш кадров: МИМО — декодирую «{}»",
+                                    path.display()
+                                );
+                                match decode_animated_frames(&path) {
+                                    Ok(frames) if !frames.is_empty() => {
+                                        lock_or_recover(&anim_cache).put(path, frames.clone());
+                                        frames
+                                    }
+                                    Ok(_) => return, // статика — не анимируем
+                                    Err(e) => {
+                                        log::debug!("анимация: кадры не декодировались: {e}");
+                                        return;
+                                    }
+                                }
+                            }
+                        };
+                        spawn_animator(frames, idx, my_gen, gen, ui_weak, settings, anim_playing);
                     });
                 }
             }
@@ -1356,6 +1383,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         broken: Rc::new(RefCell::new(std::collections::HashSet::new())), // 4.4c-3
         anim_playing: Arc::new(Mutex::new(None)), // 4.7a-fix2 — аниматор владеет слоем
         settings: global_settings.clone(),        // 4.7a-fix2 — анимация из перехода
+        anim_cache: Arc::new(Mutex::new(AnimFramesCache::new(ANIM_CACHE_MAX_BYTES))), // 4.7c
     });
 
     /// Подпись режима ресайза для логов [CONC]: «1 поток» или «ultra N ядер».
@@ -1434,17 +1462,6 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         // Сохраняем в кэш (короткая блокировка).
         lock_or_recover(&cache).put(path, (data.clone(), w, h));
         Ok((data, w, h))
-    }
-
-    /// 4.7a — кадр анимации: сырой RGBA (Send) + задержка до СЛЕДУЮЩЕГО
-    /// кадра в миллисекундах. Декодер image сам композитит частичные
-    /// GIF-кадры на полный холст (blend_and_dispose) — каждый кадр
-    /// готов к показу как есть, без ручной склейки.
-    struct AnimFrame {
-        data: Vec<u8>,
-        w: u32,
-        h: u32,
-        delay_ms: u64,
     }
 
     /// 4.7a — верхний лимит кадров анимации в памяти. GIF на 1000 кадров
