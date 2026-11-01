@@ -1549,10 +1549,13 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             let mut frame_no: usize = 0;
             loop {
                 for f in &frames {
-                    // Пауза ДО показа кадра: кадр N показывается, затем
-                    // ждём его delay, потом показываем N+1.
-                    std::thread::sleep(std::time::Duration::from_millis(f.delay_ms));
                     // Поколение сменилось — пользователь ушёл, стоп.
+                    // 4.7a-fix3 — сверка стоит ПОСЛЕ паузы предыдущего кадра
+                    // и ДО показа текущего: первый кадр проверяется мгновенно
+                    // после старта аниматора (окно гонки — микросекунды),
+                    // каждый следующий — после своей паузы. Раньше пауза шла
+                    // ДО первого кадра: за delay_ms поколение успевало уйти,
+                    // и аниматор умирал, не показав НИ ОДНОГО кадра.
                     if generation.load(Ordering::SeqCst) != my_gen {
                         log::debug!("[ANIM] аниматор остановлен (поколение ушло): idx={index}");
                         let ap = anim_playing.clone();
@@ -1593,6 +1596,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             w_ui.set_viewer_image(slint::Image::from_rgba8(buf));
                         }
                     });
+                    // 4.7a-fix3 — пауза ПОСЛЕ показа: кадр N висит свой
+                    // delay_ms, затем приходит N+1. Первый кадр появляется
+                    // мгновенно при старте аниматора — до любой гонки
+                    // поколений.
+                    std::thread::sleep(std::time::Duration::from_millis(f.delay_ms));
                 }
                 // Проход закончен: галка «зациклить» читается ЗДЕСЬ —
                 // смена настройки применяется к текущей анимации.
