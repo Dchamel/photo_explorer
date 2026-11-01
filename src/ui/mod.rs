@@ -810,12 +810,39 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             continue;
                         }
                         let decode_start = std::time::Instant::now();
+                        // 4.7a — путь для анимации: load_full_image забирает
+                        // path, а аниматору нужен свой (кадры декодируются
+                        // отдельно от первого кадра).
+                        let anim_path = path.clone();
                         let result = load_full_image(path, viewer_cache.clone(), &global_settings);
                         log::debug!(
                             "[CONC] worker: Photo idx={index} декод за {} мс ({})",
                             decode_start.elapsed().as_millis(),
                             resize_mode_label(&global_settings)
                         );
+                        // 4.7a — анимированный файл (GIF/APNG/WEBP с кадрами)?
+                        // Декодируем ВСЕ кадры и запускаем поток-аниматор.
+                        // Не анимированный → пусто → ничего не делаем (статика
+                        // как раньше). Ошибка кадров НЕ роняет показ: первый
+                        // кадр уже в кэше и на экране (фолбэк).
+                        if result.is_ok() && viewer_generation.load(Ordering::SeqCst) == my_gen {
+                            match decode_animated_frames(&anim_path) {
+                                Ok(frames) if !frames.is_empty() => {
+                                    spawn_animator(
+                                        frames,
+                                        index,
+                                        my_gen,
+                                        viewer_generation.clone(),
+                                        ui_weak_for_viewer.clone(),
+                                        global_settings.clone(),
+                                    );
+                                }
+                                Ok(_) => {} // статика — аниматор не нужен
+                                Err(e) => {
+                                    log::debug!("анимация: кадры не декодировались: {e}")
+                                }
+                            }
+                        }
                         let gen = viewer_generation.clone();
                         let dir = last_direction.load(Ordering::SeqCst);
                         let ui_weak = ui_weak_for_viewer.clone();
@@ -1342,6 +1369,169 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         // Сохраняем в кэш (короткая блокировка).
         lock_or_recover(&cache).put(path, (data.clone(), w, h));
         Ok((data, w, h))
+    }
+
+    /// 4.7a — кадр анимации: сырой RGBA (Send) + задержка до СЛЕДУЮЩЕГО
+    /// кадра в миллисекундах. Декодер image сам композитит частичные
+    /// GIF-кадры на полный холст (blend_and_dispose) — каждый кадр
+    /// готов к показу как есть, без ручной склейки.
+    struct AnimFrame {
+        data: Vec<u8>,
+        w: u32,
+        h: u32,
+        delay_ms: u64,
+    }
+
+    /// 4.7a — верхний лимит кадров анимации в памяти. GIF на 1000 кадров
+    /// 2560×2560 — это гигабайты RGBA; без лимта можно уронить ноут по
+    /// памяти. 200 кадров хватает практически любой осмысленной анимации;
+    /// длинные обрежутся (лучше обрезать, чем OOM).
+    const ANIM_MAX_FRAMES: usize = 200;
+
+    /// 4.7a — декодирует ВСЕ кадры анимированного файла (GIF/APNG/WEBP)
+    /// через AnimationDecoder крейта image. Не-анимированный файл или
+    /// формат без анимации → Ok(vec![]) (пусто = показывать статично,
+    /// как раньше). Ошибка декодирования НЕ фатальна: Err → файл
+    /// покажется обычным путём через load_full_image (фолбэк).
+    fn decode_animated_frames(path: &std::path::Path) -> Result<Vec<AnimFrame>, String> {
+        use image::AnimationDecoder;
+        // Открываем по расширению: image::open не отдаёт AnimationDecoder,
+        // нужен конкретный кодек. GIF — самое частое; APNG и WEBP — бонус.
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let file = std::fs::File::open(path).map_err(|e| format!("анимация: открыть файл: {e}"))?;
+        let reader = std::io::BufReader::new(file);
+        let frames_iter = match ext.as_str() {
+            "gif" => {
+                let dec = image::codecs::gif::GifDecoder::new(reader)
+                    .map_err(|e| format!("анимация: GIF декодер: {e}"))?;
+                dec.into_frames()
+            }
+            "png" | "apng" => {
+                // APNG: PngDecoder::apng() — публичный конструктор обёртки
+                // (возвращает Result). Обычный PNG отдаст 0-1 кадров —
+                // статика, отфильтруется проверкой len <= 1 ниже.
+                let png = image::codecs::png::PngDecoder::new(reader)
+                    .map_err(|e| format!("анимация: PNG декодер: {e}"))?;
+                let dec = png
+                    .apng()
+                    .map_err(|e| format!("анимация: APNG обёртка: {e}"))?;
+                dec.into_frames()
+            }
+            "webp" => {
+                let dec = image::codecs::webp::WebPDecoder::new(reader)
+                    .map_err(|e| format!("анимация: WEBP декодер: {e}"))?;
+                dec.into_frames()
+            }
+            _ => return Ok(vec![]), // не анимированный формат — статика
+        };
+        let mut frames = Vec::new();
+        for f in frames_iter {
+            let f = f.map_err(|e| format!("анимация: кадр: {e}"))?;
+            let (numer, denom) = f.delay().numer_denom_ms();
+            // Задержка: numer/denom мс; ноль у статичных — даём 100 мс
+            // (не мгновенный проскок, если вдруг анимация без задержек).
+            let delay_ms = if denom == 0 {
+                100
+            } else {
+                (numer as u64 * 1000 / denom as u64).max(20)
+            };
+            let rgba = f.into_buffer();
+            let (w, h) = rgba.dimensions();
+            frames.push(AnimFrame {
+                data: rgba.into_raw(),
+                w,
+                h,
+                delay_ms,
+            });
+            if frames.len() >= ANIM_MAX_FRAMES {
+                log::warn!("анимация: {ANIM_MAX_FRAMES} кадров — обрезаем (защита памяти)");
+                break;
+            }
+        }
+        // 1 кадр = не анимация (статичный PNG через APNG-путь и т.п.).
+        if frames.len() <= 1 {
+            return Ok(vec![]);
+        }
+        log::info!(
+            "анимация: {} кадров, {}x{}",
+            frames.len(),
+            frames.first().map(|f| f.w).unwrap_or(0),
+            frames.first().map(|f| f.h).unwrap_or(0)
+        );
+        Ok(frames)
+    }
+
+    /// 4.7a — поток-аниматор: проигрывает кадры в UI-поток. Живёт в
+    /// ОТДЕЛЬНОМ потоке (воркер не блокируется), между кадрами спит
+    /// delay_ms. Каждый кадр отдаётся через invoke_from_event_loop со
+    /// сверкой ПОКОЛЕНИЯ (как у воркера): пользователь ушёл на другое
+    /// фото → поколение сменилось → аниматор молча завершается, чужие
+    /// кадры на экран не попадут (инвариант «кадр = viewer-index»
+    /// сохранён — кадр анимации пишется только когда поколение живо).
+    /// «Зациклить» читается из настроек на каждом ПРОХОДЕ: смена галки
+    /// применяется к текущей анимации сразу.
+    fn spawn_animator(
+        frames: Vec<AnimFrame>,
+        index: i32,
+        my_gen: u64,
+        generation: Arc<AtomicU64>,
+        ui_weak: slint::Weak<GalleryScreen>,
+        settings: Arc<crate::settings::GlobalSettings>,
+    ) {
+        std::thread::spawn(move || {
+            log::debug!(
+                "[ANIM] аниматор запущен: idx={index} gen={my_gen} кадров={}",
+                frames.len()
+            );
+            loop {
+                for f in &frames {
+                    // Пауза ДО показа кадра: кадр N показывается, затем
+                    // ждём его delay, потом показываем N+1.
+                    std::thread::sleep(std::time::Duration::from_millis(f.delay_ms));
+                    // Поколение сменилось — пользователь ушёл, стоп.
+                    if generation.load(Ordering::SeqCst) != my_gen {
+                        log::debug!("[ANIM] аниматор остановлен (поколение ушло): idx={index}");
+                        return;
+                    }
+                    let gen = generation.clone();
+                    let ui_weak = ui_weak.clone();
+                    let (data, w, h) = (f.data.clone(), f.w, f.h);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        // Двойная сверка (как у воркера): поколение + индекс.
+                        let cur = gen.load(Ordering::SeqCst);
+                        if cur != my_gen {
+                            return;
+                        }
+                        if let Some(w_ui) = ui_weak.upgrade() {
+                            if w_ui.get_viewer_index() != index {
+                                return; // индекс ушёл — не показываем
+                            }
+                            let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
+                            let pixels = buf.make_mut_slice();
+                            for (dst, chunk) in pixels.iter_mut().zip(data.as_chunks::<4>().0) {
+                                dst.r = chunk[0];
+                                dst.g = chunk[1];
+                                dst.b = chunk[2];
+                                dst.a = chunk[3];
+                            }
+                            w_ui.set_viewer_img_w(w as f32);
+                            w_ui.set_viewer_img_h(h as f32);
+                            w_ui.set_viewer_image(slint::Image::from_rgba8(buf));
+                        }
+                    });
+                }
+                // Проход закончен: галка «зациклить» читается ЗДЕСЬ —
+                // смена настройки применяется к текущей анимации.
+                if !settings.loop_animation_on() {
+                    log::debug!("[ANIM] аниматор завершён (один проход): idx={index}");
+                    return;
+                }
+            }
+        });
     }
 
     /// 4.6c (Фаза 2) — ускоренный downscale для «Ультра-скорости»:
@@ -1997,6 +2187,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             w.set_ultra_threads_max(max_threads);
             w.set_settings_tab(0);
             w.set_debug_stats(global_settings.debug_stats_on());
+            // 4.7a — «Зациклить анимацию» из глобальных настроек.
+            w.set_loop_animation(global_settings.loop_animation_on());
         }
     }
     // 4.6c — галка «Ультра-скорость»: пишем в атомики (воркер применит к
@@ -2054,6 +2246,21 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             crate::settings::store(&settings);
             if let Some(w) = ui_weak.upgrade() {
                 w.set_debug_stats(on);
+            }
+        });
+    }
+    // 4.7a — галка «Зациклить анимацию» (вкладка «Листание»): пишем в
+    // атомик (поток-аниматор читает на каждом проходе — смена цикла
+    // применяется к текущей анимации сразу) и сохраняем на диск.
+    {
+        let ui_weak = ui.as_weak();
+        let settings = global_settings.clone();
+        ui.on_set_loop_animation(move |on| {
+            log::info!("settings: зациклить анимацию → {on}");
+            settings.loop_animation.store(on, Ordering::Relaxed);
+            crate::settings::store(&settings);
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_loop_animation(on);
             }
         });
     }

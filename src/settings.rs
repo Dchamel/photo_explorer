@@ -32,6 +32,12 @@ pub struct GlobalSettings {
     /// и прочие замеры. ВЫКЛ по умолчанию у всех — обычному пользователю
     /// детальный лог не нужен (чисто отладочный инструмент).
     pub debug_stats: AtomicBool,
+    /// 4.7a — «Зациклить анимацию» (GIF/WEBP/APNG): ВКЛ — проигрывать
+    /// по кругу (как в браузерах, по умолчанию); ВЫКЛ — один проход,
+    /// стоп на последнем кадре. Глобальная настройка (про поведение
+    /// просмотра, не про конкретный проект); поток-аниматор читает её
+    /// на каждом проходе — смена применяется сразу.
+    pub loop_animation: AtomicBool,
 }
 
 impl GlobalSettings {
@@ -44,6 +50,8 @@ impl GlobalSettings {
             ultra_speed: AtomicBool::new(false),
             threads: AtomicUsize::new(threads),
             debug_stats: AtomicBool::new(false),
+            // 4.7a — цикл по умолчанию: естественное поведение просмотрщика.
+            loop_animation: AtomicBool::new(true),
         }
     }
 
@@ -58,6 +66,11 @@ impl GlobalSettings {
     /// 4.6c-fix3 — детальная статистика включена? (вкладка «Отладка»).
     pub fn debug_stats_on(&self) -> bool {
         self.debug_stats.load(Ordering::Relaxed)
+    }
+
+    /// 4.7a — зациклить анимацию? (глобальная настройка просмотра).
+    pub fn loop_animation_on(&self) -> bool {
+        self.loop_animation.load(Ordering::Relaxed)
     }
 }
 
@@ -92,6 +105,14 @@ struct SettingsFile {
     /// 4.6c-fix3 — отсутствует в старых файлах → serde default (false).
     #[serde(default)]
     debug_stats: bool,
+    /// 4.7a — отсутствует в старых файлах → serde default (true, цикл).
+    #[serde(default = "default_loop_animation")]
+    loop_animation: bool,
+}
+
+/// 4.7a — значение loop_animation по умолчанию для serde (цикл ВКЛ).
+fn default_loop_animation() -> bool {
+    true
 }
 
 /// Загрузить настройки с диска (или значения по умолчанию, если файла
@@ -106,11 +127,15 @@ pub fn load() -> GlobalSettings {
                 settings.ultra_speed.store(f.ultra_speed, Ordering::Relaxed);
                 settings.threads.store(f.threads.max(1), Ordering::Relaxed);
                 settings.debug_stats.store(f.debug_stats, Ordering::Relaxed);
+                settings
+                    .loop_animation
+                    .store(f.loop_animation, Ordering::Relaxed);
                 log::info!(
-                    "settings: загружены (ultra_speed={}, threads={}, debug_stats={})",
+                    "settings: загружены (ultra_speed={}, threads={}, debug_stats={}, loop_animation={})",
                     f.ultra_speed,
                     f.threads.max(1),
-                    f.debug_stats
+                    f.debug_stats,
+                    f.loop_animation
                 );
             }
             Err(e) => {
@@ -132,6 +157,7 @@ pub fn store(settings: &GlobalSettings) {
         ultra_speed,
         threads,
         debug_stats: settings.debug_stats_on(),
+        loop_animation: settings.loop_animation_on(),
     };
     let path = settings_path();
     // Создаём каталог, если его ещё нет (первый запуск).
@@ -168,6 +194,8 @@ mod tests {
         assert!(!s.ultra_speed.load(Ordering::Relaxed));
         // Детальная статистика ВЫКЛ по умолчанию — тихий лог у всех.
         assert!(!s.debug_stats_on());
+        // Анимация ЗАЦИКЛЕНА по умолчанию — как в браузерах.
+        assert!(s.loop_animation_on());
         let (_, threads) = s.snapshot();
         assert!(threads >= 1);
     }

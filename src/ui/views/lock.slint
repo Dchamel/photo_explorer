@@ -255,6 +255,10 @@ export component GalleryScreen inherits Window {
     // ВЫКЛ по умолчанию у всех — обычному пользователю не нужна).
     in-out property <int> settings-tab: 0;
     in-out property <bool> debug-stats: false;
+    // 4.7a — «Зациклить анимацию» (GIF/WEBP/APNG): ВКЛ — по кругу
+    // (по умолчанию, как в браузерах); ВЫКЛ — один проход, стоп на
+    // последнем кадре. Глобальная настройка просмотра.
+    in-out property <bool> loop-animation: true;
     // Диалог переименования проекта (Slint, без нативных диалогов).
     in-out property <bool> rename-visible: false;
     in-out property <string> rename-text: "";
@@ -275,6 +279,8 @@ export component GalleryScreen inherits Window {
     // 4.6c-fix3 — вкладки и отладочная статистика.
     callback set-settings-tab(int);  // переключить вкладку настроек
     callback set-debug-stats(bool);  // детальная статистика в логах
+    // 4.7a — зациклить анимацию GIF/WEBP/APNG.
+    callback set-loop-animation(bool);
     // 4.6c-fix4 — доступ к логам из вкладки «Отладка» (Windows).
     callback open-logs-folder();     // открыть папку с логами (проводник)
     callback open-log-file();        // открыть лог в программе по умолчанию
@@ -1100,6 +1106,42 @@ export component GalleryScreen inherits Window {
                                 hint: "кнопки листания выбирают случайное фото";
                                 selected: root.nav-mode;
                                 selected-clicked() => { root.set-nav-mode("random"); }
+                            }
+                            // 4.7a — «Зациклить анимацию» (глобальная):
+                            // GIF/WEBP/APNG по кругу или один проход.
+                            Rectangle {
+                                height: 48px;
+                                border-radius: 8px;
+                                background: root.loop-animation ? #2a4d6f : #ffffff0d;
+                                border-width: root.loop-animation ? 1px : 0px;
+                                border-color: Theme.accent;
+                                TouchArea { clicked => { root.set-loop-animation(!root.loop-animation); } }
+                                HorizontalLayout {
+                                    padding: 10px;
+                                    spacing: 10px;
+                                    Text {
+                                        text: root.loop-animation ? "◉" : "○";
+                                        color: Theme.accent;
+                                        font-size: 16px;
+                                        vertical-alignment: center;
+                                    }
+                                    VerticalLayout {
+                                        padding: 0px;
+                                        Text {
+                                            text: "Зациклить анимацию";
+                                            color: Theme.text-primary;
+                                            font-size: 13px;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            text: "анимированные GIF/WEBP играют по кругу; выключено — один проход и стоп";
+                                            color: Theme.text-secondary;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
                             }
                         }
                         // === Вкладка 1: «Производительность» (глобальные) ===
