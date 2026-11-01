@@ -3,7 +3,7 @@
 // Оба компонента (LockScreen и GalleryScreen) в одном файле, чтобы slint-build компилировал их вместе.
 
 import { Theme } from "theme.slint";
-import { Slider } from "std-widgets.slint";
+import { Slider, ScrollView } from "std-widgets.slint";
 
 component KeyButton inherits Rectangle {
     in property <string> label;
@@ -961,23 +961,27 @@ export component GalleryScreen inherits Window {
         }
     }
 
-    // --- 4.4a — Панель настроек проекта: режим листания ---
-    // Три варианта: до края (стоп на первом/последнем), циклично (по кругу),
-    // случайно (хаотичный порядок). Выбор сохраняется в сессию проекта.
+    // --- Панель настроек (4.4a + 4.6c-fix) ---
+    // Три зоны (заказчик: «настройки улетали под кат — не нажать Готово»):
+    // 1) шапка с заголовком — закреплена сверху;
+    // 2) ScrollView со ВСЕМИ блоками настроек — прокручивается, сколько
+    //    бы блоков ни добавили в будущем (кнопка никогда не уедет);
+    // 3) подвал с «Готово» — закреплён снизу, ВСЕГДА видна и кликабельна.
     if root.settings-visible : Rectangle {
         background: #000000b4;
         Rectangle {
-            width: 440px;
-            height: 540px;
+            width: 460px;
+            height: 600px;
             border-radius: 12px;
             background: Theme.panel;
             border-width: 1px;
             border-color: Theme.accent;
             VerticalLayout {
                 padding: 20px;
-                spacing: 14px;
+                spacing: 12px;
+                // --- Зона 1: шапка (закреплена) ---
                 Text {
-                    text: "⚙ Настройки проекта";
+                    text: "⚙ Настройки";
                     color: Theme.text-primary;
                     font-size: 18px;
                     font-weight: 700;
@@ -990,130 +994,140 @@ export component GalleryScreen inherits Window {
                     font-size: 13px;
                 }
                 Rectangle { height: 1px; background: #ffffff22; }
-                // --- Блок «Листание» (per-project) ---
-                Text {
-                    text: "Листание в просмотрщике:";
-                    color: Theme.text-primary;
-                    font-size: 14px;
-                    font-weight: 600;
-                }
-                Text {
-                    // Подпись блока: что делает эта секция (по просьбе
-                    // заказчика — понятно пользователю без догадок).
-                    text: "Как ведут себя стрелки и колесо на первом/последнем фото. Выбор сохраняется в этом проекте.";
-                    color: Theme.text-secondary;
-                    font-size: 11px;
-                    wrap: TextWrap.word-wrap;
-                }
-                NavOption {
-                    value: "edge";
-                    label: "До края";
-                    hint: "на первом/последнем фото стоп — без прыжка в конец";
-                    selected: root.nav-mode;
-                    selected-clicked() => { root.set-nav-mode("edge"); }
-                }
-                NavOption {
-                    value: "cycle";
-                    label: "Циклично";
-                    hint: "после последнего — снова первое (по кругу)";
-                    selected: root.nav-mode;
-                    selected-clicked() => { root.set-nav-mode("cycle"); }
-                }
-                NavOption {
-                    value: "random";
-                    label: "Случайно";
-                    hint: "кнопки листания выбирают случайное фото";
-                    selected: root.nav-mode;
-                    selected-clicked() => { root.set-nav-mode("random"); }
-                }
-                Rectangle { height: 1px; background: #ffffff22; }
-                // --- Блок «Производительность» (глобальные, 4.6c) ---
-                Text {
-                    text: "⚡ Производительность:";
-                    color: Theme.text-primary;
-                    font-size: 14px;
-                    font-weight: 600;
-                }
-                Text {
-                    text: "Ускорение открытия тяжёлых фото (4K и больше). Настройка общая для всех проектов — про железо, не про фото.";
-                    color: Theme.text-secondary;
-                    font-size: 11px;
-                    wrap: TextWrap.word-wrap;
-                }
-                HorizontalLayout {
-                    spacing: 10px;
-                    // Галка «Ультра-скорость» (кликабельная строка).
-                    Rectangle {
-                        height: 44px;
-                        border-radius: 8px;
-                        background: root.ultra-speed ? #2a4d6f : #ffffff0d;
-                        border-width: root.ultra-speed ? 1px : 0px;
-                        border-color: Theme.accent;
-                        TouchArea { clicked => { root.set-ultra-speed(!root.ultra-speed); } }
-                        HorizontalLayout {
-                            padding: 10px;
-                            spacing: 10px;
+                // --- Зона 2: прокручиваемые настройки ---
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding: 0px;
+                        spacing: 12px;
+                        // --- Карточка «Листание» (per-project) ---
+                        VerticalLayout {
+                            spacing: 8px;
                             Text {
-                                text: root.ultra-speed ? "◉" : "○";
-                                color: Theme.accent;
-                                font-size: 16px;
-                                vertical-alignment: center;
+                                text: "Листание в просмотрщике";
+                                color: Theme.text-primary;
+                                font-size: 14px;
+                                font-weight: 600;
                             }
-                            VerticalLayout {
-                                padding: 0px;
+                            Text {
+                                text: "Как ведут себя стрелки и колесо на первом/последнем фото. Выбор сохраняется в этом проекте.";
+                                color: Theme.text-secondary;
+                                font-size: 11px;
+                                wrap: TextWrap.word-wrap;
+                            }
+                            NavOption {
+                                value: "edge";
+                                label: "До края";
+                                hint: "на первом/последнем фото стоп — без прыжка в конец";
+                                selected: root.nav-mode;
+                                selected-clicked() => { root.set-nav-mode("edge"); }
+                            }
+                            NavOption {
+                                value: "cycle";
+                                label: "Циклично";
+                                hint: "после последнего — снова первое (по кругу)";
+                                selected: root.nav-mode;
+                                selected-clicked() => { root.set-nav-mode("cycle"); }
+                            }
+                            NavOption {
+                                value: "random";
+                                label: "Случайно";
+                                hint: "кнопки листания выбирают случайное фото";
+                                selected: root.nav-mode;
+                                selected-clicked() => { root.set-nav-mode("random"); }
+                            }
+                        }
+                        Rectangle { height: 1px; background: #ffffff22; }
+                        // --- Карточка «Производительность» (глобальные, 4.6c) ---
+                        VerticalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "⚡ Производительность";
+                                color: Theme.text-primary;
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
+                            Text {
+                                text: "Ускорение открытия тяжёлых фото (4K и больше). Настройка общая для всех проектов — про железо, не про фото.";
+                                color: Theme.text-secondary;
+                                font-size: 11px;
+                                wrap: TextWrap.word-wrap;
+                            }
+                            // Галка «Ультра-скорость» (кликабельная карточка).
+                            Rectangle {
+                                height: 48px;
+                                border-radius: 8px;
+                                background: root.ultra-speed ? #2a4d6f : #ffffff0d;
+                                border-width: root.ultra-speed ? 1px : 0px;
+                                border-color: Theme.accent;
+                                TouchArea { clicked => { root.set-ultra-speed(!root.ultra-speed); } }
+                                HorizontalLayout {
+                                    padding: 10px;
+                                    spacing: 10px;
+                                    Text {
+                                        text: root.ultra-speed ? "◉" : "○";
+                                        color: Theme.accent;
+                                        font-size: 16px;
+                                        vertical-alignment: center;
+                                    }
+                                    VerticalLayout {
+                                        padding: 0px;
+                                        Text {
+                                            text: "Ультра-скорость";
+                                            color: Theme.text-primary;
+                                            font-size: 13px;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            text: "быстрее открывает тяжёлые фото, но сильнее греет ноутбук и расходует батарею";
+                                            color: Theme.text-secondary;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                            }
+                            // Бегунок числа ядер (виден только при включённой галке).
+                            if root.ultra-speed : VerticalLayout {
+                                spacing: 4px;
                                 Text {
-                                    text: "Ультра-скорость";
+                                    text: "Ядер для ускорения: " + root.ultra-threads + " из " + root.ultra-threads-max;
                                     color: Theme.text-primary;
-                                    font-size: 13px;
-                                    vertical-alignment: center;
+                                    font-size: 12px;
+                                }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Text {
+                                        text: "1";
+                                        color: Theme.text-secondary;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                    }
+                                    Slider {
+                                        minimum: 1;
+                                        maximum: root.ultra-threads-max;
+                                        value: root.ultra-threads;
+                                        changed(f) => { root.set-ultra-threads(Math.round(f)); }
+                                    }
+                                    Text {
+                                        text: root.ultra-threads-max;
+                                        color: Theme.text-secondary;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                    }
                                 }
                                 Text {
-                                    text: "быстрее открывает тяжёлые фото, но сильнее греет ноутбук и расходует батарею";
+                                    text: "больше ядер — быстрее декод, но выше нагрузка на процессор";
                                     color: Theme.text-secondary;
                                     font-size: 11px;
-                                    vertical-alignment: center;
                                 }
                             }
-                            Rectangle { horizontal-stretch: 1; }
                         }
                     }
                 }
-                // Бегунок числа ядер (виден только при включённой галке).
-                if root.ultra-speed : VerticalLayout {
-                    spacing: 4px;
-                    Text {
-                        text: "Ядер для ускорения: " + root.ultra-threads + " из " + root.ultra-threads-max;
-                        color: Theme.text-primary;
-                        font-size: 12px;
-                    }
-                    HorizontalLayout {
-                        spacing: 10px;
-                        Text {
-                            text: "1";
-                            color: Theme.text-secondary;
-                            font-size: 11px;
-                            vertical-alignment: center;
-                        }
-                        Slider {
-                            minimum: 1;
-                            maximum: root.ultra-threads-max;
-                            value: root.ultra-threads;
-                            changed(f) => { root.set-ultra-threads(Math.round(f)); }
-                        }
-                        Text {
-                            text: root.ultra-threads-max;
-                            color: Theme.text-secondary;
-                            font-size: 11px;
-                            vertical-alignment: center;
-                        }
-                    }
-                    Text {
-                        text: "больше ядер — быстрее декод, но выше нагрузка на процессор";
-                        color: Theme.text-secondary;
-                        font-size: 11px;
-                    }
-                }
-                Rectangle { vertical-stretch: 1; }
+                // --- Зона 3: подвал с «Готово» (закреплён, всегда виден) ---
+                Rectangle { height: 1px; background: #ffffff22; }
                 HorizontalLayout {
                     spacing: 8px;
                     alignment: end;
