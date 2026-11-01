@@ -27,6 +27,11 @@ pub struct GlobalSettings {
     /// Сколько ядер использовать при включённой «Ультра-скорости».
     /// 0 = «половина ядер» (значение по умолчанию вычисляется при загрузке).
     pub threads: AtomicUsize,
+    /// 4.6c-fix3 — «Детальная статистика в логах» (вкладка «Отладка»):
+    /// под флагом воркер пишет число реально задействованных полос rayon
+    /// и прочие замеры. ВЫКЛ по умолчанию у всех — обычному пользователю
+    /// детальный лог не нужен (чисто отладочный инструмент).
+    pub debug_stats: AtomicBool,
 }
 
 impl GlobalSettings {
@@ -38,15 +43,21 @@ impl GlobalSettings {
         Self {
             ultra_speed: AtomicBool::new(false),
             threads: AtomicUsize::new(threads),
+            debug_stats: AtomicBool::new(false),
         }
     }
 
-    /// Текущие значения одним кортежем (удобно для UI и логов).
+    /// Текущие значения кортежем (удобно для UI и логов).
     pub fn snapshot(&self) -> (bool, usize) {
         (
             self.ultra_speed.load(Ordering::Relaxed),
             self.threads.load(Ordering::Relaxed),
         )
+    }
+
+    /// 4.6c-fix3 — детальная статистика включена? (вкладка «Отладка»).
+    pub fn debug_stats_on(&self) -> bool {
+        self.debug_stats.load(Ordering::Relaxed)
     }
 }
 
@@ -78,6 +89,9 @@ fn settings_path() -> PathBuf {
 struct SettingsFile {
     ultra_speed: bool,
     threads: usize,
+    /// 4.6c-fix3 — отсутствует в старых файлах → serde default (false).
+    #[serde(default)]
+    debug_stats: bool,
 }
 
 /// Загрузить настройки с диска (или значения по умолчанию, если файла
@@ -91,10 +105,12 @@ pub fn load() -> GlobalSettings {
             Ok(f) => {
                 settings.ultra_speed.store(f.ultra_speed, Ordering::Relaxed);
                 settings.threads.store(f.threads.max(1), Ordering::Relaxed);
+                settings.debug_stats.store(f.debug_stats, Ordering::Relaxed);
                 log::info!(
-                    "settings: загружены (ultra_speed={}, threads={})",
+                    "settings: загружены (ultra_speed={}, threads={}, debug_stats={})",
                     f.ultra_speed,
-                    f.threads.max(1)
+                    f.threads.max(1),
+                    f.debug_stats
                 );
             }
             Err(e) => {
@@ -115,6 +131,7 @@ pub fn store(settings: &GlobalSettings) {
     let file = SettingsFile {
         ultra_speed,
         threads,
+        debug_stats: settings.debug_stats_on(),
     };
     let path = settings_path();
     // Создаём каталог, если его ещё нет (первый запуск).
@@ -149,6 +166,8 @@ mod tests {
         let s = GlobalSettings::new();
         // Ультра-скорость ВЫКЛ по умолчанию — бережём батарею.
         assert!(!s.ultra_speed.load(Ordering::Relaxed));
+        // Детальная статистика ВЫКЛ по умолчанию — тихий лог у всех.
+        assert!(!s.debug_stats_on());
         let (_, threads) = s.snapshot();
         assert!(threads >= 1);
     }

@@ -1320,7 +1320,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 if ultra_on { "ultra" } else { "1 поток" }
             );
             if ultra_on {
-                resize_ultra(img, ultra_threads)?
+                resize_ultra(img, ultra_threads, settings)?
             } else {
                 img.resize(
                     VIEWER_MAX_SIZE,
@@ -1356,6 +1356,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     fn resize_ultra(
         img: image::DynamicImage,
         threads: usize,
+        settings: &crate::settings::GlobalSettings,
     ) -> Result<image::DynamicImage, String> {
         let threads = threads.max(1);
         // 1) image → сырой RGBA8 (fast_image_resize работает с буферами).
@@ -1370,6 +1371,19 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         log::debug!(
             "[CONC] ultra: пул {threads} потоков, картинка {src_w}x{src_h} → {dst_w}x{dst_h}"
         );
+        // 4.6c-fix3 — детальная статистика ТОЛЬКО под галкой «Отладка»
+        // (ВЫКЛ по умолчанию у всех): сколько полос rayon реально возьмёт
+        // = сколько потоков максимум будет молотить эту картинку. Формула
+        // та же, что внутри fast_image_resize: площадь/1024, но не больше
+        // высоты и не больше пула. Для мелких картинок полос меньше —
+        // часть ядер простаивает (это честно видно в логе).
+        if settings.debug_stats_on() {
+            let area_parts = (src_w as u64 * src_h as u64) / 1024;
+            let strips = area_parts.min(src_h as u64).min(threads as u64).max(1);
+            log::debug!(
+                "[CONC] ultra: работало полос {strips} (из пула {threads}) — столько потоков молотило картинку"
+            );
+        }
         // 3) Собираем исходник/приёмник крейта из сырых буферов.
         let src = fast_image_resize::images::Image::from_vec_u8(
             src_w,
@@ -1968,8 +1982,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
         });
     }
-    // 4.6c — инициализация панели «Производительность» из глобальных
-    // настроек (галка + бегунок ядер + максимум бегунка = все ядра).
+    // 4.6c — инициализация панели настроек из глобальных настроек:
+    // галка + бегунок ядер + максимум бегунка; 4.6c-fix3 — вкладка
+    // по умолчанию (0 = «Листание») и галка «Детальная статистика».
     {
         let ui_weak = ui.as_weak();
         let (on, threads) = global_settings.snapshot();
@@ -1980,6 +1995,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             w.set_ultra_speed(on);
             w.set_ultra_threads(threads as i32);
             w.set_ultra_threads_max(max_threads);
+            w.set_settings_tab(0);
+            w.set_debug_stats(global_settings.debug_stats_on());
         }
     }
     // 4.6c — галка «Ультра-скорость»: пишем в атомики (воркер применит к
@@ -2011,6 +2028,32 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             crate::settings::store(&settings);
             if let Some(w) = ui_weak.upgrade() {
                 w.set_ultra_threads(n as i32);
+            }
+        });
+    }
+    // 4.6c-fix3 — переключить вкладку настроек (0/1/2): чисто UI-дело,
+    // клампим в диапазон и пишем property (хранилище не трогаем —
+    // выбранная вкладка не должна переживать перезапуск, KISS).
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_set_settings_tab(move |tab| {
+            let tab = tab.clamp(0, 2);
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_settings_tab(tab);
+            }
+        });
+    }
+    // 4.6c-fix3 — галка «Детальная статистика в логах» (вкладка «Отладка»):
+    // пишем в атомик (воркер увидит на следующем декоде) и сохраняем.
+    {
+        let ui_weak = ui.as_weak();
+        let settings = global_settings.clone();
+        ui.on_set_debug_stats(move |on| {
+            log::info!("settings: детальная статистика → {on}");
+            settings.debug_stats.store(on, Ordering::Relaxed);
+            crate::settings::store(&settings);
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_debug_stats(on);
             }
         });
     }

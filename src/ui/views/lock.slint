@@ -24,6 +24,30 @@ component KeyButton inherits Rectangle {
 // 4.4a — строка-переключатель режима листания (панель ⚙ Настройки проекта).
 // value — строка режима ("edge" | "cycle" | "random"); selected — текущий
 // выбранный режим (для подсветки); selected() — сигнал «выбрали меня».
+// 4.6c-fix3 — TabButton (вкладки панели настроек) вынесен сюда же: один
+// файл = все переиспользуемые компоненты экранов (KISS, DRY).
+component TabButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    callback clicked();
+    height: 34px;
+    border-radius: 8px;
+    background: root.active ? Theme.accent : #ffffff0d;
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        Text {
+            text: root.label;
+            color: root.active ? white : Theme.text-secondary;
+            font-size: 12px;
+            font-weight: root.active ? 700 : 400;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    TouchArea { clicked => { root.clicked(); } }
+}
+
 component NavOption inherits Rectangle {
     in property <string> value;
     in property <string> label;
@@ -226,6 +250,11 @@ export component GalleryScreen inherits Window {
     in-out property <bool> ultra-speed: false;
     in-out property <int> ultra-threads: 1;
     in-out property <int> ultra-threads-max: 1;
+    // 4.6c-fix3 — вкладки панели настроек: 0=Листание, 1=Производительность,
+    // 2=Отладка. И «Детальная статистика в логах» (вкладка «Отладка»,
+    // ВЫКЛ по умолчанию у всех — обычному пользователю не нужна).
+    in-out property <int> settings-tab: 0;
+    in-out property <bool> debug-stats: false;
     // Диалог переименования проекта (Slint, без нативных диалогов).
     in-out property <bool> rename-visible: false;
     in-out property <string> rename-text: "";
@@ -243,6 +272,9 @@ export component GalleryScreen inherits Window {
     // 4.6c — «Ультра-скорость»: галка и число ядер (глобальные настройки).
     callback set-ultra-speed(bool);  // включить/выключить ускорение
     callback set-ultra-threads(int); // сколько ядер использовать
+    // 4.6c-fix3 — вкладки и отладочная статистика.
+    callback set-settings-tab(int);  // переключить вкладку настроек
+    callback set-debug-stats(bool);  // детальная статистика в логах
 
     // --- Viewer (просмотр фото в полном размере) ---
     in-out property <bool> show-viewer: false;
@@ -998,12 +1030,30 @@ export component GalleryScreen inherits Window {
                     font-size: 13px;
                 }
                 Rectangle { height: 1px; background: #ffffff22; }
-                // --- Зона 2: прокручиваемые настройки ---
+                // --- 4.6c-fix3: ряд вкладок-табов (красиво и стильно) ---
+                HorizontalLayout {
+                    spacing: 8px;
+                    TabButton {
+                        label: "Листание";
+                        active: root.settings-tab == 0;
+                        clicked => { root.set-settings-tab(0); }
+                    }
+                    TabButton {
+                        label: "⚡ Производительность";
+                        active: root.settings-tab == 1;
+                        clicked => { root.set-settings-tab(1); }
+                    }
+                    TabButton {
+                        label: "🔧 Отладка";
+                        active: root.settings-tab == 2;
+                        clicked => { root.set-settings-tab(2); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                // --- Зона 2: прокручиваемые настройки (контент по вкладке) ---
                 // 4.6c-fix2: горизонтальная прокрутка ОТКЛЮЧЕНА ПОЛИТИКОЙ
                 // (ScrollBarPolicy.always-off), а контенту жёстко задана
-                // ширина видимой области (width: self.width у внутреннего
-                // layout невозможно — поэтому content-width = ширина окна):
-                // тексты переносятся по словам ВНИЗ, горизонталь невозможна.
+                // ширина видимой области: тексты переносятся по словам ВНИЗ.
                 sv := ScrollView {
                     vertical-stretch: 1;
                     horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
@@ -1011,8 +1061,8 @@ export component GalleryScreen inherits Window {
                         width: sv.visible-width;
                         padding: 0px;
                         spacing: 12px;
-                        // --- Карточка «Листание» (per-project) ---
-                        VerticalLayout {
+                        // === Вкладка 0: «Листание» (per-project) ===
+                        if root.settings-tab == 0 : VerticalLayout {
                             spacing: 8px;
                             Text {
                                 text: "Листание в просмотрщике";
@@ -1048,9 +1098,8 @@ export component GalleryScreen inherits Window {
                                 selected-clicked() => { root.set-nav-mode("random"); }
                             }
                         }
-                        Rectangle { height: 1px; background: #ffffff22; }
-                        // --- Карточка «Производительность» (глобальные, 4.6c) ---
-                        VerticalLayout {
+                        // === Вкладка 1: «Производительность» (глобальные) ===
+                        if root.settings-tab == 1 : VerticalLayout {
                             spacing: 8px;
                             Text {
                                 text: "⚡ Производительность";
@@ -1132,6 +1181,57 @@ export component GalleryScreen inherits Window {
                                     text: "больше ядер — быстрее декод, но выше нагрузка на процессор";
                                     color: Theme.text-secondary;
                                     font-size: 11px;
+                                }
+                            }
+                        }
+                        // === Вкладка 2: «Отладка» (4.6c-fix3) ===
+                        if root.settings-tab == 2 : VerticalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "🔧 Отладка";
+                                color: Theme.text-primary;
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
+                            Text {
+                                text: "Инструменты для диагностики. Обычному пользователю не нужны — включайте только по просьбе разработчика.";
+                                color: Theme.text-secondary;
+                                font-size: 11px;
+                                wrap: TextWrap.word-wrap;
+                            }
+                            // Галка «Детальная статистика в логах».
+                            Rectangle {
+                                height: 48px;
+                                border-radius: 8px;
+                                background: root.debug-stats ? #2a4d6f : #ffffff0d;
+                                border-width: root.debug-stats ? 1px : 0px;
+                                border-color: Theme.accent;
+                                TouchArea { clicked => { root.set-debug-stats(!root.debug-stats); } }
+                                HorizontalLayout {
+                                    padding: 10px;
+                                    spacing: 10px;
+                                    Text {
+                                        text: root.debug-stats ? "◉" : "○";
+                                        color: Theme.accent;
+                                        font-size: 16px;
+                                        vertical-alignment: center;
+                                    }
+                                    VerticalLayout {
+                                        padding: 0px;
+                                        Text {
+                                            text: "Детальная статистика в логах";
+                                            color: Theme.text-primary;
+                                            font-size: 13px;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            text: "подробные замеры декода в ./logs (число задействованных полос и пр.)";
+                                            color: Theme.text-secondary;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
                                 }
                             }
                         }
