@@ -1364,6 +1364,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         // 2) Целевой размер — как у image::resize: вписать в квадрат
         //    VIEWER_MAX_SIZE с сохранением пропорций.
         let (dst_w, dst_h) = fit_into_max(src_w, src_h, VIEWER_MAX_SIZE);
+        // 4.6c-fix2 [CONC] — видимость: пул создан именно на N потоков
+        // (настройка), картинка такого-то размера. Реальную занятость ядер
+        // показывает ОС (Диспетчер задач → ЦП), приложение её не знает.
+        log::debug!(
+            "[CONC] ultra: пул {threads} потоков, картинка {src_w}x{src_h} → {dst_w}x{dst_h}"
+        );
         // 3) Собираем исходник/приёмник крейта из сырых буферов.
         let src = fast_image_resize::images::Image::from_vec_u8(
             src_w,

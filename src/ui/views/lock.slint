@@ -961,17 +961,21 @@ export component GalleryScreen inherits Window {
         }
     }
 
-    // --- Панель настроек (4.4a + 4.6c-fix) ---
+    // --- Панель настроек (4.4a + 4.6c-fix2) ---
     // Три зоны (заказчик: «настройки улетали под кат — не нажать Готово»):
     // 1) шапка с заголовком — закреплена сверху;
     // 2) ScrollView со ВСЕМИ блоками настроек — прокручивается, сколько
     //    бы блоков ни добавили в будущем (кнопка никогда не уедет);
     // 3) подвал с «Готово» — закреплён снизу, ВСЕГДА видна и кликабельна.
+    // 4.6c-fix2 — АДАПТИВНЫЙ размер (по требованию заказчика: большое,
+    // но влезает на любой экран): ширина/высота — min(желаемое, 90% окна).
+    // Горизонтальная прокрутка ЗАПРЕЩЕНА (зло): контенту жёстко задана
+    // ширина видимой области, тексты переносятся по словам ВНИЗ.
     if root.settings-visible : Rectangle {
         background: #000000b4;
         Rectangle {
-            width: 460px;
-            height: 600px;
+            width: Math.min(620px, root.width * 0.9);
+            height: Math.min(660px, root.height * 0.9);
             border-radius: 12px;
             background: Theme.panel;
             border-width: 1px;
@@ -995,9 +999,16 @@ export component GalleryScreen inherits Window {
                 }
                 Rectangle { height: 1px; background: #ffffff22; }
                 // --- Зона 2: прокручиваемые настройки ---
-                ScrollView {
+                // 4.6c-fix2: горизонтальная прокрутка ОТКЛЮЧЕНА ПОЛИТИКОЙ
+                // (ScrollBarPolicy.always-off), а контенту жёстко задана
+                // ширина видимой области (width: self.width у внутреннего
+                // layout невозможно — поэтому content-width = ширина окна):
+                // тексты переносятся по словам ВНИЗ, горизонталь невозможна.
+                sv := ScrollView {
                     vertical-stretch: 1;
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
                     VerticalLayout {
+                        width: sv.visible-width;
                         padding: 0px;
                         spacing: 12px;
                         // --- Карточка «Листание» (per-project) ---
