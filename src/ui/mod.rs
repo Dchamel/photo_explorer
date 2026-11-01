@@ -8,8 +8,10 @@
 slint::include_modules!();
 
 mod anim_cache;
+mod anim_playback;
 
 use anim_cache::{AnimFrame, AnimFramesCache, ANIM_CACHE_MAX_BYTES};
+use anim_playback::{effective_delay_ms, AnimPlayback};
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -1036,6 +1038,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         /// повторное открытие GIF — мгновенно, без повторного декода
         /// сотен кадров. Arc<Mutex> — доступ из потока-декодера (Send).
         anim_cache: Arc<Mutex<AnimFramesCache>>,
+        /// 4.7d — состояние проигрывания (мост UI ⇄ аниматор): пауза,
+        /// скорость, перемотка. Атомики — без блокировок, Send.
+        playback: Arc<AnimPlayback>,
     }
 
     impl ViewerCtx {
@@ -1114,6 +1119,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     let settings = self.settings.clone();
                     let anim_playing = self.anim_playing.clone();
                     let anim_cache = self.anim_cache.clone();
+                    let playback = self.playback.clone();
                     let idx = index;
                     std::thread::spawn(move || {
                         // Поколение уже ушло — не декодируем зря.
@@ -1152,7 +1158,16 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                 }
                             }
                         };
-                        spawn_animator(frames, idx, my_gen, gen, ui_weak, settings, anim_playing);
+                        spawn_animator(
+                            frames,
+                            idx,
+                            my_gen,
+                            gen,
+                            ui_weak,
+                            settings,
+                            anim_playing,
+                            playback,
+                        );
                     });
                 }
             }
@@ -1384,6 +1399,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         anim_playing: Arc::new(Mutex::new(None)), // 4.7a-fix2 — аниматор владеет слоем
         settings: global_settings.clone(),        // 4.7a-fix2 — анимация из перехода
         anim_cache: Arc::new(Mutex::new(AnimFramesCache::new(ANIM_CACHE_MAX_BYTES))), // 4.7c
+        playback: Arc::new(AnimPlayback::new()),  // 4.7d — панель управления
     });
 
     /// Подпись режима ресайза для логов [CONC]: «1 поток» или «ultra N ядер».
@@ -1556,15 +1572,20 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         Ok(frames)
     }
 
-    /// 4.7a — поток-аниматор: проигрывает кадры в UI-поток. Живёт в
+    /// 4.7a/4.7d — поток-аниматор: проигрывает кадры в UI-поток. Живёт в
     /// ОТДЕЛЬНОМ потоке (воркер не блокируется), между кадрами спит
     /// delay_ms. Каждый кадр отдаётся через invoke_from_event_loop со
     /// сверкой ПОКОЛЕНИЯ (как у воркера): пользователь ушёл на другое
     /// фото → поколение сменилось → аниматор молча завершается, чужие
     /// кадры на экран не попадут (инвариант «кадр = viewer-index»
     /// сохранён — кадр анимации пишется только когда поколение живо).
-    /// «Зациклить» читается из настроек на каждом ПРОХОДЕ: смена галки
-    /// применяется к текущей анимации сразу.
+    /// 4.7d — аниматор УПРАВЛЯЕМЫЙ: на каждом шаге читает AnimPlayback
+    /// (пауза/скорость/перемотка из панели) и пишет текущий кадр (бегунок
+    /// перемотки двигается за анимацией). «Зациклить» — иконка-тумблер
+    /// на панели (4.7d), читается на каждом проходе.
+    // 8 аргументов — всё, что нужно потоку; структура лишь добавила бы
+    // шум (осознанное исключение, KISS).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_animator(
         frames: Vec<AnimFrame>,
         index: i32,
@@ -1573,94 +1594,139 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         ui_weak: slint::Weak<GalleryScreen>,
         settings: Arc<crate::settings::GlobalSettings>,
         anim_playing: Arc<Mutex<Option<(i32, u64)>>>,
+        playback: Arc<AnimPlayback>,
     ) {
         std::thread::spawn(move || {
             log::debug!(
                 "[ANIM] аниматор запущен: idx={index} gen={my_gen} кадров={}",
                 frames.len()
             );
+            let total = frames.len();
             // 4.7a-fix2 — заявляем владение слоем (в UI-потоке): пока
             // anim_playing == (index, my_gen), статичные писатели не
             // трогают viewer-image. Чистим при любом выходе.
+            // 4.7d — заодно включаем панель анимации (anim-active),
+            // максимум бегунка и сброс позиции/паузы (скорость живёт).
             {
                 let ap = anim_playing.clone();
+                let ui_weak_start = ui_weak.clone();
+                let total_i32 = total as i32;
                 let _ = slint::invoke_from_event_loop(move || {
                     *lock_or_recover(&ap) = Some((index, my_gen));
+                    if let Some(w) = ui_weak_start.upgrade() {
+                        w.set_anim_active(true);
+                        w.set_anim_total(total_i32);
+                        w.set_anim_frame(0);
+                        w.set_anim_paused(false);
+                    }
                 });
             }
-            let total = frames.len();
-            let mut frame_no: usize = 0;
+            playback.set_total(total);
+            playback.set_frame(0);
+            playback.set_paused(false);
+            let mut cur: usize = 0;
             // 4.7a-fix4 — единая точка выхода: после break 'anim причина
-            // логируется и слой освобождается ОДИН раз (DRY), а не в
-            // трёх местах, как было.
+            // логируется и слой освобождается ОДИН раз (DRY).
             let mut stopped = false;
             'anim: loop {
-                for f in &frames {
-                    // Поколение сменилось — пользователь ушёл, стоп.
-                    // 4.7a-fix3 — сверка ДО показа кадра: первый кадр
-                    // проверяется мгновенно после старта аниматора
-                    // (окно гонки — микросекунды), каждый следующий —
-                    // после своей паузы.
-                    if generation.load(Ordering::SeqCst) != my_gen {
-                        stopped = true;
-                        break 'anim;
+                // 4.7d — перемотка: забрать запрос (один раз, атомарно),
+                // прыгнуть на кадр. Кламп по числу кадров.
+                if let Some(seek_to) = playback.take_seek() {
+                    cur = seek_to.clamp(0, total as i32 - 1) as usize;
+                }
+                // Поколение сменилось — пользователь ушёл, стоп.
+                // 4.7a-fix3 — сверка ДО показа кадра: первый кадр
+                // проверяется мгновенно после старта аниматора.
+                if generation.load(Ordering::SeqCst) != my_gen {
+                    stopped = true;
+                    break 'anim;
+                }
+                let f = &frames[cur];
+                let gen = generation.clone();
+                let ui_weak = ui_weak.clone();
+                let (data, w, h) = (f.data.clone(), f.w, f.h);
+                log::debug!(
+                    "[ANIM] кадр {}/{} idx={index} gen={my_gen} (пауза {} мс)",
+                    cur + 1,
+                    total,
+                    f.delay_ms
+                );
+                playback.set_frame(cur);
+                let _ = slint::invoke_from_event_loop(move || {
+                    // Двойная сверка (как у воркера): поколение + индекс.
+                    let cur_gen = gen.load(Ordering::SeqCst);
+                    if cur_gen != my_gen {
+                        log::debug!("[ANIM] кадр отсечён в UI (поколение {cur_gen} ≠ {my_gen})");
+                        return;
                     }
-                    let gen = generation.clone();
-                    let ui_weak = ui_weak.clone();
-                    let (data, w, h) = (f.data.clone(), f.w, f.h);
-                    // 4.7a-fix2/fix4 — диагностический лог КАЖДОГО кадра
-                    // с его паузой: сразу видно, сколько мс ждём.
-                    log::debug!(
-                        "[ANIM] кадр {}/{total} idx={index} gen={my_gen} (пауза {} мс)",
-                        frame_no + 1,
-                        f.delay_ms
-                    );
-                    frame_no = frame_no.wrapping_add(1);
-                    let _ = slint::invoke_from_event_loop(move || {
-                        // Двойная сверка (как у воркера): поколение + индекс.
-                        let cur = gen.load(Ordering::SeqCst);
-                        if cur != my_gen {
-                            log::debug!("[ANIM] кадр отсечён в UI (поколение {cur} ≠ {my_gen})");
-                            return;
+                    if let Some(w_ui) = ui_weak.upgrade() {
+                        if w_ui.get_viewer_index() != index {
+                            log::debug!("[ANIM] кадр отсечён в UI (индекс ушёл)");
+                            return; // индекс ушёл — не показываем
                         }
-                        if let Some(w_ui) = ui_weak.upgrade() {
-                            if w_ui.get_viewer_index() != index {
-                                log::debug!("[ANIM] кадр отсечён в UI (индекс ушёл)");
-                                return; // индекс ушёл — не показываем
-                            }
-                            let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
-                            let pixels = buf.make_mut_slice();
-                            for (dst, chunk) in pixels.iter_mut().zip(data.as_chunks::<4>().0) {
-                                dst.r = chunk[0];
-                                dst.g = chunk[1];
-                                dst.b = chunk[2];
-                                dst.a = chunk[3];
-                            }
-                            w_ui.set_viewer_img_w(w as f32);
-                            w_ui.set_viewer_img_h(h as f32);
-                            w_ui.set_viewer_image(slint::Image::from_rgba8(buf));
-                            log::debug!("[ANIM] кадр НА ЭКРАНЕ idx={index}");
+                        let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
+                        let pixels = buf.make_mut_slice();
+                        for (dst, chunk) in pixels.iter_mut().zip(data.as_chunks::<4>().0) {
+                            dst.r = chunk[0];
+                            dst.g = chunk[1];
+                            dst.b = chunk[2];
+                            dst.a = chunk[3];
                         }
-                    });
-                    // 4.7a-fix3/fix4 — пауза ПОСЛЕ показа, квантами
-                    // ≤30 мс со сверкой поколения: старый аниматор умирает
-                    // за ≤30 мс после нового перехода, зомби не копятся и
-                    // не топят очередь событий UI лишними invoke.
-                    let mut left = f.delay_ms;
-                    while left > 0 {
-                        let quantum = left.min(ANIM_SLEEP_QUANTUM_MS);
-                        std::thread::sleep(std::time::Duration::from_millis(quantum));
+                        w_ui.set_viewer_img_w(w as f32);
+                        w_ui.set_viewer_img_h(h as f32);
+                        w_ui.set_viewer_image(slint::Image::from_rgba8(buf));
+                        // 4.7d — двигаем бегунок перемотки за анимацией.
+                        w_ui.set_anim_frame(cur as i32);
+                        log::debug!("[ANIM] кадр НА ЭКРАНЕ idx={index}");
+                    }
+                });
+                // 4.7a-fix3/fix4 — пауза ПОСЛЕ показа, квантами ≤30 мс со
+                // сверкой поколения: старый аниматор умирает за ≤30 мс.
+                // 4.7d — пауза делится на скорость (×2 = вдвое быстрее),
+                // а is_paused крутит цикл вхолостую (кадр висит).
+                let mut left = effective_delay_ms(f.delay_ms, playback.speed_tenths());
+                while left > 0 {
+                    if playback.is_paused() {
+                        // Пауза: спим тиками 30 мс, кадр не меняется.
+                        std::thread::sleep(std::time::Duration::from_millis(ANIM_SLEEP_QUANTUM_MS));
+                        // Пауза не отменяет сверки поколения и перемотки:
+                        // ушёл с фото / потянул бегунок — реагируем.
                         if generation.load(Ordering::SeqCst) != my_gen {
                             stopped = true;
                             break 'anim;
                         }
-                        left -= quantum;
+                        if let Some(seek_to) = playback.take_seek() {
+                            cur = seek_to.clamp(0, total as i32 - 1) as usize;
+                            break; // прыжок — сразу показать новый кадр
+                        }
+                        continue;
                     }
+                    let quantum = left.min(ANIM_SLEEP_QUANTUM_MS);
+                    std::thread::sleep(std::time::Duration::from_millis(quantum));
+                    if generation.load(Ordering::SeqCst) != my_gen {
+                        stopped = true;
+                        break 'anim;
+                    }
+                    // Перемотка во время паузы кадра — прерываем ожидание.
+                    if let Some(seek_to) = playback.take_seek() {
+                        cur = seek_to.clamp(0, total as i32 - 1) as usize;
+                        break;
+                    }
+                    left -= quantum;
                 }
-                // Проход закончен: галка «зациклить» читается ЗДЕСЬ —
-                // смена настройки применяется к текущей анимации.
-                if !settings.loop_animation_on() {
-                    break 'anim; // один проход — стоп на последнем кадре
+                // Прыжок перемотки прервал паузу кадра — без инкремента.
+                if playback.take_seek().is_some() {
+                    continue;
+                }
+                // 4.7d — конец прохода: последний кадр → зацикливание
+                // (иконка-тумблер панели) или стоп на последнем кадре.
+                if cur + 1 >= total {
+                    if !settings.loop_animation_on() {
+                        break 'anim; // один проход — стоп на последнем кадре
+                    }
+                    cur = 0; // по кругу
+                } else {
+                    cur += 1;
                 }
             }
             // Единая точка выхода: лог причины + освобождение слоя.
@@ -1672,6 +1738,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             let ap = anim_playing.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 *lock_or_recover(&ap) = None;
+                // 4.7d — гасим панель анимации (ушли с фото / конец).
+                if let Some(w) = ui_weak.upgrade() {
+                    w.set_anim_active(false);
+                    w.set_anim_paused(false);
+                }
             });
         });
     }
@@ -2391,18 +2462,57 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
         });
     }
-    // 4.7a — галка «Зациклить анимацию» (вкладка «Листание»): пишем в
-    // атомик (поток-аниматор читает на каждом проходе — смена цикла
-    // применяется к текущей анимации сразу) и сохраняем на диск.
+    // 4.7a/4.7d — зацикливание: тумблер 🔁 на панели анимации (переехал
+    // из настроек). Пишем в атомик (аниматор читает на каждом проходе —
+    // смена применяется к текущей анимации сразу) и сохраняем на диск.
     {
         let ui_weak = ui.as_weak();
         let settings = global_settings.clone();
         ui.on_set_loop_animation(move |on| {
-            log::info!("settings: зациклить анимацию → {on}");
+            log::info!("anim: зацикливание → {on}");
             settings.loop_animation.store(on, Ordering::Relaxed);
             crate::settings::store(&settings);
             if let Some(w) = ui_weak.upgrade() {
                 w.set_loop_animation(on);
+            }
+        });
+    }
+    // 4.7d — бегунок перемотки: кадр 0..total-1 → запрос аниматору.
+    // Сверка с текущим кадром подавляет петлю «аниматор двигает слайдер
+    // → changed → seek того же кадра» (безопасно, но лишний invoke).
+    {
+        let ctx = viewer_ctx.clone();
+        ui.on_anim_seek(move |frame| {
+            let frame = frame.max(0);
+            if ctx.playback.current_frame() as i32 == frame {
+                return; // слайдер уже на этом кадре (его двигает аниматор)
+            }
+            log::debug!("anim: перемотка → кадр {frame}");
+            ctx.playback.request_seek(frame);
+        });
+    }
+    // 4.7d — кнопка ⏸/▶: переключаем паузу и её отражение в UI.
+    {
+        let ctx = viewer_ctx.clone();
+        ui.on_anim_toggle_pause(move || {
+            let paused = !ctx.playback.is_paused();
+            log::info!("anim: пауза → {paused}");
+            ctx.playback.set_paused(paused);
+            if let Some(w) = ctx.ui_weak.upgrade() {
+                w.set_anim_paused(paused);
+            }
+        });
+    }
+    // 4.7d — бегунок скорости: десятые множителя 1..20 (×0.1..×2.0).
+    // Аниматор читает на каждом кадре — применяется мгновенно.
+    {
+        let ctx = viewer_ctx.clone();
+        ui.on_anim_set_speed(move |tenths| {
+            let tenths = tenths.clamp(1, 20);
+            log::info!("anim: скорость → ×{}.{}", tenths / 10, tenths % 10);
+            ctx.playback.set_speed_tenths(tenths as u32);
+            if let Some(w) = ctx.ui_weak.upgrade() {
+                w.set_anim_speed(tenths);
             }
         });
     }

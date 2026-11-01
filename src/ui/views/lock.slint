@@ -259,6 +259,17 @@ export component GalleryScreen inherits Window {
     // (по умолчанию, как в браузерах); ВЫКЛ — один проход, стоп на
     // последнем кадре. Глобальная настройка просмотра.
     in-out property <bool> loop-animation: true;
+    // --- 4.7d — панель управления анимацией внизу вьюера ---
+    // Анимация играет (панель видна при controls-visible).
+    in-out property <bool> anim-active: false;
+    // Текущий кадр (0-based) — бегунок перемотки двигается за анимацией.
+    in-out property <int> anim-frame: 0;
+    // Всего кадров (максимум бегунка перемотки).
+    in-out property <int> anim-total: 0;
+    // Пауза (⏸/▶): true = кадр висит.
+    in-out property <bool> anim-paused: false;
+    // Скорость в ДЕСЯТЫХ множителя: 10 = ×1.0, 1 = ×0.1, 20 = ×2.0.
+    in-out property <int> anim-speed: 10;
     // Диалог переименования проекта (Slint, без нативных диалогов).
     in-out property <bool> rename-visible: false;
     in-out property <string> rename-text: "";
@@ -281,6 +292,13 @@ export component GalleryScreen inherits Window {
     callback set-debug-stats(bool);  // детальная статистика в логах
     // 4.7a — зациклить анимацию GIF/WEBP/APNG.
     callback set-loop-animation(bool);
+    // --- 4.7d — управление анимацией из панели внизу вьюера ---
+    // Бегунок перемотки: кадр 0..anim-total-1 (прыжок аниматора).
+    callback anim-seek(int);
+    // Кнопка ⏸/▶.
+    callback anim-toggle-pause();
+    // Бегунок скорости: десятые множителя 1..20 (×0.1..×2.0).
+    callback anim-set-speed(int);
     // 4.6c-fix4 — доступ к логам из вкладки «Отладка» (Windows).
     callback open-logs-folder();     // открыть папку с логами (проводник)
     callback open-log-file();        // открыть лог в программе по умолчанию
@@ -732,6 +750,109 @@ export component GalleryScreen inherits Window {
                     vertical-alignment: center;
                 }
             }
+
+            // 4.7d — панель управления анимацией внизу: ⏸/▶, перемотка
+            // по кадрам, 🔁-тумблер зацикливания, скорость ×0.1..×2.0.
+            // Видна только когда играет анимация И управление не скрыто
+            // (автоскрытие по движению мыши — общее с ←/→/×).
+            if root.anim-active && root.controls-visible : Rectangle {
+                height: 64px;
+                width: Math.min(760px, parent.width - 32px);
+                x: (parent.width - self.width) / 2;
+                y: parent.height - self.height - 20px;
+                background: #000000cc;
+                border-radius: 14px;
+                border-width: 1px;
+                border-color: #ffffff22;
+
+                HorizontalLayout {
+                    padding: 10px;
+                    spacing: 12px;
+                    alignment: center;
+
+                    // ⏸/▶ — пауза/плей.
+                    Rectangle {
+                        width: 44px;
+                        height: 44px;
+                        border-radius: 22px;
+                        background: #ffffff14;
+                        TouchArea { clicked => { root.anim-toggle-pause(); } }
+                        Text {
+                            text: root.anim-paused ? "▶" : "⏸";
+                            color: white;
+                            font-size: 20px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Перемотка по кадрам: кадр N из M.
+                    VerticalLayout {
+                        alignment: center;
+                        padding: 0px;
+                        spacing: 2px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: center;
+                            Text {
+                                text: "Кадр " + (root.anim-frame + 1) + " / " + root.anim-total;
+                                color: #ffffffcc;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                                horizontal-alignment: center;
+                            }
+                        }
+                        // Бегунок перемотки: 0..total-1 (кадры).
+                        // changed => seek: аниматор прыгает на кадр.
+                        Slider {
+                            width: 240px;
+                            minimum: 0;
+                            maximum: Math.max(root.anim-total - 1, 1);
+                            value: root.anim-frame;
+                            changed(f) => { root.anim-seek(Math.round(f)); }
+                        }
+                    }
+
+                    // 🔁 — тумблер зацикливания (подсветка = ВКЛ).
+                    Rectangle {
+                        width: 44px;
+                        height: 44px;
+                        border-radius: 22px;
+                        background: root.loop-animation ? #2a4d6f : #ffffff14;
+                        border-width: root.loop-animation ? 1px : 0px;
+                        border-color: Theme.accent;
+                        TouchArea { clicked => { root.set-loop-animation(!root.loop-animation); } }
+                        Text {
+                            text: "🔁";
+                            font-size: 20px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Скорость ×0.1..×2.0 (шаг 0.1): десятые множителя.
+                    VerticalLayout {
+                        alignment: center;
+                        padding: 0px;
+                        spacing: 2px;
+                        Text {
+                            text: "Скорость ×" + (root.anim-speed / 10) + "." + Math.mod(root.anim-speed, 10);
+                            color: #ffffffcc;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                        }
+                        // Бегунок скорости: 1..20 десятых (×0.1..×2.0).
+                        Slider {
+                            width: 150px;
+                            minimum: 1;
+                            maximum: 20;
+                            value: root.anim-speed;
+                            changed(f) => { root.anim-set-speed(Math.round(f)); }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1107,42 +1228,9 @@ export component GalleryScreen inherits Window {
                                 selected: root.nav-mode;
                                 selected-clicked() => { root.set-nav-mode("random"); }
                             }
-                            // 4.7a — «Зациклить анимацию» (глобальная):
-                            // GIF/WEBP/APNG по кругу или один проход.
-                            Rectangle {
-                                height: 48px;
-                                border-radius: 8px;
-                                background: root.loop-animation ? #2a4d6f : #ffffff0d;
-                                border-width: root.loop-animation ? 1px : 0px;
-                                border-color: Theme.accent;
-                                TouchArea { clicked => { root.set-loop-animation(!root.loop-animation); } }
-                                HorizontalLayout {
-                                    padding: 10px;
-                                    spacing: 10px;
-                                    Text {
-                                        text: root.loop-animation ? "◉" : "○";
-                                        color: Theme.accent;
-                                        font-size: 16px;
-                                        vertical-alignment: center;
-                                    }
-                                    VerticalLayout {
-                                        padding: 0px;
-                                        Text {
-                                            text: "Зациклить анимацию";
-                                            color: Theme.text-primary;
-                                            font-size: 13px;
-                                            vertical-alignment: center;
-                                        }
-                                        Text {
-                                            text: "анимированные GIF/WEBP играют по кругу; выключено — один проход и стоп";
-                                            color: Theme.text-secondary;
-                                            font-size: 11px;
-                                            vertical-alignment: center;
-                                        }
-                                    }
-                                    Rectangle { horizontal-stretch: 1; }
-                                }
-                            }
+                            // 4.7d — галка «Зациклить анимацию» ПЕРЕЕХАЛА из
+                            // настроек на панель управления анимацией внизу
+                            // вьюера (иконка-тумблер 🔁). Здесь её больше нет.
                         }
                         // === Вкладка 1: «Производительность» (глобальные) ===
                         if root.settings-tab == 1 : VerticalLayout {
