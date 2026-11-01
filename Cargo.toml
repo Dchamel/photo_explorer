@@ -49,6 +49,8 @@ windows = { version = "0.61", features = [
 
 [build-dependencies]
 slint-build = "1.8"
+# 4.6-polish — вшивание иконки в .exe (ресурсы Windows)
+winresource = "0.1"
 
 [profile.release]
 opt-level = 3
