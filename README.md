@@ -12,7 +12,7 @@
 [![UI](https://img.shields.io/badge/UI-Slint-brightgreen)]()
 [![Platform](https://img.shields.io/badge/Platform-Windows%2011-blue)]()
 [![Architecture](https://img.shields.io/badge/Architecture-Hexagonal-purple)]()
-[![Release](https://img.shields.io/badge/Release-v0.4.0-green)](https://github.com/Dchamel/photo_explorer/releases)
+[![Release](https://img.shields.io/badge/Release-v0.5.0-green)](https://github.com/Dchamel/photo_explorer/releases)
 
 </div>
 
@@ -32,8 +32,8 @@
 
 ## ⬇️ Скачать
 
-**Готовый .exe (Windows 11):** [**Releases → v0.4.0**](https://github.com/Dchamel/photo_explorer/releases) —
-справа в разделе Releases лежит собранный `photo_explorer_v0.4.0.exe`.
+**Готовый .exe (Windows 11):** [**Releases → v0.5.0**](https://github.com/Dchamel/photo_explorer/releases) —
+справа в разделе Releases лежит собранный `photo_explorer_v0.5.0.exe`.
 Скачай и запусти, установка не требуется.
 
 > Все личные данные (PIN-хэш, кэш миниатюр, проекты) хранятся локально
@@ -56,14 +56,14 @@
 .exe лежит файл `photo_explorer_vX.Y.Z.exe.sha256` — контрольная сумма.
 Сверьте её командой (PowerShell):
 ```powershell
-Get-FileHash photo_explorer_v0.4.0.exe -Algorithm SHA256
+Get-FileHash photo_explorer_v0.5.0.exe -Algorithm SHA256
 ```
 Если сумма совпала — файл ровно тот, что собрал GitHub Actions из
 исходников репозитория, без подмен.
 
 ---
 
-## ✨ Возможности (v0.4.0)
+## ✨ Возможности (v0.5.0)
 
 - 🗂️ **Два режима сканирования:**
   - только выбранная папка (без подпапок);
