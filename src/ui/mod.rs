@@ -1625,9 +1625,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             playback.set_frame(0);
             playback.set_paused(false);
             let mut cur: usize = 0;
-            // 4.7a-fix4 — единая точка выхода: после break 'anim причина
-            // логируется и слой освобождается ОДИН раз (DRY).
-            let mut stopped = false;
+            // 4.7a-fix4 — единая точка выхода: после break 'anim слой
+            // освобождается ОДИН раз (DRY). 4.7d-fix — выход ЕДИНСТВЕННЫЙ:
+            // смена поколения (уход с фото); конец прохода теперь НЕ
+            // убивает поток, а ставит автопаузу — флага причины больше нет.
             'anim: loop {
                 // 4.7d — перемотка: забрать запрос (один раз, атомарно),
                 // прыгнуть на кадр. Кламп по числу кадров.
@@ -1638,12 +1639,13 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 // 4.7a-fix3 — сверка ДО показа кадра: первый кадр
                 // проверяется мгновенно после старта аниматора.
                 if generation.load(Ordering::SeqCst) != my_gen {
-                    stopped = true;
                     break 'anim;
                 }
                 let f = &frames[cur];
                 let gen = generation.clone();
-                let ui_weak = ui_weak.clone();
+                // 4.7d-fix — клон кадра под СВОИМ именем: затенение
+                // внешнего ui_weak ломало автопаузу ниже (borrow after move).
+                let ui_weak_frame = ui_weak.clone();
                 let (data, w, h) = (f.data.clone(), f.w, f.h);
                 log::debug!(
                     "[ANIM] кадр {}/{} idx={index} gen={my_gen} (пауза {} мс)",
@@ -1659,7 +1661,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         log::debug!("[ANIM] кадр отсечён в UI (поколение {cur_gen} ≠ {my_gen})");
                         return;
                     }
-                    if let Some(w_ui) = ui_weak.upgrade() {
+                    if let Some(w_ui) = ui_weak_frame.upgrade() {
                         if w_ui.get_viewer_index() != index {
                             log::debug!("[ANIM] кадр отсечён в UI (индекс ушёл)");
                             return; // индекс ушёл — не показываем
@@ -1692,7 +1694,6 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         // Пауза не отменяет сверки поколения и перемотки:
                         // ушёл с фото / потянул бегунок — реагируем.
                         if generation.load(Ordering::SeqCst) != my_gen {
-                            stopped = true;
                             break 'anim;
                         }
                         if let Some(seek_to) = playback.take_seek() {
@@ -1704,7 +1705,6 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     let quantum = left.min(ANIM_SLEEP_QUANTUM_MS);
                     std::thread::sleep(std::time::Duration::from_millis(quantum));
                     if generation.load(Ordering::SeqCst) != my_gen {
-                        stopped = true;
                         break 'anim;
                     }
                     // Перемотка во время паузы кадра — прерываем ожидание.
@@ -1718,27 +1718,47 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 if playback.take_seek().is_some() {
                     continue;
                 }
-                // 4.7d — конец прохода: последний кадр → зацикливание
-                // (иконка-тумблер панели) или стоп на последнем кадре.
+                // 4.7d-fix — конец прохода без зацикливания: НЕ умираем —
+                // встаём на АВТОПАУЗУ на последнем кадре (панель жива,
+                // кнопка показывает ▶, можно перемотать/продолжить).
+                // Поток умирает ТОЛЬКО по смене поколения (уход с фото).
                 if cur + 1 >= total {
                     if !settings.loop_animation_on() {
-                        break 'anim; // один проход — стоп на последнем кадре
+                        playback.set_paused(true);
+                        let ui_weak_pause = ui_weak.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(w) = ui_weak_pause.upgrade() {
+                                w.set_anim_paused(true);
+                            }
+                        });
+                        log::debug!(
+                            "[ANIM] конец прохода — автопауза на кадре {}/{}",
+                            cur + 1,
+                            total
+                        );
+                        // cur остаётся на последнем кадре; цикл продолжит
+                        // крутиться по паузе (тики 30мс) — ждёт ▶ или уход.
+                    } else {
+                        cur = 0; // по кругу
                     }
-                    cur = 0; // по кругу
                 } else {
                     cur += 1;
                 }
             }
-            // Единая точка выхода: лог причины + освобождение слоя.
-            if stopped {
-                log::debug!("[ANIM] аниматор остановлен (поколение ушло): idx={index}");
-            } else {
-                log::debug!("[ANIM] аниматор завершён (один проход): idx={index}");
-            }
+            // Единая точка выхода: освобождение слоя.
+            // 4.7d-fix — сверка поколения: СТАРЫЙ аниматор (его поколение
+            // уже неактуально) НЕ гасит панель нового перехода — иначе
+            // панель моргала при листании (старый писал false ПОСЛЕ
+            // того как новый написал true).
+            log::debug!("[ANIM] аниматор остановлен (поколение ушло): idx={index}");
             let ap = anim_playing.clone();
+            let gen_exit = generation.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 *lock_or_recover(&ap) = None;
-                // 4.7d — гасим панель анимации (ушли с фото / конец).
+                // Гасим панель ТОЛЬКО если наше поколение всё ещё актуально.
+                if gen_exit.load(Ordering::SeqCst) != my_gen {
+                    return; // ушёл на другое фото — панель принадлежит новому
+                }
                 if let Some(w) = ui_weak.upgrade() {
                     w.set_anim_active(false);
                     w.set_anim_paused(false);
@@ -2492,11 +2512,22 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         });
     }
     // 4.7d — кнопка ⏸/▶: переключаем паузу и её отражение в UI.
+    // 4.7d-fix — ▶ на АВТОПАУЗЕ конца прохода: перезапуск с кадра 0
+    // (иначе «продолжить» с последнего кадра мгновенно упиралось в
+    // конец и снова паузило — кнопка «не работала»).
     {
         let ctx = viewer_ctx.clone();
         ui.on_anim_toggle_pause(move || {
             let paused = !ctx.playback.is_paused();
             log::info!("anim: пауза → {paused}");
+            // Снимаем паузу, стоя на последнем кадре — честный
+            // перезапуск с начала.
+            if !paused {
+                let total = ctx.playback.total();
+                if total > 0 && ctx.playback.current_frame() + 1 >= total {
+                    ctx.playback.request_seek(0);
+                }
+            }
             ctx.playback.set_paused(paused);
             if let Some(w) = ctx.ui_weak.upgrade() {
                 w.set_anim_paused(paused);

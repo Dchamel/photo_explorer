@@ -755,7 +755,7 @@ export component GalleryScreen inherits Window {
             // по кадрам, 🔁-тумблер зацикливания, скорость ×0.1..×2.0.
             // Видна только когда играет анимация И управление не скрыто
             // (автоскрытие по движению мыши — общее с ←/→/×).
-            if root.anim-active && root.controls-visible : Rectangle {
+            if root.anim-active : Rectangle {
                 height: 64px;
                 width: Math.min(760px, parent.width - 32px);
                 x: (parent.width - self.width) / 2;
@@ -764,6 +764,20 @@ export component GalleryScreen inherits Window {
                 border-radius: 14px;
                 border-width: 1px;
                 border-color: #ffffff22;
+                // 4.7d-fix — ПЛАВНОЕ появление/исчезание (200 мс) вместо
+                // резкого скачка; opacity ведёт controls-visible.
+                opacity: root.controls-visible ? 1.0 : 0.0;
+                animate opacity { duration: 200ms; easing: ease-in-out; }
+                // 4.7d-fix — панель НЕ гаснет под курсором: её TouchArea
+                // сама сообщает о движении мыши (внешний TouchArea вьюера
+                // не видит событий над панелью — они перехватываются).
+                TouchArea {
+                    pointer-event(e) => {
+                        if e.kind == PointerEventKind.move {
+                            root.mouse-moved();
+                        }
+                    }
+                }
 
                 HorizontalLayout {
                     padding: 10px;
@@ -836,7 +850,9 @@ export component GalleryScreen inherits Window {
                         padding: 0px;
                         spacing: 2px;
                         Text {
-                            text: "Скорость ×" + (root.anim-speed / 10) + "." + Math.mod(root.anim-speed, 10);
+                            // 4.7d-fix — Math.floor: Slint делит как float
+                            // (1/10 = 0.1), подпись выходила «×0.1.1».
+                            text: "Скорость ×" + Math.floor(root.anim-speed / 10) + "." + Math.mod(root.anim-speed, 10);
                             color: #ffffffcc;
                             font-size: 12px;
                             vertical-alignment: center;

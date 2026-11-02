@@ -49,6 +49,12 @@ impl AnimPlayback {
         self.frame.store(frame, Ordering::SeqCst);
     }
 
+    /// Всего кадров (колбэк ▶ сверяет «последний ли кадр» для
+    /// перезапуска с начала).
+    pub(crate) fn total(&self) -> usize {
+        self.total.load(Ordering::SeqCst)
+    }
+
     /// Аниматор объявляет число кадров на старте.
     pub(crate) fn set_total(&self, total: usize) {
         self.total.store(total, Ordering::SeqCst);
