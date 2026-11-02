@@ -567,10 +567,13 @@ export component GalleryScreen inherits Window {
 
     // --- Viewer: просмотр фото в полном размере (поверх галереи) ---
     // FocusScope — КОРЕНЬ overlay: занимает весь экран, первым получает фокус
-    // при показе (init => self.focus()). Все элементы внутри — его дети,
-    // поэтому TouchArea фона и кнопки не крадут клавиатурный фокус.
+    // при показе (init => self.focus()). Все элементы внутри — его дети.
+    // 4.7d-fix3 — Slider панели анимации ФОКУСИРУЕМЫЙ: клик по нему уводит
+    // фокус из FocusScope, и Esc/←/→ перестают работать. Поэтому все
+    // колбэки панели возвращают фокус сюда (vs.focus()) — клавиатура
+    // восстанавливается сразу после взаимодействия с панелью.
     // Esc — закрыть, ←/→ — листать. Фокус сразу, без второго клика.
-    if root.show-viewer : FocusScope {
+    if root.show-viewer : vs := FocusScope {
         init => { self.focus(); }
         key-pressed(e) => {
             if e.text == Key.Escape {
@@ -785,13 +788,19 @@ export component GalleryScreen inherits Window {
                     spacing: 12px;
                     alignment: center;
 
-                    // ⏸/▶ — пауза/плей.
+                    // ⏸/▶ — пауза/плей. 4.7d-fix3 — возвращаем фокус
+                    // вьюеру (клик по панели не должен ломать клавиатуру).
                     Rectangle {
                         width: 44px;
                         height: 44px;
                         border-radius: 22px;
                         background: #ffffff14;
-                        TouchArea { clicked => { root.anim-toggle-pause(); } }
+                        TouchArea {
+                            clicked => {
+                                root.anim-toggle-pause();
+                                vs.focus();
+                            }
+                        }
                         Text {
                             text: root.anim-paused ? "▶" : "⏸";
                             color: white;
@@ -819,12 +828,17 @@ export component GalleryScreen inherits Window {
                         }
                         // Бегунок перемотки: 0..total-1 (кадры).
                         // changed => seek: аниматор прыгает на кадр.
+                        // 4.7d-fix3 — после перемотки фокус обратно
+                        // вьюеру (слайдер крадёт фокус при клике).
                         Slider {
                             width: 240px;
                             minimum: 0;
                             maximum: Math.max(root.anim-total - 1, 1);
                             value: root.anim-frame;
-                            changed(f) => { root.anim-seek(Math.round(f)); }
+                            changed(f) => {
+                                root.anim-seek(Math.round(f));
+                                vs.focus();
+                            }
                         }
                     }
 
@@ -836,7 +850,12 @@ export component GalleryScreen inherits Window {
                         background: root.loop-animation ? #2a4d6f : #ffffff14;
                         border-width: root.loop-animation ? 1px : 0px;
                         border-color: Theme.accent;
-                        TouchArea { clicked => { root.set-loop-animation(!root.loop-animation); } }
+                        TouchArea {
+                            clicked => {
+                                root.set-loop-animation(!root.loop-animation);
+                                vs.focus();
+                            }
+                        }
                         Text {
                             text: "🔁";
                             font-size: 20px;
@@ -860,12 +879,16 @@ export component GalleryScreen inherits Window {
                             horizontal-alignment: center;
                         }
                         // Бегунок скорости: 1..20 десятых (×0.1..×2.0).
+                        // 4.7d-fix3 — фокус обратно вьюеру после смены.
                         Slider {
                             width: 150px;
                             minimum: 1;
                             maximum: 20;
                             value: root.anim-speed;
-                            changed(f) => { root.anim-set-speed(Math.round(f)); }
+                            changed(f) => {
+                                root.anim-set-speed(Math.round(f));
+                                vs.focus();
+                            }
                         }
                     }
                 }
