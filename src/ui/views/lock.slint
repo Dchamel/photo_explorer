@@ -251,10 +251,11 @@ export component GalleryScreen inherits Window {
     in-out property <int> ultra-threads: 1;
     in-out property <int> ultra-threads-max: 1;
     // 4.6c-fix3 — вкладки панели настроек: 0=Листание, 1=Производительность,
-    // 2=Отладка. И «Детальная статистика в логах» (вкладка «Отладка»,
-    // ВЫКЛ по умолчанию у всех — обычному пользователю не нужна).
+    // 2=Отладка.
     in-out property <int> settings-tab: 0;
-    in-out property <bool> debug-stats: false;
+    // 4.8 — уровень подробности лога: 0 «Важное», 1 «Обычный»,
+    // 2 «Подробный». Заменил галку «Детальная статистика».
+    in-out property <int> log-level: 1;
     // 4.7a — «Зациклить анимацию» (GIF/WEBP/APNG): ВКЛ — по кругу
     // (по умолчанию, как в браузерах); ВЫКЛ — один проход, стоп на
     // последнем кадре. Глобальная настройка просмотра.
@@ -289,7 +290,7 @@ export component GalleryScreen inherits Window {
     callback set-ultra-threads(int); // сколько ядер использовать
     // 4.6c-fix3 — вкладки и отладочная статистика.
     callback set-settings-tab(int);  // переключить вкладку настроек
-    callback set-debug-stats(bool);  // детальная статистика в логах
+    callback set-log-level(int);     // 4.8 — уровень подробности лога
     // 4.7a — зациклить анимацию GIF/WEBP/APNG.
     callback set-loop-animation(bool);
     // --- 4.7d — управление анимацией из панели внизу вьюера ---
@@ -1349,44 +1350,80 @@ export component GalleryScreen inherits Window {
                                 font-size: 11px;
                                 wrap: TextWrap.word-wrap;
                             }
-                            // Галка «Детальная статистика в логах».
-                            Rectangle {
-                                height: 48px;
-                                border-radius: 8px;
-                                background: root.debug-stats ? #2a4d6f : #ffffff0d;
-                                border-width: root.debug-stats ? 1px : 0px;
-                                border-color: Theme.accent;
-                                TouchArea { clicked => { root.set-debug-stats(!root.debug-stats); } }
-                                HorizontalLayout {
-                                    padding: 10px;
-                                    spacing: 10px;
+                            // 4.8 — уровень подробности лога (3 таба).
+                            // Лог пишется ВСЕГДА; уровень регулирует
+                            // подробность: «Важное» — ошибки и ключевые
+                            // события, «Обычный» — +ход работы,
+                            // «Подробный» — +покадровая трассировка [ANIM].
+                            Text {
+                                text: "Подробность логов";
+                                color: Theme.text-primary;
+                                font-size: 13px;
+                                font-weight: 600;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                // Таб «Важное» (0).
+                                Rectangle {
+                                    height: 40px;
+                                    border-radius: 8px;
+                                    background: root.log-level == 0 ? #2a4d6f : #ffffff0d;
+                                    border-width: root.log-level == 0 ? 1px : 0px;
+                                    border-color: Theme.accent;
+                                    horizontal-stretch: 1;
+                                    TouchArea { clicked => { root.set-log-level(0); } }
                                     Text {
-                                        text: root.debug-stats ? "◉" : "○";
-                                        color: Theme.accent;
-                                        font-size: 16px;
+                                        text: "⚠ Важное";
+                                        color: Theme.text-primary;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
                                         vertical-alignment: center;
                                     }
-                                    VerticalLayout {
-                                        padding: 0px;
-                                        Text {
-                                            text: "Детальная статистика в логах";
-                                            color: Theme.text-primary;
-                                            font-size: 13px;
-                                            vertical-alignment: center;
-                                        }
-                                        Text {
-                                            text: "подробные замеры декода в ./logs (число задействованных полос и пр.)";
-                                            color: Theme.text-secondary;
-                                            font-size: 11px;
-                                            vertical-alignment: center;
-                                        }
+                                }
+                                // Таб «Обычный» (1).
+                                Rectangle {
+                                    height: 40px;
+                                    border-radius: 8px;
+                                    background: root.log-level == 1 ? #2a4d6f : #ffffff0d;
+                                    border-width: root.log-level == 1 ? 1px : 0px;
+                                    border-color: Theme.accent;
+                                    horizontal-stretch: 1;
+                                    TouchArea { clicked => { root.set-log-level(1); } }
+                                    Text {
+                                        text: "📋 Обычный";
+                                        color: Theme.text-primary;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
                                     }
-                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                                // Таб «Подробный» (2).
+                                Rectangle {
+                                    height: 40px;
+                                    border-radius: 8px;
+                                    background: root.log-level == 2 ? #2a4d6f : #ffffff0d;
+                                    border-width: root.log-level == 2 ? 1px : 0px;
+                                    border-color: Theme.accent;
+                                    horizontal-stretch: 1;
+                                    TouchArea { clicked => { root.set-log-level(2); } }
+                                    Text {
+                                        text: "🔍 Подробный";
+                                        color: Theme.text-primary;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
                                 }
                             }
-                            // 4.6c-fix4 — кнопки доступа к логам: видны
-                            // ТОЛЬКО при включённой галке (дебаг-режим).
-                            if root.debug-stats : VerticalLayout {
+                            Text {
+                                text: "«Важное» — только ошибки и ключевые события; «Обычный» — плюс ход работы; «Подробный» — плюс покадровая трассировка анимации и замеры декода.";
+                                color: Theme.text-secondary;
+                                font-size: 11px;
+                                wrap: TextWrap.word-wrap;
+                            }
+                            // 4.6c-fix4 — кнопки доступа к логам (4.8 —
+                            // видны ВСЕГДА: лог полезен на любом уровне).
+                            VerticalLayout {
                                 spacing: 8px;
                                 Rectangle { height: 1px; background: #ffffff22; }
                                 Text {

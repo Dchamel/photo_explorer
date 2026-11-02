@@ -21,7 +21,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::OnceLock;
 
-use log::{Level, Log, Metadata, Record};
+use log::{Log, Metadata, Record};
 
 /// Папка под логи.
 ///
@@ -41,12 +41,41 @@ pub fn log_path() -> std::path::PathBuf {
 /// Глобальный файл лога (открывается один раз при init).
 static LOG_FILE: OnceLock<std::sync::Mutex<std::fs::File>> = OnceLock::new();
 
+/// 4.8 — максимальный уровень записей лога (глобальный, атомик —
+/// меняется из UI без блокировок). 0 = «Важное» (Error+Warn),
+/// 1 = «Обычный» (+Info), 2 = «Подробный» (+Debug+Trace).
+static MAX_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// 4.8 — сменить подробность лога (вызывается из настроек).
+/// 0/1/2, значения вне диапазона клампятся.
+pub fn set_level(level: u8) {
+    MAX_LEVEL.store(level.min(2), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 4.8 — текущий уровень подробности (для UI-подписи при старте).
+pub fn level() -> u8 {
+    MAX_LEVEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 4.8 — маппинг уровня лога (log::Level) в градацию подробности:
+/// Error/Warn → 0 (важное), Info → 1 (обычный), Debug/Trace → 2
+/// (подробный). Чистая функция — легко тестировать.
+pub fn level_of(level: log::Level) -> u8 {
+    match level {
+        log::Level::Error | log::Level::Warn => 0,
+        log::Level::Info => 1,
+        log::Level::Debug | log::Level::Trace => 2,
+    }
+}
+
 /// Наш логгер.
 struct FileLogger;
 
 impl Log for FileLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Trace
+        // 4.8 — фильтр по глобальному уровню подробности: запись
+        // проходит, если её градация ≤ выбранной пользователем.
+        level_of(metadata.level()) <= MAX_LEVEL.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn log(&self, record: &Record) {
@@ -188,6 +217,27 @@ pub fn init() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_levels_map_to_three_grades() {
+        // 4.8 — Error/Warn → «Важное» (0), Info → «Обычный» (1),
+        // Debug/Trace → «Подробный» (2).
+        assert_eq!(level_of(log::Level::Error), 0);
+        assert_eq!(level_of(log::Level::Warn), 0);
+        assert_eq!(level_of(log::Level::Info), 1);
+        assert_eq!(level_of(log::Level::Debug), 2);
+        assert_eq!(level_of(log::Level::Trace), 2);
+    }
+
+    #[test]
+    fn set_level_clamps_out_of_range() {
+        // Значения вне 0..2 клампятся — мусор не сломает логгер.
+        set_level(9);
+        assert_eq!(level(), 2);
+        set_level(0);
+        assert_eq!(level(), 0);
+        set_level(1); // возвращаем дефолт для других тестов
+    }
 
     #[test]
     fn days_to_ymd_epoch() {

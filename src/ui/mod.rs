@@ -1091,6 +1091,13 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         /// мелькала перед уходом на другой кадр).
         fn switch_to_photo(&self, index: i32, skip_depth: u32, show_thumb: bool) {
             let my_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            // 4.7d-fix2 — панель анимации прячется СРАЗУ на новом переходе:
+            // раньше anim-active висел true от прошлого GIF и панель
+            // оставалась на статичных фото. Аниматор включит её обратно,
+            // только если реально запустится (кадров > 1).
+            if let Some(w) = self.ui_weak.upgrade() {
+                w.set_anim_active(false);
+            }
             if show_thumb {
                 self.show_thumbnail(index, my_gen);
             }
@@ -1647,7 +1654,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 // внешнего ui_weak ломало автопаузу ниже (borrow after move).
                 let ui_weak_frame = ui_weak.clone();
                 let (data, w, h) = (f.data.clone(), f.w, f.h);
-                log::debug!(
+                // 4.8 — покадровый лог на TRACE: виден только на уровне
+                // «Подробный» (для обычного пользователя лог чистый).
+                log::trace!(
                     "[ANIM] кадр {}/{} idx={index} gen={my_gen} (пауза {} мс)",
                     cur + 1,
                     total,
@@ -1663,7 +1672,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     }
                     if let Some(w_ui) = ui_weak_frame.upgrade() {
                         if w_ui.get_viewer_index() != index {
-                            log::debug!("[ANIM] кадр отсечён в UI (индекс ушёл)");
+                            log::trace!("[ANIM] кадр отсечён в UI (индекс ушёл)");
                             return; // индекс ушёл — не показываем
                         }
                         let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
@@ -1679,7 +1688,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         w_ui.set_viewer_image(slint::Image::from_rgba8(buf));
                         // 4.7d — двигаем бегунок перемотки за анимацией.
                         w_ui.set_anim_frame(cur as i32);
-                        log::debug!("[ANIM] кадр НА ЭКРАНЕ idx={index}");
+                        log::trace!("[ANIM] кадр НА ЭКРАНЕ idx={index}");
                     }
                 });
                 // 4.7a-fix3/fix4 — пауза ПОСЛЕ показа, квантами ≤30 мс со
@@ -2419,7 +2428,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             w.set_ultra_threads(threads as i32);
             w.set_ultra_threads_max(max_threads);
             w.set_settings_tab(0);
-            w.set_debug_stats(global_settings.debug_stats_on());
+            // 4.8 — уровень логов из настроек (заменил галку «Детальная
+            // статистика»); применяем к логгеру сразу.
+            let log_level = global_settings.log_level.load(Ordering::Relaxed);
+            crate::logging::set_level(log_level);
+            w.set_log_level(log_level as i32);
             // 4.7a — «Зациклить анимацию» из глобальных настроек.
             w.set_loop_animation(global_settings.loop_animation_on());
         }
@@ -2468,17 +2481,19 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
         });
     }
-    // 4.6c-fix3 — галка «Детальная статистика в логах» (вкладка «Отладка»):
-    // пишем в атомик (воркер увидит на следующем декоде) и сохраняем.
+    // 4.8 — уровень подробности лога (3 таба вкладки «Отладка»):
+    // пишем в атомик, применяем к логгеру СРАЗУ (set_level), сохраняем.
     {
         let ui_weak = ui.as_weak();
         let settings = global_settings.clone();
-        ui.on_set_debug_stats(move |on| {
-            log::info!("settings: детальная статистика → {on}");
-            settings.debug_stats.store(on, Ordering::Relaxed);
+        ui.on_set_log_level(move |level| {
+            let level = level.clamp(0, 2) as u8;
+            log::info!("settings: уровень логов → {level}");
+            settings.log_level.store(level, Ordering::Relaxed);
+            crate::logging::set_level(level);
             crate::settings::store(&settings);
             if let Some(w) = ui_weak.upgrade() {
-                w.set_debug_stats(on);
+                w.set_log_level(level as i32);
             }
         });
     }

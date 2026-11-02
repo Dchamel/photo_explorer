@@ -16,7 +16,7 @@
 //! читает на каждом декоде, актуальность мгновенная.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 /// Глобальные настройки в памяти: обёртки-атомики для доступа из
 /// воркер-потока без блокировок. UI-поток меняет значения через
@@ -31,7 +31,14 @@ pub struct GlobalSettings {
     /// под флагом воркер пишет число реально задействованных полос rayon
     /// и прочие замеры. ВЫКЛ по умолчанию у всех — обычному пользователю
     /// детальный лог не нужен (чисто отладочный инструмент).
+    /// 4.8 — заменяется выбором уровня логов (см. log_level), оставлен
+    /// для чтения старых файлов настроек; UI больше его не показывает.
     pub debug_stats: AtomicBool,
+    /// 4.8 — уровень подробности лога: 0 «Важное» (Error/Warn),
+    /// 1 «Обычный» (+Info — ход работы), 2 «Подробный» (+Debug/Trace —
+    /// покадровый [ANIM], [CONC]-детали). Лог пишется ВСЕГДА; уровень
+    /// регулирует только подробность. По умолчанию 1 — обычный.
+    pub log_level: AtomicU8,
     /// 4.7a — «Зациклить анимацию» (GIF/WEBP/APNG): ВКЛ — проигрывать
     /// по кругу (как в браузерах, по умолчанию); ВЫКЛ — один проход,
     /// стоп на последнем кадре. Глобальная настройка (про поведение
@@ -52,6 +59,9 @@ impl GlobalSettings {
             debug_stats: AtomicBool::new(false),
             // 4.7a — цикл по умолчанию: естественное поведение просмотрщика.
             loop_animation: AtomicBool::new(true),
+            // 4.8 — «Обычный» по умолчанию: ключевые события и ход
+            // работы видны, покадровая трассировка — нет.
+            log_level: AtomicU8::new(1),
         }
     }
 
@@ -108,6 +118,14 @@ struct SettingsFile {
     /// 4.7a — отсутствует в старых файлах → serde default (true, цикл).
     #[serde(default = "default_loop_animation")]
     loop_animation: bool,
+    /// 4.8 — отсутствует в старых файлах → serde default (1, обычный).
+    #[serde(default = "default_log_level")]
+    log_level: u8,
+}
+
+/// 4.8 — уровень логов по умолчанию для serde («Обычный»).
+fn default_log_level() -> u8 {
+    1
 }
 
 /// 4.7a — значение loop_animation по умолчанию для serde (цикл ВКЛ).
@@ -130,12 +148,17 @@ pub fn load() -> GlobalSettings {
                 settings
                     .loop_animation
                     .store(f.loop_animation, Ordering::Relaxed);
+                // 4.8 — уровень логов (кламп 0..2 от мусора в файле).
+                settings
+                    .log_level
+                    .store(f.log_level.min(2), Ordering::Relaxed);
                 log::info!(
-                    "settings: загружены (ultra_speed={}, threads={}, debug_stats={}, loop_animation={})",
+                    "settings: загружены (ultra_speed={}, threads={}, debug_stats={}, loop_animation={}, log_level={})",
                     f.ultra_speed,
                     f.threads.max(1),
                     f.debug_stats,
-                    f.loop_animation
+                    f.loop_animation,
+                    f.log_level.min(2)
                 );
             }
             Err(e) => {
@@ -158,6 +181,8 @@ pub fn store(settings: &GlobalSettings) {
         threads,
         debug_stats: settings.debug_stats_on(),
         loop_animation: settings.loop_animation_on(),
+        // 4.8 — уровень подробности лога.
+        log_level: settings.log_level.load(Ordering::Relaxed),
     };
     let path = settings_path();
     // Создаём каталог, если его ещё нет (первый запуск).
