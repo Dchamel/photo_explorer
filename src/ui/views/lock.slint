@@ -678,15 +678,24 @@ export component GalleryScreen inherits Window {
             // Адаптивная сетка миниатюр: карточки позиционируются по индексу.
             // 4.7e-fix — y-отступ под панель фильтра (40px + отступы):
             // раньше панель ложилась ПОВЕРХ первой строки карточек.
-            grid := Flickable {
+            // 4.7g — СКРОЛЛБАР справа (ScrollView показывает полосу
+            // автоматически при переполнении) + РАВНОМЕРНАЯ сетка:
+            // колонки считаются от ширины окна (целевая ширина карточки),
+            // а фактическая ширина растягивается — ряд заполнен ВЕСЬ,
+            // без пустого хвоста у правого края (раньше «жались влево»).
+            grid := ScrollView {
                 x: 0px;
                 y: 48px;
                 width: parent.width;
                 height: parent.height - 48px;
-                property <length> card-w: 180px;
+                property <length> target-card-w: 180px;
                 property <length> card-h: 200px;
                 property <length> gap: 12px;
-                property <int> columns: max(1, floor((self.width - 16px) / (self.card-w + self.gap)));
+                // Колонок — сколько влезает по ЦЕЛЕВОЙ ширине (мин. 1).
+                property <int> columns: max(1, floor((self.width - 16px - self.gap) / (self.target-card-w + self.gap)));
+                // Фактическая ширина карточки: ряд растягивается на всю
+                // ширину сетки минус поля и промежутки — равномерно.
+                property <length> card-w: (self.width - 16px - (self.columns - 1) * self.gap) / self.columns;
                 property <int> rows: ceil(root.thumbnails.length / self.columns);
                 content-width: self.width;
                 content-height: 16px + self.rows * (self.card-h + self.gap);

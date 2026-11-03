@@ -1101,7 +1101,19 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             if show_thumb {
                 self.show_thumbnail(index, my_gen);
             }
-            self.request_load(index, my_gen, skip_depth);
+            // 4.7g — видео НЕ отправляем воркеру как «фото»: image::open
+            // не умеет mp4 → Err → файл попадал в «битые» → авто-скип
+            // перелистывал видео сразу после открытия. Кадр видео
+            // показывает видео-ветка ниже (first_frame_rgba/заглушка).
+            let is_video = {
+                let p = lock_or_recover(&self.photos);
+                p.get(index.max(0) as usize)
+                    .map(|ph| crate::media::is_video(&ph.path))
+                    .unwrap_or(false)
+            };
+            if !is_video {
+                self.request_load(index, my_gen, skip_depth);
+            }
             // 4.7a-fix2 — анимация — ответственность ПЕРЕХОДА, а не воркера:
             // раньше decode кадров жил в воркере, и при повторном открытии
             // GIF из кэша (кэш-хит минует воркер) аниматор НЕ запускался —
@@ -1983,6 +1995,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     /// через invoke_from_event_loop, где берёт модель из UI и downcast'ит.
     /// 4.7e — батчи пишут в ПОЛНУЮ Slint-модель (full-thumbnails);
     /// отображаемая (thumbnails) — только прошедшие фильтр.
+    /// 4.7g — ВИДЕО НЕ БЛОКИРУЕТ галерею: в батчах видео получает
+    /// мгновенную заглушку «play» (без MF-декода), а настоящие кадры
+    /// строит отдельный фоновый проход и ПОДМЕНЯЕТ карточки по готовности
+    /// (281 видео × MF-декод в общем конвейере = 42 минуты ожидания).
     fn load_thumbs_batched(
         photos: Vec<Photo>,
         thumbs: &Arc<FileSystemThumbnailProvider>,
@@ -1997,6 +2013,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let thumbs = thumbs.clone();
         let ui_weak = ui_weak.clone();
         let gallery_gen = gallery_gen.clone();
+        // 4.7g — видео уходит в отдельный проход (пути, не миниатюры).
+        let videos: Vec<std::path::PathBuf> = photos
+            .iter()
+            .filter(|p| crate::media::is_video(&p.path))
+            .map(|p| p.path.clone())
+            .collect();
         std::thread::spawn(move || {
             // Первый батч 200 — сетка оживает сразу; остальные по 150.
             // ВАЖНО: срез [..200] даёт РОВНО один кусок (chunks не выйдет за
@@ -2009,9 +2031,29 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 .enumerate()
             {
                 // Миниатюры (чистый RGBA, Send) — строим в фоне.
-                let results = thumbs.thumbnails(chunk);
-                let raw: Vec<crate::core::models::Thumbnail> =
-                    results.into_iter().flatten().collect();
+                // 4.7g — видео в батчах НЕ декодируется (быстро): вместо
+                // MF-кадра — мгновенная заглушка; настоящий кадр придёт
+                // фоновым проходом ниже и подменит карточку.
+                let results: Vec<crate::core::models::Thumbnail> = chunk
+                    .iter()
+                    .map(|photo| {
+                        if crate::media::is_video(&photo.path) {
+                            // Заглушка: без декода, без кэша (кэш проверит
+                            // видео-проход — там же запишется настоящий кадр).
+                            let (data, w, h) = crate::media::video_placeholder();
+                            crate::core::models::Thumbnail {
+                                source_path: photo.path.clone(),
+                                width: w,
+                                height: h,
+                                data,
+                            }
+                        } else {
+                            thumbs
+                                .thumbnail(photo)
+                                .unwrap_or_else(|_| placeholder_for(&photo.path))
+                        }
+                    })
+                    .collect();
                 done += chunk.len();
                 let is_first = batch_i == 0;
                 let prefix = status_prefix.clone();
@@ -2024,7 +2066,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     }
                     if let Some(w) = ui_weak.upgrade() {
                         // ThumbItem (не-Send) строим ЗДЕСЬ, в UI-потоке.
-                        let items: Vec<ThumbItem> = raw.into_iter().map(thumb_item_from).collect();
+                        let items: Vec<ThumbItem> =
+                            results.into_iter().map(thumb_item_from).collect();
                         use slint::Model;
                         // 4.7e — первый батч: полная модель = срез,
                         // отображаемая = отфильтрованная.
@@ -2068,7 +2111,83 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 std::thread::sleep(std::time::Duration::from_millis(30));
             }
             log::info!("gallery: батчи миниатюр завершены ({total})");
+
+            // 4.7g — ВТОРОЙ ПРОХОД: настоящие кадры видео (фоном, после
+            // того как вся галерея уже на экране). Каждый готовый кадр
+            // подменяет заглушку в ОБЕИХ моделях (полная + отображаемая)
+            // по ПУТИ — карточка не меняет позицию, меняется только картинка.
+            let ui_weak = ui_weak.clone();
+            let gallery_gen = gallery_gen.clone();
+            std::thread::spawn(move || {
+                let mut ready = 0usize;
+                for path in &videos {
+                    // Проект закрыли/сменён — проход отменяется.
+                    if gallery_gen.load(Ordering::SeqCst) != my_gen {
+                        return;
+                    }
+                    // Кэш миниатюр: если настоящий кадр уже в PNG-кэше —
+                    // берём оттуда (быстро, без MF).
+                    let thumb = thumbs
+                        .thumbnail(&Photo {
+                            path: path.clone(),
+                            file_name: String::new(),
+                            size_bytes: 0,
+                            modified: 0,
+                        })
+                        .ok();
+                    let Some(thumb) = thumb else {
+                        continue; // декод не удался — заглушка остаётся
+                    };
+                    ready += 1;
+                    // Thumbnail (чистый RGBA, Send) — через границу потока;
+                    // ThumbItem (slint::Image, не-Send) строим в UI-потоке.
+                    let ui_weak = ui_weak.clone();
+                    let gallery_gen = gallery_gen.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if gallery_gen.load(Ordering::SeqCst) != my_gen {
+                            return;
+                        }
+                        if let Some(w) = ui_weak.upgrade() {
+                            let item = thumb_item_from(thumb);
+                            replace_thumb_by_path(&w, &item);
+                        }
+                    });
+                }
+                log::info!("gallery: видео-кадры готовы ({ready} из {})", videos.len());
+            });
         });
+    }
+
+    /// 4.7g — заглушка для фото, чья миниатюра не построилась (битый файл):
+    /// серая карточка, файл не теряется из галереи (как у видео).
+    fn placeholder_for(path: &std::path::Path) -> crate::core::models::Thumbnail {
+        let (data, w, h) = crate::media::video_placeholder();
+        crate::core::models::Thumbnail {
+            source_path: path.to_path_buf(),
+            width: w,
+            height: h,
+            data,
+        }
+    }
+
+    /// 4.7g — подменить карточку миниатюры по ПУТИ в обеих моделях
+    /// (полная + отображаемая). Карточка не меняет позицию — только картинку.
+    fn replace_thumb_by_path(w: &GalleryScreen, new_item: &ThumbItem) {
+        use slint::Model;
+        let target = new_item.source_path.clone();
+        for model in [w.get_full_thumbnails(), w.get_thumbnails()] {
+            if let Some(vm) = model.as_any().downcast_ref::<slint::VecModel<ThumbItem>>() {
+                for row in 0..vm.row_count() {
+                    if let Some(mut it) = vm.row_data(row) {
+                        if it.source_path.as_str() == target.as_str() {
+                            it.image = new_item.image.clone();
+                            vm.set_row_data(row, it);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Запускает выбор папки + скан + генерацию миниатюр в фоновом потоке.

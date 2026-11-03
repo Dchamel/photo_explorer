@@ -81,33 +81,38 @@ pub fn video_placeholder() -> (Vec<u8>, u32, u32) {
 /// Возвращает (данные RGBA, ширина, высота). Ошибки — строкой: вызывающие
 /// ветки (миниатюры, просмотрщик) показывают файл как «битый» — обычный
 /// путь скипа сработает.
+/// 4.7g — MF инициализируется ОДИН РАЗ на процесс (OnceLock): раньше
+/// MFStartup/MFShutdown гонялись на КАЖДОМ видео (281 файл × инициализация
+/// COM-инфраструктуры = минуты). MFStartup референс-счётный — повторные
+/// вызовы безвредны, но и не нужны; Shutdown не делаем — ОС почистит.
+#[cfg(windows)]
+fn mf_ensure_started() -> Result<(), String> {
+    use std::sync::OnceLock;
+    use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_LITE, MF_SDK_VERSION};
+    static MF_STARTED: OnceLock<Result<(), String>> = OnceLock::new();
+    let started = MF_STARTED.get_or_init(|| unsafe {
+        MFStartup(MF_SDK_VERSION, MFSTARTUP_LITE).map_err(|e| format!("video: MFStartup: {e}"))
+    });
+    started.clone()
+}
+
 #[cfg(windows)]
 pub fn first_frame_rgba(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), String> {
     use windows::core::PCWSTR;
     use windows::Win32::Media::MediaFoundation::{
         IMFAttributes, IMFMediaType, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
-        MFCreateSourceReaderFromURL, MFMediaType_Video, MFShutdown, MFStartup, MFVideoFormat_RGB32,
-        MFSTARTUP_LITE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
-        MF_SDK_VERSION, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
-        MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+        MFCreateSourceReaderFromURL, MFMediaType_Video, MFVideoFormat_RGB32, MF_MT_DEFAULT_STRIDE,
+        MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+        MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
     };
 
     let start = std::time::Instant::now();
 
-    // 1) Инициализация MF (LITE — без полного COM, достаточно для
-    //    Source Reader). Гвардируем Shutdown при любом выходе (COM-гигиена).
-    unsafe {
-        MFStartup(MF_SDK_VERSION, MFSTARTUP_LITE).map_err(|e| format!("video: MFStartup: {e}"))?;
-    }
-    struct MfGuard;
-    impl Drop for MfGuard {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = MFShutdown();
-            }
-        }
-    }
-    let _mf = MfGuard;
+    // 1) Инициализация MF (LITE) — 4.7g: ОДИН РАЗ на процесс, а не на
+    //    каждый файл (281 видео × MFStartup = минуты лишнего старта).
+    //    MFStartup — референс-счётный и потокобезопасный; Shutdown не
+    //    делаем (процесс живёт — MF живёт, ОС почистит на выходе).
+    mf_ensure_started()?;
 
     // 2) Source Reader из пути файла (URL — широкая строка с нулём).
     //    4.7f — ВКЛЮЧАЕМ ВИДЕО-ПРОЦЕССОР: без него Source Reader НЕ
