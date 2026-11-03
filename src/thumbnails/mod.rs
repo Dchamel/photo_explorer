@@ -78,10 +78,31 @@ impl ThumbnailProvider for FileSystemThumbnailProvider {
         }
 
         // Генерация миниатюры из исходного файла.
-        let thumb = generate_thumbnail(&photo.path, self.max_size)?;
-
-        // Сохранение в кэш (ошибка записи кэша не ломает результат).
-        let _ = save_thumbnail_to_cache(&cache_file, &thumb);
+        // 4.7f — видео при провале декода НЕ валится ошибкой: заглушка
+        // (тёмная карточка «play») — файл остаётся в галерее, его видно
+        // и можно открыть. Заглушка НЕ пишется в кэш: следующий заход
+        // снова попробует декод (например, после установки кодека).
+        let thumb = match generate_thumbnail(&photo.path, self.max_size) {
+            Ok(thumb) => {
+                // Сохранение в кэш (ошибка записи кэша не ломает результат).
+                let _ = save_thumbnail_to_cache(&cache_file, &thumb);
+                thumb
+            }
+            Err(e) if crate::media::is_video(&photo.path) => {
+                log::warn!(
+                    "video: кадр не декодировался «{}»: {e}",
+                    photo.path.display()
+                );
+                let (data, w, h) = crate::media::video_placeholder();
+                Thumbnail {
+                    source_path: photo.path.clone(),
+                    width: w,
+                    height: h,
+                    data,
+                }
+            }
+            Err(e) => return Err(e),
+        };
 
         Ok(thumb)
     }

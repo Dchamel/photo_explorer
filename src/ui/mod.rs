@@ -1132,38 +1132,39 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         if gen.load(Ordering::SeqCst) != my_gen {
                             return;
                         }
-                        match crate::media::first_frame_rgba(&video_path) {
-                            Ok((data, w, h)) => {
-                                let _ = slint::invoke_from_event_loop(move || {
-                                    // Двойная сверка (как у воркера).
-                                    if gen.load(Ordering::SeqCst) != my_gen {
-                                        return;
-                                    }
-                                    if let Some(w_ui) = ui_weak.upgrade() {
-                                        if w_ui.get_viewer_index() != idx {
-                                            return;
-                                        }
-                                        let mut buf =
-                                            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
-                                                w, h,
-                                            );
-                                        let pixels = buf.make_mut_slice();
-                                        for (dst, chunk) in
-                                            pixels.iter_mut().zip(data.as_chunks::<4>().0)
-                                        {
-                                            dst.r = chunk[0];
-                                            dst.g = chunk[1];
-                                            dst.b = chunk[2];
-                                            dst.a = chunk[3];
-                                        }
-                                        w_ui.set_viewer_img_w(w as f32);
-                                        w_ui.set_viewer_img_h(h as f32);
-                                        w_ui.set_viewer_image(slint::Image::from_rgba8(buf));
-                                    }
-                                });
+                        // 4.7f — при провале декода показываем ту же
+                        // заглушку, что в галерее: файл не проваливается
+                        // в чёрный экран — его видно и можно листать.
+                        let (data, w, h) = match crate::media::first_frame_rgba(&video_path) {
+                            Ok(frame) => frame,
+                            Err(e) => {
+                                log::warn!("video: {e}");
+                                crate::media::video_placeholder()
                             }
-                            Err(e) => log::warn!("video: {e}"),
-                        }
+                        };
+                        let _ = slint::invoke_from_event_loop(move || {
+                            // Двойная сверка (как у воркера).
+                            if gen.load(Ordering::SeqCst) != my_gen {
+                                return;
+                            }
+                            if let Some(w_ui) = ui_weak.upgrade() {
+                                if w_ui.get_viewer_index() != idx {
+                                    return;
+                                }
+                                let mut buf =
+                                    slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
+                                let pixels = buf.make_mut_slice();
+                                for (dst, chunk) in pixels.iter_mut().zip(data.as_chunks::<4>().0) {
+                                    dst.r = chunk[0];
+                                    dst.g = chunk[1];
+                                    dst.b = chunk[2];
+                                    dst.a = chunk[3];
+                                }
+                                w_ui.set_viewer_img_w(w as f32);
+                                w_ui.set_viewer_img_h(h as f32);
+                                w_ui.set_viewer_image(slint::Image::from_rgba8(buf));
+                            }
+                        });
                     });
                 }
                 if matches!(ext.as_str(), "gif" | "png" | "apng" | "webp") {

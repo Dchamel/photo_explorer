@@ -24,6 +24,58 @@ pub fn is_video(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 4.7f — убрать паддинг строк кадра: Media Foundation отдаёт строку
+/// длиной stride ≥ w*4 (выравнивание по границе). Копируем ровно w*4
+/// байт с каждой строки — иначе w*h*4 != len буфера и миниатюра падает
+/// («буфер кадра не сошёлся»). None — буфер меньше h*stride (битый кадр).
+fn strip_stride(data: &[u8], stride: usize, w: usize, h: usize) -> Option<Vec<u8>> {
+    let row = w * 4;
+    if stride == row {
+        return Some(data.to_vec()); // выравнивание не добавило паддинга
+    }
+    if stride < row || data.len() < h * stride {
+        return None;
+    }
+    let mut out = Vec::with_capacity(h * row);
+    for y in 0..h {
+        let start = y * stride;
+        out.extend_from_slice(&data[start..start + row]);
+    }
+    Some(out)
+}
+
+/// 4.7f — заглушка кадра видео (тёмная карточка 96x96 с белым
+/// треугольником «play»), когда декод не удался (нет кодека в системе,
+/// битый файл): файл НЕ теряется — и галерея, и просмотрщик показывают
+/// заглушку, файл видно и можно открыть/листать.
+pub fn video_placeholder() -> (Vec<u8>, u32, u32) {
+    const SIZE: u32 = 96;
+    // Треугольник «play» (вершины в сетке 96x96, центр кадра).
+    let (ax, ay) = (38.0f32, 30.0f32);
+    let (bx, by) = (38.0f32, 66.0f32);
+    let (cx, cy) = (66.0f32, 48.0f32);
+    let mut data = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            // Внутренность треугольника: знаковые площади к трём рёбрам
+            // без смешанных знаков (все положительные или все отрицательные).
+            let d1 = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+            let d2 = (cx - bx) * (py - by) - (cy - by) * (px - bx);
+            let d3 = (ax - cx) * (py - cy) - (ay - cy) * (px - cx);
+            let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+            let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+            let (r, g, b) = if !(has_neg && has_pos) {
+                (245u8, 245, 245) // треугольник — светлый
+            } else {
+                (38u8, 38, 46) // фон — тёмный
+            };
+            data.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    (data, SIZE, SIZE)
+}
+
 /// 4.7b-1 — декодировать первый кадр видео в RGBA.
 ///
 /// Возвращает (данные RGBA, ширина, высота). Ошибки — строкой: вызывающие
@@ -33,9 +85,10 @@ pub fn is_video(path: &std::path::Path) -> bool {
 pub fn first_frame_rgba(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), String> {
     use windows::core::PCWSTR;
     use windows::Win32::Media::MediaFoundation::{
-        IMFMediaType, IMFSourceReader, MFCreateMediaType, MFCreateSourceReaderFromURL,
-        MFMediaType_Video, MFShutdown, MFStartup, MFVideoFormat_RGB32, MFSTARTUP_LITE,
-        MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SDK_VERSION,
+        IMFAttributes, IMFMediaType, IMFSourceReader, MFCreateAttributes, MFCreateMediaType,
+        MFCreateSourceReaderFromURL, MFMediaType_Video, MFShutdown, MFStartup, MFVideoFormat_RGB32,
+        MFSTARTUP_LITE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+        MF_SDK_VERSION, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
         MF_SOURCE_READER_FIRST_VIDEO_STREAM,
     };
 
@@ -57,14 +110,29 @@ pub fn first_frame_rgba(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), S
     let _mf = MfGuard;
 
     // 2) Source Reader из пути файла (URL — широкая строка с нулём).
+    //    4.7f — ВКЛЮЧАЕМ ВИДЕО-ПРОЦЕССОР: без него Source Reader НЕ
+    //    конвертирует нативный формат декодера (NV12 у H.264/H.265) в
+    //    запрошенный ниже RGB32 — SetCurrentMediaType падает на любом
+    //    реальном видео, ВСЕ миниатюры проваливаются, а галерея молча
+    //    выбрасывает файлы (корень «видео не видно в галерее»).
     let url: Vec<u16> = path
         .as_os_str()
         .to_string_lossy()
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
+    let attrs = unsafe {
+        let mut attrs_opt: Option<IMFAttributes> = None;
+        MFCreateAttributes(&mut attrs_opt, 0)
+            .map_err(|e| format!("video: MFCreateAttributes: {e}"))?;
+        let attrs = attrs_opt.ok_or_else(|| "video: MFCreateAttributes: пусто".to_string())?;
+        attrs
+            .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
+            .map_err(|e| format!("video: включить видео-процессор: {e}"))?;
+        attrs
+    };
     let reader: IMFSourceReader = unsafe {
-        MFCreateSourceReaderFromURL(PCWSTR(url.as_ptr()), None)
+        MFCreateSourceReaderFromURL(PCWSTR(url.as_ptr()), Some(&attrs))
             .map_err(|e| format!("video: открыть «{}»: {e}", path.display()))?
     };
 
@@ -130,19 +198,34 @@ pub fn first_frame_rgba(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), S
         }
 
         // Размеры кадра — из MF_MT_FRAME_SIZE (u64: старшие 32 = W,
-        // младшие 32 = H).
-        let (w, h) = unsafe {
+        // младшие 32 = H). Заодно stride (4.7f): длина строки в памяти
+        // может быть БОЛЬШЕ w*4 из-за выравнивания.
+        let (w, h, stride) = unsafe {
             let cur: IMFMediaType = reader
                 .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
                 .map_err(|e| format!("video: GetCurrentMediaType: {e}"))?;
             let packed = cur
                 .GetUINT64(&MF_MT_FRAME_SIZE)
                 .map_err(|e| format!("video: MF_MT_FRAME_SIZE: {e}"))?;
-            ((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32)
+            let w = (packed >> 32) as u32;
+            let h = (packed & 0xFFFF_FFFF) as u32;
+            // Stride: MF_MT_DEFAULT_STRIDE может отсутствовать — тогда
+            // вычисляем из длины буфера (ровно h строк по stride байт).
+            // Отрицательный stride (перевёрнутый кадр) приходит огромным
+            // u32 — такой случай не трактуем как длину строки.
+            let stride = match cur.GetUINT32(&MF_MT_DEFAULT_STRIDE) {
+                Ok(s) if s != 0 && (s as i32) > 0 => s as usize,
+                _ => data.len() / h.max(1) as usize,
+            };
+            (w, h, stride)
         };
         if w == 0 || h == 0 {
             return Err("video: нулевые размеры кадра".to_string());
         }
+
+        // 4.7f — режем паддинг построчно: без этого w*h*4 != len и
+        // миниатюра падает на «буфер кадра не сошёлся».
+        let data = strip_stride(&data, stride, w as usize, h as usize).unwrap_or(data);
 
         frame = Some((data, w, h));
         break;
@@ -168,7 +251,7 @@ pub fn first_frame_rgba(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), S
 
 #[cfg(test)]
 mod tests {
-    use super::is_video;
+    use super::{is_video, strip_stride};
     use std::path::Path;
 
     #[test]
@@ -191,5 +274,53 @@ mod tests {
         px[3] = 255;
         // RGBA: красный 255, зелёный 128, синий 0, альфа 255.
         assert_eq!(px, [0, 128, 255, 255]);
+    }
+
+    /// 4.7f — буфер со stride > w*4: паддинг каждой строки отбрасывается,
+    /// на выходе ровно w*h*4 байт настоящих пикселей.
+    #[test]
+    fn stride_padding_is_stripped() {
+        // 2 пикселя в ширину, 2 строки, stride 12 (паддинг 4 байта).
+        let data = [
+            1u8, 2, 3, 255, 5, 6, 7, 255, 99, 99, 99, 99, //
+            9, 10, 11, 255, 13, 14, 15, 255, 88, 88, 88, 88,
+        ];
+        let out = strip_stride(&data, 12, 2, 2).expect("паддинг режется");
+        assert_eq!(
+            out,
+            [1u8, 2, 3, 255, 5, 6, 7, 255, 9, 10, 11, 255, 13, 14, 15, 255]
+        );
+    }
+
+    /// 4.7f — stride ровно w*4: паддинга нет, данные проходят как есть.
+    #[test]
+    fn stride_equal_row_is_passthrough() {
+        let data = [1u8, 2, 3, 255, 4, 5, 6, 255];
+        let out = strip_stride(&data, 8, 2, 1).expect("без паддинга");
+        assert_eq!(out, data);
+    }
+
+    /// 4.7f — защита: stride меньше w*4 или буфер короче h*stride → None
+    /// (битый кадр не превращаем в мусорную картинку).
+    #[test]
+    fn stride_broken_buffer_is_none() {
+        assert!(strip_stride(&[0u8; 8], 4, 2, 1).is_none()); // stride < w*4
+        assert!(strip_stride(&[0u8; 8], 16, 2, 2).is_none()); // буфера мало
+    }
+
+    /// 4.7f — заглушка: размер ровно 96*96*4, альфа всюду 255,
+    /// центр светлый (треугольник), угол тёмный (фон).
+    #[test]
+    fn placeholder_is_opaque_card() {
+        let (data, w, h) = super::video_placeholder();
+        assert_eq!((w, h), (96, 96));
+        assert_eq!(data.len(), 96 * 96 * 4);
+        assert!(data.as_chunks::<4>().0.iter().all(|px| px[3] == 255));
+        let at = |x: usize, y: usize| {
+            let i = (y * 96 + x) * 4;
+            (data[i], data[i + 1], data[i + 2])
+        };
+        assert_eq!(at(48, 48), (245, 245, 245)); // центр — треугольник
+        assert_eq!(at(4, 4), (38, 38, 46)); // угол — фон
     }
 }
