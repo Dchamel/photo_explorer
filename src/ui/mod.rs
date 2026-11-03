@@ -1156,10 +1156,17 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         match crate::media::VideoStream::open(&video_path) {
                             Ok(mut stream) => {
                                 let (w, h) = stream.size();
-                                log::info!("video: поток открыт {w}x{h} (проигрывание)");
+                                // 4.7i — длительность СРАЗУ (шкала 0..конец
+                                // фиксирована, как в плеере): через source
+                                // resolver, без чтения кадров.
+                                let duration_ms =
+                                    (crate::media::video_duration_100ns(&video_path) / 10_000)
+                                        .max(1) as i32;
+                                log::info!(
+                                    "video: поток открыт {w}x{h}, длительность {duration_ms} мс"
+                                );
                                 // Панель 4.7d: включаем; бегунок = позиция
-                                // в видео (мс), максимум уточняется по ходу
-                                // (длительность считаем из таймингов кадров).
+                                // в видео (мс), максимум = длительность.
                                 let ap = anim_playing.clone();
                                 let ui_weak_start = ui_weak.clone();
                                 let _ = slint::invoke_from_event_loop(move || {
@@ -1169,17 +1176,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                         // 4.7b-2-fix — режим ВИДЕО: шкала
                                         // в секундах, флаг включён.
                                         w_ui.set_anim_is_video(true);
-                                        w_ui.set_anim_total(1);
+                                        w_ui.set_anim_total(duration_ms);
                                         w_ui.set_anim_frame(0);
                                         w_ui.set_anim_paused(false);
                                     }
                                 });
-                                playback.set_total(1);
+                                playback.set_total(duration_ms as usize);
                                 playback.set_frame(0);
                                 playback.set_paused(false);
-                                // Максимальный тайминг кадра (длительность
-                                // по ходу; обновляем бегунок при росте).
-                                let mut max_ms: i32 = 1;
                                 // Начало воспроизведения (для пауз между кадрами).
                                 let mut started = std::time::Instant::now();
                                 'video: loop {
@@ -1229,20 +1233,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                             break 'video;
                                         }
                                     };
-                                    // Длительность по ходу: новый максимум
-                                    // тайминга → обновить бегунок (UI).
+                                    // Текущая позиция (мс) — бегунок.
                                     let pos_ms = (frame.time_100ns / 10_000).max(0) as i32;
-                                    if pos_ms + 40 > max_ms {
-                                        max_ms = pos_ms + 40;
-                                        let ui_weak_total = ui_weak.clone();
-                                        let total_i32 = max_ms;
-                                        let _ = slint::invoke_from_event_loop(move || {
-                                            if let Some(w_ui) = ui_weak_total.upgrade() {
-                                                w_ui.set_anim_total(total_i32);
-                                            }
-                                        });
-                                        playback.set_total(total_i32 as usize);
-                                    }
                                     // Пауза до тайминга кадра: кадр N должен
                                     // появиться в момент time_100ns от начала,
                                     // МАСШТАБИРОВАННЫЙ скоростью (×0.5 — вдвое
@@ -2181,12 +2173,6 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let thumbs = thumbs.clone();
         let ui_weak = ui_weak.clone();
         let gallery_gen = gallery_gen.clone();
-        // 4.7g — видео уходит в отдельный проход (пути, не миниатюры).
-        let videos: Vec<std::path::PathBuf> = photos
-            .iter()
-            .filter(|p| crate::media::is_video(&p.path))
-            .map(|p| p.path.clone())
-            .collect();
         std::thread::spawn(move || {
             // Первый батч 200 — сетка оживает сразу; остальные по 150.
             // ВАЖНО: срез [..200] даёт РОВНО один кусок (chunks не выйдет за
@@ -2202,29 +2188,20 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 // 4.7g — видео в батчах НЕ декодируется (быстро): вместо
                 // MF-кадра — мгновенная заглушка; настоящий кадр придёт
                 // фоновым проходом ниже и подменит карточку.
-                // 4.7h — (Thumbnail, is_broken): провал декода = битый.
+                // 4.7i — (Thumbnail, is_broken): провал декода = битый.
+                // ВИДЕО идёт тем же путём, что фото: thumbs.thumbnail()
+                // (MF-кадр → PNG-кэш). Первый скан декодирует видео ОДИН
+                // раз и кэширует; следующий запуск — мгновенно из кэша.
+                // Отдельный «видео-проход» 4.7g УДАЛЁН: он передекодировал
+                // все видео на каждом запуске (кэш не писался) — 30 секунд
+                // CPU-голода и «фото не листаются».
                 let results: Vec<(crate::core::models::Thumbnail, bool)> = chunk
                     .iter()
                     .map(|photo| {
-                        if crate::media::is_video(&photo.path) {
-                            // Заглушка: без декода, без кэша (кэш проверит
-                            // видео-проход — там же запишется настоящий кадр).
-                            let (data, w, h) = crate::media::video_placeholder();
-                            (
-                                crate::core::models::Thumbnail {
-                                    source_path: photo.path.clone(),
-                                    width: w,
-                                    height: h,
-                                    data,
-                                },
-                                false,
-                            )
-                        } else {
-                            thumbs
-                                .thumbnail(photo)
-                                .map(|t| (t, false))
-                                .unwrap_or_else(|_| (placeholder_for(&photo.path), true))
-                        }
+                        thumbs
+                            .thumbnail(photo)
+                            .map(|t| (t, false))
+                            .unwrap_or_else(|_| (placeholder_for(&photo.path), true))
                     })
                     .collect();
                 done += chunk.len();
@@ -2288,51 +2265,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 std::thread::sleep(std::time::Duration::from_millis(30));
             }
             log::info!("gallery: батчи миниатюр завершены ({total})");
-
-            // 4.7g — ВТОРОЙ ПРОХОД: настоящие кадры видео (фоном, после
-            // того как вся галерея уже на экране). Каждый готовый кадр
-            // подменяет заглушку в ОБЕИХ моделях (полная + отображаемая)
-            // по ПУТИ — карточка не меняет позицию, меняется только картинка.
-            let ui_weak = ui_weak.clone();
-            let gallery_gen = gallery_gen.clone();
-            std::thread::spawn(move || {
-                let mut ready = 0usize;
-                for path in &videos {
-                    // Проект закрыли/сменён — проход отменяется.
-                    if gallery_gen.load(Ordering::SeqCst) != my_gen {
-                        return;
-                    }
-                    // Кэш миниатюр: если настоящий кадр уже в PNG-кэше —
-                    // берём оттуда (быстро, без MF).
-                    let thumb = thumbs
-                        .thumbnail(&Photo {
-                            path: path.clone(),
-                            file_name: String::new(),
-                            size_bytes: 0,
-                            modified: 0,
-                        })
-                        .ok();
-                    let Some(thumb) = thumb else {
-                        continue; // декод не удался — заглушка остаётся
-                    };
-                    ready += 1;
-                    // Thumbnail (чистый RGBA, Send) — через границу потока;
-                    // ThumbItem (slint::Image, не-Send) строим в UI-потоке.
-                    let ui_weak = ui_weak.clone();
-                    let gallery_gen = gallery_gen.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if gallery_gen.load(Ordering::SeqCst) != my_gen {
-                            return;
-                        }
-                        if let Some(w) = ui_weak.upgrade() {
-                            // Видео-проход: настоящий кадр — файл НЕ битый.
-                            let item = thumb_item_from(thumb, false);
-                            replace_thumb_by_path(&w, &item);
-                        }
-                    });
-                }
-                log::info!("gallery: видео-кадры готовы ({ready} из {})", videos.len());
-            });
+            // 4.7i — отдельный «видео-проход» УДАЛЁН: видео теперь идёт
+            // через общий кэш в батчах (см. комментарий выше). Прежний
+            // проход передекодировал все видео на каждом запуске —
+            // CPU-голод 30 сек, «фото не листаются».
         });
     }
 
@@ -2349,25 +2285,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         }
     }
 
-    /// 4.7g — подменить карточку миниатюры по ПУТИ в обеих моделях
-    /// (полная + отображаемая). Карточка не меняет позицию — только картинку.
-    fn replace_thumb_by_path(w: &GalleryScreen, new_item: &ThumbItem) {
-        use slint::Model;
-        let target = new_item.source_path.clone();
-        for model in [w.get_full_thumbnails(), w.get_thumbnails()] {
-            if let Some(vm) = model.as_any().downcast_ref::<slint::VecModel<ThumbItem>>() {
-                for row in 0..vm.row_count() {
-                    if let Some(mut it) = vm.row_data(row) {
-                        if it.source_path.as_str() == target.as_str() {
-                            it.image = new_item.image.clone();
-                            vm.set_row_data(row, it);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // 4.7i — replace_thumb_by_path удалён вместе с «видео-проходом» 4.7g:
+    // видео теперь строится и кэшируется в общих батчах миниатюр.
 
     /// Запускает выбор папки + скан + генерацию миниатюр в фоновом потоке.
     /// 4.7 — после успешного скана сохраняет сессию (recent) в хранилище:

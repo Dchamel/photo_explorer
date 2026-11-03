@@ -332,6 +332,48 @@ impl VideoStream {
     }
 }
 
+/// 4.7i — длительность видео (100-наносекундные единицы). Прямого
+/// GetDuration у IMFSourceReader в windows 0.61 нет, resolver-путь
+/// капризен — считаем ПРОГОНОМ кадров (тайминг последнего), результат
+/// кэшируем рядом с миниатюрой (файл .dur): первый запуск видео
+/// посчитает один раз, дальше — мгновенно.
+#[cfg(windows)]
+pub fn video_duration_100ns(path: &std::path::Path) -> i64 {
+    // Кэш: файл рядом с PNG миниатюрой (тот же каталог, суффикс .dur).
+    let cache_dir = std::env::temp_dir().join("photo_explorer_thumbs_cache");
+    let key = format!("{:?}", path.to_string_lossy());
+    let hash = {
+        // Простой стабильный хэш пути (FNV-1a) — без новых зависимостей.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in key.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        format!("{h:016x}")
+    };
+    let dur_file = cache_dir.join(format!("{hash}.dur"));
+    if let Ok(text) = std::fs::read_to_string(&dur_file) {
+        if let Ok(v) = text.trim().parse::<i64>() {
+            return v;
+        }
+    }
+    // Прогон: читаем кадры до конца, берём максимальный тайминг.
+    let mut max_100ns: i64 = 0;
+    let mut stream = match VideoStream::open(path) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    while let Ok(Some(f)) = stream.next_frame() {
+        if f.time_100ns > max_100ns {
+            max_100ns = f.time_100ns;
+        }
+    }
+    // Кэшируем (ошибка записи не критична).
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let _ = std::fs::write(&dur_file, max_100ns.to_string());
+    max_100ns
+}
+
 #[cfg(windows)]
 pub fn first_frame_rgba(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), String> {
     use windows::core::PCWSTR;
