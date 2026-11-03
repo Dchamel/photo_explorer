@@ -323,6 +323,9 @@ export component GalleryScreen inherits Window {
     in-out property <bool> anim-paused: false;
     // Скорость в ДЕСЯТЫХ множителя: 10 = ×1.0, 1 = ×0.1, 20 = ×2.0.
     in-out property <int> anim-speed: 10;
+    // 4.7b-2-fix — панель в режиме ВИДЕО: шкала и подпись в СЕКУНДАХ
+    // («MM:SS / MM:SS», бегунок = мс), у GIF — кадры («Кадр N / M»).
+    in-out property <bool> anim-is-video: false;
     // Диалог переименования проекта (Slint, без нативных диалогов).
     in-out property <bool> rename-visible: false;
     in-out property <string> rename-text: "";
@@ -1005,7 +1008,12 @@ export component GalleryScreen inherits Window {
                             spacing: 8px;
                             alignment: center;
                             Text {
-                                text: "Кадр " + (root.anim-frame + 1) + " / " + root.anim-total;
+                                // 4.7b-2-fix — видео: время MM:SS / MM:SS
+                                // (anim-frame/anim-total в МИЛЛИСЕКУНДАХ);
+                                // GIF: кадры, как было.
+                                property <string> time-label: Math.floor(root.anim-frame / 60000) + ":" + (Math.mod(Math.floor(root.anim-frame / 1000), 60) < 10 ? "0" : "") + Math.mod(Math.floor(root.anim-frame / 1000), 60);
+                                property <string> time-total: Math.floor(root.anim-total / 60000) + ":" + (Math.mod(Math.floor(root.anim-total / 1000), 60) < 10 ? "0" : "") + Math.mod(Math.floor(root.anim-total / 1000), 60);
+                                text: root.anim-is-video ? (time-label + " / " + time-total) : ("Кадр " + (root.anim-frame + 1) + " / " + root.anim-total);
                                 color: #ffffffcc;
                                 font-size: 12px;
                                 vertical-alignment: center;

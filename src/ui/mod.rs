@@ -1097,6 +1097,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             // только если реально запустится (кадров > 1).
             if let Some(w) = self.ui_weak.upgrade() {
                 w.set_anim_active(false);
+                // 4.7b-2-fix — сброс режима видео на новом переходе:
+                // панель следующей анимации начнёт с чистой подписи.
+                w.set_anim_is_video(false);
             }
             if show_thumb {
                 self.show_thumbnail(index, my_gen);
@@ -1163,6 +1166,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                     *lock_or_recover(&ap) = Some((idx, my_gen));
                                     if let Some(w_ui) = ui_weak_start.upgrade() {
                                         w_ui.set_anim_active(true);
+                                        // 4.7b-2-fix — режим ВИДЕО: шкала
+                                        // в секундах, флаг включён.
+                                        w_ui.set_anim_is_video(true);
                                         w_ui.set_anim_total(1);
                                         w_ui.set_anim_frame(0);
                                         w_ui.set_anim_paused(false);
@@ -1180,6 +1186,18 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                     // Поколение сменилось — ушли с видео, стоп.
                                     if gen.load(Ordering::SeqCst) != my_gen {
                                         break 'video;
+                                    }
+                                    // 4.7b-2-fix — ПЕРЕМОТКА: бегунок прислал
+                                    // позицию (мс) — прыгаем (промоткой ридера
+                                    // до нужного тайминга) и сбрасываем отсчёт.
+                                    if let Some(seek_ms) = playback.take_seek() {
+                                        let target_100ns = i64::from(seek_ms) * 10_000;
+                                        if stream.seek_100ns(target_100ns).is_ok() {
+                                            started = std::time::Instant::now()
+                                                - std::time::Duration::from_nanos(
+                                                    (target_100ns.max(0) as u64) * 100,
+                                                );
+                                        }
                                     }
                                     // Пауза (панель): крутимся на месте, кадр
                                     // держится, время НЕ течёт (started сдвигаем).
@@ -1226,19 +1244,19 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                         playback.set_total(total_i32 as usize);
                                     }
                                     // Пауза до тайминга кадра: кадр N должен
-                                    // появиться в момент time_100ns от начала.
+                                    // появиться в момент time_100ns от начала,
+                                    // МАСШТАБИРОВАННЫЙ скоростью (×0.5 — вдвое
+                                    // медленнее: время кадра растягивается).
+                                    let speed = playback.speed_tenths();
                                     let due = started
                                         + std::time::Duration::from_nanos(
-                                            (frame.time_100ns.max(0) as u64) * 100,
+                                            (frame.time_100ns.max(0) as u64) * 100 * 10
+                                                / u64::from(speed),
                                         );
                                     let now = std::time::Instant::now();
                                     if due > now {
                                         std::thread::sleep(due - now);
                                     }
-                                    // Скорость из панели (0.1–2.0): пауза
-                                    // масштабируется — время течёт быстрее/медленнее.
-                                    let speed = playback.speed_tenths();
-                                    let _ = speed; // 4.7b-2: скорость применится в 4.7b-4 (с перемоткой)
                                     let data = frame.data;
                                     let fw = frame.w;
                                     let fh = frame.h;
@@ -1821,6 +1839,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     *lock_or_recover(&ap) = Some((index, my_gen));
                     if let Some(w) = ui_weak_start.upgrade() {
                         w.set_anim_active(true);
+                        // 4.7b-2-fix — GIF: режим КАДРОВ (не видео).
+                        w.set_anim_is_video(false);
                         w.set_anim_total(total_i32);
                         w.set_anim_frame(0);
                         w.set_anim_paused(false);
