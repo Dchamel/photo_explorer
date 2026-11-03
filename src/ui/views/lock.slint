@@ -48,6 +48,31 @@ component TabButton inherits Rectangle {
     TouchArea { clicked => { root.clicked(); } }
 }
 
+// 4.7e — галочка фильтра расширений: компактная кнопка-тумблер
+// (подсветка = тип показывается).
+component FilterCheck inherits Rectangle {
+    in property <string> label;
+    in property <bool> checked;
+    callback toggled(bool);
+    height: 28px;
+    border-radius: 6px;
+    background: root.checked ? #2a4d6f : #ffffff0a;
+    border-width: root.checked ? 1px : 0px;
+    border-color: Theme.accent;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        Text {
+            text: (root.checked ? "✓ " : "") + root.label;
+            color: root.checked ? Theme.text-primary : Theme.text-secondary;
+            font-size: 11px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    TouchArea { clicked => { root.toggled(!root.checked); } }
+}
+
 component NavOption inherits Rectangle {
     in property <string> value;
     in property <string> label;
@@ -228,7 +253,29 @@ export component GalleryScreen inherits Window {
     preferred-height: 640px;
 
     in-out property <[ThumbItem]> thumbnails: [];
+    // 4.7e — ПОЛНАЯ модель миниатюр (все файлы, без фильтра): батчи
+    // пишут сюда, фильтр пересобирает отображаемую `thumbnails` из неё.
+    in-out property <[ThumbItem]> full-thumbnails: [];
     in-out property <bool> scanning: false;
+    // --- 4.7e — фильтр галереи по расширениям (точечный отбор) ---
+    // 10 групп: JPG (jpg+jpeg), PNG, GIF, BMP, WEBP, MP4, WEBM, MOV, MKV, AVI.
+    // По умолчанию все ВКЛ (показываем всё). Снял галочку — тип скрылся.
+    in-out property <bool> filter-jpg: true;
+    in-out property <bool> filter-png: true;
+    in-out property <bool> filter-gif: true;
+    in-out property <bool> filter-bmp: true;
+    in-out property <bool> filter-webp: true;
+    in-out property <bool> filter-mp4: true;
+    in-out property <bool> filter-webm: true;
+    in-out property <bool> filter-mov: true;
+    in-out property <bool> filter-mkv: true;
+    in-out property <bool> filter-avi: true;
+    // Панель фильтра раскрыта?
+    in-out property <bool> filter-visible: false;
+    // Сигнал «галочка сменилась» — Rust пересобирает отфильтрованную модель.
+    callback filter-changed();
+    // «Все» / «Ничего» — быстрый сброс.
+    callback filter-set-all(bool);
     in-out property <string> status-text: "Выберите папку, чтобы увидеть фото";
     in-out property <string> error-text: "";
     // 4.7 — экран «Проекты» (стартовый, VS Code Welcome) поверх галереи.
@@ -511,6 +558,83 @@ export component GalleryScreen inherits Window {
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
+            // 4.7e — панель фильтра по расширениям (точечный отбор на 10к
+            // файлов). Кнопка-тумблер раскрывает полосу галочек.
+            HorizontalLayout {
+                height: 40px;
+                padding: 4px;
+                spacing: 8px;
+                // Тумблер «Фильтр» (подсветка = панель раскрыта).
+                Rectangle {
+                    width: 96px;
+                    border-radius: 8px;
+                    background: root.filter-visible ? #2a4d6f : #ffffff0d;
+                    border-width: root.filter-visible ? 1px : 0px;
+                    border-color: Theme.accent;
+                    TouchArea { clicked => { root.filter-visible = !root.filter-visible; } }
+                    Text {
+                        text: "⚙ Фильтр";
+                        color: Theme.text-primary;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                // Раскрытая полоса: галочки + Все/Ничего.
+                if root.filter-visible : Rectangle {
+                    horizontal-stretch: 1;
+                    border-radius: 8px;
+                    background: #ffffff08;
+                    Flickable {
+                        width: parent.width - 8px;
+                        height: parent.height;
+                        HorizontalLayout {
+                            padding: 4px;
+                            spacing: 6px;
+                            alignment: center;
+                            // «Все» / «Ничего» — быстрый сброс.
+                            Rectangle {
+                                width: 52px;
+                                border-radius: 6px;
+                                background: #ffffff14;
+                                TouchArea { clicked => { root.filter-set-all(true); } }
+                                Text {
+                                    text: "Все";
+                                    color: Theme.accent;
+                                    font-size: 11px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Rectangle {
+                                width: 64px;
+                                border-radius: 6px;
+                                background: #ffffff14;
+                                TouchArea { clicked => { root.filter-set-all(false); } }
+                                Text {
+                                    text: "Ничего";
+                                    color: Theme.text-secondary;
+                                    font-size: 11px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            // 10 галочек расширений (компонент ниже).
+                            FilterCheck { label: "JPG";  checked: root.filter-jpg;  toggled(v) => { root.filter-jpg = v; root.filter-changed(); } }
+                            FilterCheck { label: "PNG";  checked: root.filter-png;  toggled(v) => { root.filter-png = v; root.filter-changed(); } }
+                            FilterCheck { label: "GIF";  checked: root.filter-gif;  toggled(v) => { root.filter-gif = v; root.filter-changed(); } }
+                            FilterCheck { label: "BMP";  checked: root.filter-bmp;  toggled(v) => { root.filter-bmp = v; root.filter-changed(); } }
+                            FilterCheck { label: "WEBP"; checked: root.filter-webp; toggled(v) => { root.filter-webp = v; root.filter-changed(); } }
+                            FilterCheck { label: "MP4";  checked: root.filter-mp4;  toggled(v) => { root.filter-mp4 = v; root.filter-changed(); } }
+                            FilterCheck { label: "WEBM"; checked: root.filter-webm; toggled(v) => { root.filter-webm = v; root.filter-changed(); } }
+                            FilterCheck { label: "MOV";  checked: root.filter-mov;  toggled(v) => { root.filter-mov = v; root.filter-changed(); } }
+                            FilterCheck { label: "MKV";  checked: root.filter-mkv;  toggled(v) => { root.filter-mkv = v; root.filter-changed(); } }
+                            FilterCheck { label: "AVI";  checked: root.filter-avi;  toggled(v) => { root.filter-avi = v; root.filter-changed(); } }
+                        }
+                    }
+                }
+            }
+
             // Адаптивная сетка миниатюр: карточки позиционируются по индексу.
             grid := Flickable {
                 property <length> card-w: 180px;

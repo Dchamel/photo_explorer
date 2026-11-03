@@ -1936,6 +1936,42 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         }
     }
 
+    /// 4.7e — проходит ли миниатюра фильтр расширений (по ПУТИ файла).
+    /// Чистая функция: (галочки из UI) × (путь) → да/нет.
+    fn passes_filter(w: &GalleryScreen, path: &str) -> bool {
+        let ext = path
+            .rsplit('.')
+            .next()
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "jpg" | "jpeg" => w.get_filter_jpg(),
+            "png" => w.get_filter_png(),
+            "gif" => w.get_filter_gif(),
+            "bmp" => w.get_filter_bmp(),
+            "webp" => w.get_filter_webp(),
+            "mp4" => w.get_filter_mp4(),
+            "webm" => w.get_filter_webm(),
+            "mov" => w.get_filter_mov(),
+            "mkv" => w.get_filter_mkv(),
+            "avi" => w.get_filter_avi(),
+            _ => true, // неизвестное расширение — показываем (не теряем)
+        }
+    }
+
+    /// 4.7e — пересобрать ОТОБРАЖАЕМУЮ модель из ПОЛНОЙ (Slint-модель
+    /// full-thumbnails) по фильтру. Вызывается при смене галочек.
+    fn rebuild_filtered_thumbnails(w: &GalleryScreen) {
+        use slint::Model;
+        let full = w.get_full_thumbnails();
+        let filtered: Vec<ThumbItem> = full
+            .iter()
+            .filter(|it| passes_filter(w, it.source_path.as_ref()))
+            .collect();
+        // Заменяем модель целиком — сетка перерисуется.
+        w.set_thumbnails(slint::ModelRc::new(slint::VecModel::from(filtered)));
+    }
+
     /// 4.4b — ПОРЦИОННАЯ загрузка миниатюр в галерею (чинит «тупит 30-60 сек»
     /// на 10k фото). Первый батч (FIRST_BATCH=200) заменяет модель — сетка
     /// оживает сразу; остальные добавляются батчами по BATCH=150 в фоне
@@ -1945,6 +1981,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     /// если открыли другой (иначе чужие миниатюры подмешаются в сетку).
     /// Хэндл VecModel (не-Send) живёт в UI-потоке — фон добирается до него
     /// через invoke_from_event_loop, где берёт модель из UI и downcast'ит.
+    /// 4.7e — батчи пишут в ПОЛНУЮ Slint-модель (full-thumbnails);
+    /// отображаемая (thumbnails) — только прошедшие фильтр.
     fn load_thumbs_batched(
         photos: Vec<Photo>,
         thumbs: &Arc<FileSystemThumbnailProvider>,
@@ -1987,18 +2025,39 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     if let Some(w) = ui_weak.upgrade() {
                         // ThumbItem (не-Send) строим ЗДЕСЬ, в UI-потоке.
                         let items: Vec<ThumbItem> = raw.into_iter().map(thumb_item_from).collect();
+                        use slint::Model;
+                        // 4.7e — первый батч: полная модель = срез,
+                        // отображаемая = отфильтрованная.
                         if is_first {
-                            w.set_thumbnails(slint::ModelRc::new(slint::VecModel::from(items)));
+                            w.set_full_thumbnails(slint::ModelRc::new(slint::VecModel::from(
+                                items.clone(),
+                            )));
+                            let filtered: Vec<ThumbItem> = items
+                                .into_iter()
+                                .filter(|it| passes_filter(&w, it.source_path.as_ref()))
+                                .collect();
+                            w.set_thumbnails(slint::ModelRc::new(slint::VecModel::from(filtered)));
                         } else {
-                            // Добавляем в ТУ ЖЕ модель: скролл не сбрасывается.
-                            use slint::Model;
+                            // 4.7e — дописываем в ПОЛНУЮ; в отображаемую —
+                            // только прошедшие фильтр (скролл не сбрасывается).
+                            if let Some(full_model) = w
+                                .get_full_thumbnails()
+                                .as_any()
+                                .downcast_ref::<slint::VecModel<ThumbItem>>()
+                            {
+                                for it in &items {
+                                    full_model.push(it.clone());
+                                }
+                            }
                             if let Some(model) = w
                                 .get_thumbnails()
                                 .as_any()
                                 .downcast_ref::<slint::VecModel<ThumbItem>>()
                             {
                                 for it in items {
-                                    model.push(it);
+                                    if passes_filter(&w, it.source_path.as_ref()) {
+                                        model.push(it);
+                                    }
                                 }
                             }
                         }
@@ -2423,6 +2482,35 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         ui.on_close_settings(move || {
             if let Some(w) = ui_weak.upgrade() {
                 w.set_settings_visible(false);
+            }
+        });
+    }
+    // 4.7e — галочка фильтра сменилась: пересобрать отображаемую модель
+    // из полной по активным расширениям (мгновенно, миниатюры не трогаем).
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_filter_changed(move || {
+            if let Some(w) = ui_weak.upgrade() {
+                rebuild_filtered_thumbnails(&w);
+            }
+        });
+    }
+    // 4.7e — «Все»/«Ничего»: выставить все галочки и пересобрать модель.
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_filter_set_all(move |on| {
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_filter_jpg(on);
+                w.set_filter_png(on);
+                w.set_filter_gif(on);
+                w.set_filter_bmp(on);
+                w.set_filter_webp(on);
+                w.set_filter_mp4(on);
+                w.set_filter_webm(on);
+                w.set_filter_mov(on);
+                w.set_filter_mkv(on);
+                w.set_filter_avi(on);
+                rebuild_filtered_thumbnails(&w);
             }
         });
     }
