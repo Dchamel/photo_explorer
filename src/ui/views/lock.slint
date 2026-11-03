@@ -331,6 +331,7 @@ export component GalleryScreen inherits Window {
     callback rename-cancel();        // отменить переименование
     callback open-settings();        // открыть панель настроек проекта
     callback close-settings();       // закрыть панель настроек
+    callback rescan-project();       // 4.7e-fix3 — свежий скан папки проекта
     callback set-nav-mode(string);   // 4.4a — сменить режим листания проекта
     // 4.6c — «Ультра-скорость»: галка и число ядер (глобальные настройки).
     callback set-ultra-speed(bool);  // включить/выключить ускорение
@@ -458,6 +459,25 @@ export component GalleryScreen inherits Window {
                     }
                 }
                 Rectangle { horizontal-stretch: 1; }
+                // 4.7e-fix3 — «🔄 Пересканировать»: свежий скан папки с
+                // диска (кэш сессии мог быть записан старой версией —
+                // например, до поддержки видео).
+                Rectangle {
+                    width: 150px;
+                    height: 36px;
+                    border-radius: 8px;
+                    background: #ffffff14;
+                    border-width: 1px;
+                    border-color: Theme.accent;
+                    TouchArea { clicked => { root.rescan-project(); } }
+                    Text {
+                        text: "🔄 Пересканировать";
+                        color: Theme.text-primary;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
                 // «⚙ Настройки» проекта (каркас под 4.4).
                 Rectangle {
                     width: 130px;

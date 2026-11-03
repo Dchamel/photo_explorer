@@ -2466,6 +2466,95 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
         });
     }
+    // 4.7e-fix3 — «🔄 Пересканировать»: свежий скан папки проекта с диска.
+    // Кэш сессии мог быть записан СТАРОЙ версией (например, до поддержки
+    // видео) — кнопка честно обновляет список и кэш, без удаления сессии.
+    {
+        let store = store.clone();
+        let scanner = scanner.clone();
+        let thumbs = thumbs.clone();
+        let ui_weak = ui.as_weak();
+        let photos = photos.clone();
+        let gallery_gen = gallery_gen.clone();
+        ui.on_rescan_project(move || {
+            // id открытого проекта; пустой = галерея из диалога, не сессия.
+            let id: String = ui_weak
+                .upgrade()
+                .map(|w| w.get_current_session_id().to_string())
+                .unwrap_or_default();
+            if id.is_empty() {
+                log::warn!("rescan: проект не открыт — нечего пересканировать");
+                return;
+            }
+            let session = match store.load(&id) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("rescan: сессия не читается: {e}");
+                    return;
+                }
+            };
+            log::info!(
+                "rescan: пересканирую «{}» ({})",
+                session.name,
+                session.folder.display()
+            );
+            if let Some(w) = ui_weak.upgrade() {
+                w.set_status_text("Пересканирую папку…".into());
+            }
+            let store_bg = store.clone();
+            let scanner_bg = scanner.clone();
+            let thumbs_bg = thumbs.clone();
+            let ui_weak_bg = ui_weak.clone();
+            let photos_bg = photos.clone();
+            let gallery_gen_bg = gallery_gen.clone();
+            std::thread::spawn(move || {
+                // Свежий скан в режиме сессии.
+                let mode = if session.mode == "recursive" {
+                    ScanMode::FolderRecursive(session.folder.clone())
+                } else {
+                    ScanMode::SingleFolder(session.folder.clone())
+                };
+                let fresh = match scanner_bg.scan(&mode) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::error!("rescan: скан не удался: {e}");
+                        if let Some(w) = ui_weak_bg.upgrade() {
+                            w.set_status_text("Пересканирование не удалось".into());
+                        }
+                        return;
+                    }
+                };
+                let fresh_fp = fingerprint_of(&fresh);
+                log::info!(
+                    "rescan: найдено {} файлов (было {})",
+                    fresh.len(),
+                    session.photos.len()
+                );
+                // Обновляем сессию: новый список + fingerprint.
+                let mut updated = session.clone();
+                updated.photos = fresh.clone();
+                updated.fingerprint = fresh_fp;
+                if let Err(e) = store_bg.save(&updated) {
+                    log::error!("rescan: не удалось сохранить сессию: {e}");
+                }
+                // Показ: список для viewer сразу, миниатюры порционно.
+                *lock_or_recover(&photos_bg) = fresh.clone();
+                let _ = slint::invoke_from_event_loop({
+                    let ui_weak_bg = ui_weak_bg.clone();
+                    let name = updated.name.clone();
+                    move || {
+                        if let Some(w) = ui_weak_bg.upgrade() {
+                            w.set_status_text(
+                                format!("Проект «{name}»: пересканировано, фото").into(),
+                            );
+                        }
+                    }
+                });
+                let prefix = format!("Проект «{}»: пересканировано, фото", updated.name);
+                load_thumbs_batched(fresh, &thumbs_bg, &ui_weak_bg, &gallery_gen_bg, prefix);
+            });
+        });
+    }
     // 4.7g — открыть панель настроек проекта (каркас под 4.4).
     {
         let ui_weak = ui.as_weak();
