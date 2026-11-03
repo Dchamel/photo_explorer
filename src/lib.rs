@@ -5,6 +5,9 @@
 
 pub mod core;
 pub mod logging;
+// 4.7b — декод видео (Media Foundation): инфраструктура, нужна и
+// миниатюрам (превью-кадр), и просмотрщику (первый кадр)
+pub mod media;
 pub mod scanner;
 pub mod security;
 // 4.7 — сессионное хранилище (проекты/недавние)

@@ -9,7 +9,6 @@ slint::include_modules!();
 
 mod anim_cache;
 mod anim_playback;
-mod video;
 
 use anim_cache::{AnimFrame, AnimFramesCache, ANIM_CACHE_MAX_BYTES};
 use anim_playback::{effective_delay_ms, AnimPlayback};
@@ -1133,7 +1132,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         if gen.load(Ordering::SeqCst) != my_gen {
                             return;
                         }
-                        match video::first_frame_rgba(&video_path) {
+                        match crate::media::first_frame_rgba(&video_path) {
                             Ok((data, w, h)) => {
                                 let _ = slint::invoke_from_event_loop(move || {
                                     // Двойная сверка (как у воркера).

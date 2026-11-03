@@ -1,8 +1,7 @@
-//! 4.7b-1 — видео через Windows Media Foundation (Source Reader).
+//! 4.7b — декодирование видео через Windows Media Foundation.
 //!
-//! Этап 1: открыть mp4/webm/mov и декодировать ПЕРВЫЙ кадр в RGBA —
-//! проверка, что декодер собирается и работает, и «превью» видео в
-//! просмотрщике (проигрывание — 4.7b-2, звук — 4.7b-3).
+//! Инфраструктурный модуль (не UI): нужен и миниатюрам (превью-кадр
+//! видео в галерее), и просмотрщику (первый кадр при открытии).
 //!
 //! Почему Media Foundation, а не ffmpeg: системный API Windows 10/11 —
 //! НУЛЕВОЙ дополнительный вес exe (крейт windows уже в проекте),
@@ -10,15 +9,28 @@
 //! ~50–100 МБ DLL, раздувание exe и усиление SmartScreen-проблемы.
 //!
 //! Почему Source Reader, а не MediaEngine: нам нужны САМИ кадры (пишем
-//! в единый viewer-image, как аниматор GIF), а MediaEngine рисует в
-//! свою поверхность — конфликт с архитектурой единого слоя.
+//! в единый viewer-image и строим миниатюры), а MediaEngine рисует в
+//! свою поверхность.
+
+/// Видео-расширения, которые умеет декодировать Media Foundation
+/// (совпадает со списком сканера).
+pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "webm", "mov", "mkv", "avi"];
+
+/// Это путь к видео? (по расширению, без учёта регистра)
+pub fn is_video(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| VIDEO_EXTENSIONS.iter().any(|&v| e.eq_ignore_ascii_case(v)))
+        .unwrap_or(false)
+}
 
 /// 4.7b-1 — декодировать первый кадр видео в RGBA.
 ///
-/// Возвращает (данные RGBA, ширина, высота). Ошибки — строкой (файл
-/// покажется как битый — обычный путь скипа сработает).
+/// Возвращает (данные RGBA, ширина, высота). Ошибки — строкой: вызывающие
+/// ветки (миниатюры, просмотрщик) показывают файл как «битый» — обычный
+/// путь скипа сработает.
 #[cfg(windows)]
-pub(crate) fn first_frame_rgba(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), String> {
+pub fn first_frame_rgba(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), String> {
     use windows::core::PCWSTR;
     use windows::Win32::Media::MediaFoundation::{
         IMFMediaType, IMFSourceReader, MFCreateMediaType, MFCreateSourceReaderFromURL,
@@ -156,6 +168,19 @@ pub(crate) fn first_frame_rgba(path: &std::path::Path) -> Result<(Vec<u8>, u32, 
 
 #[cfg(test)]
 mod tests {
+    use super::is_video;
+    use std::path::Path;
+
+    #[test]
+    fn video_extensions_detected() {
+        assert!(is_video(Path::new("C:/a/clip.MP4")));
+        assert!(is_video(Path::new("C:/a/clip.mov")));
+        assert!(is_video(Path::new("C:/a/clip.webm")));
+        assert!(!is_video(Path::new("C:/a/photo.jpg")));
+        assert!(!is_video(Path::new("C:/a/photo.png")));
+        assert!(!is_video(Path::new("C:/a/noext")));
+    }
+
     /// 4.7b-1 — контракт конвертации BGRA→RGBA (без MF — чистая логика
     /// свапа каналов, инлайн в first_frame_rgba).
     #[test]

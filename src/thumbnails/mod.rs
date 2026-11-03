@@ -95,7 +95,29 @@ impl ThumbnailProvider for FileSystemThumbnailProvider {
 }
 
 /// Декодирует исходное изображение и строит миниатюру с сохранением пропорций.
+/// 4.7b — ВИДЕО: превью строится из ПЕРВОГО КАДРА через Media Foundation
+/// (image::open не умеет видео — раньше файл терялся из галереи целиком).
 fn generate_thumbnail(source: &Path, max_size: u32) -> Result<Thumbnail, ThumbnailError> {
+    // 4.7b — видео: MF-кадр → тот же downscale, что у фото.
+    if crate::media::is_video(source) {
+        let (data, w, h) =
+            crate::media::first_frame_rgba(source).map_err(ThumbnailError::DecodeFailed)?;
+        let img = image::RgbaImage::from_raw(w, h, data)
+            .ok_or_else(|| ThumbnailError::DecodeFailed("буфер кадра не сошёлся".into()))?;
+        let resized = image::DynamicImage::ImageRgba8(img).resize(
+            max_size,
+            max_size,
+            image::imageops::FilterType::Lanczos3,
+        );
+        let rgba = resized.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        return Ok(Thumbnail {
+            source_path: source.to_path_buf(),
+            width,
+            height,
+            data: rgba.into_raw(),
+        });
+    }
     let img = image::open(source).map_err(|e| ThumbnailError::DecodeFailed(e.to_string()))?;
     let resized = img.resize(max_size, max_size, image::imageops::FilterType::Lanczos3);
     let rgba = resized.to_rgba8();
