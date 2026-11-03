@@ -1927,7 +1927,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     /// 4.4b — строит карточку галереи из миниатюры (RGBA → SharedPixelBuffer
     /// → slint::Image). Раньше этот код копировался в 3 местах (scan_and_show,
     /// открытие сессии, досскан) — теперь одно место (DRY).
-    fn thumb_item_from(t: crate::core::models::Thumbnail) -> ThumbItem {
+    /// 4.7h — is_broken: файл битый (декод провалился, показана заглушка
+    /// «крест»); такие карточки видны только при галочке «⚠ Битые».
+    fn thumb_item_from(t: crate::core::models::Thumbnail, is_broken: bool) -> ThumbItem {
         let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(t.width, t.height);
         let pixels = buf.make_mut_slice();
         for (dst, chunk) in pixels.iter_mut().zip(t.data.as_chunks::<4>().0) {
@@ -1945,12 +1947,18 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 .into(),
             source_path: t.source_path.to_string_lossy().to_string().into(),
             image: slint::Image::from_rgba8(buf),
+            is_broken,
         }
     }
 
     /// 4.7e — проходит ли миниатюра фильтр расширений (по ПУТИ файла).
     /// Чистая функция: (галочки из UI) × (путь) → да/нет.
-    fn passes_filter(w: &GalleryScreen, path: &str) -> bool {
+    /// 4.7h — БИТЫЕ (is_broken) показываются ТОЛЬКО при включённой
+    /// галочке «⚠ Битые» (по умолчанию выключена — битые скрыты).
+    fn passes_filter(w: &GalleryScreen, path: &str, is_broken: bool) -> bool {
+        if is_broken {
+            return w.get_filter_broken();
+        }
         let ext = path
             .rsplit('.')
             .next()
@@ -1978,7 +1986,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let full = w.get_full_thumbnails();
         let filtered: Vec<ThumbItem> = full
             .iter()
-            .filter(|it| passes_filter(w, it.source_path.as_ref()))
+            .filter(|it| passes_filter(w, it.source_path.as_ref(), it.is_broken))
             .collect();
         // Заменяем модель целиком — сетка перерисуется.
         w.set_thumbnails(slint::ModelRc::new(slint::VecModel::from(filtered)));
@@ -2034,23 +2042,28 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 // 4.7g — видео в батчах НЕ декодируется (быстро): вместо
                 // MF-кадра — мгновенная заглушка; настоящий кадр придёт
                 // фоновым проходом ниже и подменит карточку.
-                let results: Vec<crate::core::models::Thumbnail> = chunk
+                // 4.7h — (Thumbnail, is_broken): провал декода = битый.
+                let results: Vec<(crate::core::models::Thumbnail, bool)> = chunk
                     .iter()
                     .map(|photo| {
                         if crate::media::is_video(&photo.path) {
                             // Заглушка: без декода, без кэша (кэш проверит
                             // видео-проход — там же запишется настоящий кадр).
                             let (data, w, h) = crate::media::video_placeholder();
-                            crate::core::models::Thumbnail {
-                                source_path: photo.path.clone(),
-                                width: w,
-                                height: h,
-                                data,
-                            }
+                            (
+                                crate::core::models::Thumbnail {
+                                    source_path: photo.path.clone(),
+                                    width: w,
+                                    height: h,
+                                    data,
+                                },
+                                false,
+                            )
                         } else {
                             thumbs
                                 .thumbnail(photo)
-                                .unwrap_or_else(|_| placeholder_for(&photo.path))
+                                .map(|t| (t, false))
+                                .unwrap_or_else(|_| (placeholder_for(&photo.path), true))
                         }
                     })
                     .collect();
@@ -2066,8 +2079,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     }
                     if let Some(w) = ui_weak.upgrade() {
                         // ThumbItem (не-Send) строим ЗДЕСЬ, в UI-потоке.
-                        let items: Vec<ThumbItem> =
-                            results.into_iter().map(thumb_item_from).collect();
+                        let items: Vec<ThumbItem> = results
+                            .into_iter()
+                            .map(|(t, broken)| thumb_item_from(t, broken))
+                            .collect();
                         use slint::Model;
                         // 4.7e — первый батч: полная модель = срез,
                         // отображаемая = отфильтрованная.
@@ -2077,7 +2092,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             )));
                             let filtered: Vec<ThumbItem> = items
                                 .into_iter()
-                                .filter(|it| passes_filter(&w, it.source_path.as_ref()))
+                                .filter(|it| {
+                                    passes_filter(&w, it.source_path.as_ref(), it.is_broken)
+                                })
                                 .collect();
                             w.set_thumbnails(slint::ModelRc::new(slint::VecModel::from(filtered)));
                         } else {
@@ -2098,7 +2115,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                 .downcast_ref::<slint::VecModel<ThumbItem>>()
                             {
                                 for it in items {
-                                    if passes_filter(&w, it.source_path.as_ref()) {
+                                    if passes_filter(&w, it.source_path.as_ref(), it.is_broken) {
                                         model.push(it);
                                     }
                                 }
@@ -2148,7 +2165,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             return;
                         }
                         if let Some(w) = ui_weak.upgrade() {
-                            let item = thumb_item_from(thumb);
+                            // Видео-проход: настоящий кадр — файл НЕ битый.
+                            let item = thumb_item_from(thumb, false);
                             replace_thumb_by_path(&w, &item);
                         }
                     });
@@ -2159,9 +2177,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     }
 
     /// 4.7g — заглушка для фото, чья миниатюра не построилась (битый файл):
-    /// серая карточка, файл не теряется из галереи (как у видео).
+    /// файл не теряется из галереи. 4.7h — теперь это КРЕСТ (битое),
+    /// а не видео-треугольник: по значку видно, что файл сломан.
     fn placeholder_for(path: &std::path::Path) -> crate::core::models::Thumbnail {
-        let (data, w, h) = crate::media::video_placeholder();
+        let (data, w, h) = crate::media::broken_placeholder();
         crate::core::models::Thumbnail {
             source_path: path.to_path_buf(),
             width: w,

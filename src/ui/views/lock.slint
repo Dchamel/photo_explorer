@@ -232,6 +232,9 @@ struct ThumbItem {
     file-name: string,
     source-path: string,
     image: image,
+    // 4.7h — файл битый (декод провалился): показывается только при
+    // включённой галочке «⚠ Битые» (по умолчанию скрыт).
+    is-broken: bool,
 }
 
 // --- Элемент списка сессий (4.7 «Проекты и недавние») ---
@@ -270,6 +273,8 @@ export component GalleryScreen inherits Window {
     in-out property <bool> filter-mov: true;
     in-out property <bool> filter-mkv: true;
     in-out property <bool> filter-avi: true;
+    // 4.7h — битые файлы: по умолчанию ВЫКЛ (скрыты из галереи).
+    in-out property <bool> filter-broken: false;
     // Панель фильтра раскрыта?
     in-out property <bool> filter-visible: false;
     // Сигнал «галочка сменилась» — Rust пересобирает отфильтрованную модель.
@@ -670,6 +675,8 @@ export component GalleryScreen inherits Window {
                             FilterCheck { label: "MOV";  checked: root.filter-mov;  toggled(v) => { root.filter-mov = v; root.filter-changed(); } }
                             FilterCheck { label: "MKV";  checked: root.filter-mkv;  toggled(v) => { root.filter-mkv = v; root.filter-changed(); } }
                             FilterCheck { label: "AVI";  checked: root.filter-avi;  toggled(v) => { root.filter-avi = v; root.filter-changed(); } }
+                            // 4.7h — битые файлы отдельной категорией (по умолчанию скрыты).
+                            FilterCheck { label: "⚠ Битые"; checked: root.filter-broken; toggled(v) => { root.filter-broken = v; root.filter-changed(); } }
                         }
                     }
                 }
