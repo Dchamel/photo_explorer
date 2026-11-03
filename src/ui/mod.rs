@@ -1132,51 +1132,191 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     .and_then(|e| e.to_str())
                     .map(|e| e.to_ascii_lowercase())
                     .unwrap_or_default();
-                // 4.7b-1 — ВИДЕО: показать первый кадр как превью
-                // (проигрывание — 4.7b-2). Декод в фоне: COM MF не
-                // трогаем в UI-потоке.
+                // 4.7b-2 — ВИДЕО: ПОТОКОВОЕ проигрывание (без звука —
+                // звук 4.7b-3). VideoStream держит ридер MF в ЭТОМ потоке,
+                // кадры идут по одному (не гигабайты в памяти). Пауза между
+                // кадрами — по таймингу сэмпла (time_100ns), управление —
+                // та же панель 4.7d, что у GIF (AnimPlayback: пауза/
+                // скорость/зацикливание). Листание рвёт поток (поколение).
                 if matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv" | "avi") {
                     let gen = self.generation.clone();
                     let ui_weak = self.ui_weak.clone();
+                    let anim_playing = self.anim_playing.clone();
+                    let playback = self.playback.clone();
+                    let settings = self.settings.clone();
                     let idx = index;
                     let video_path = path.clone();
                     std::thread::spawn(move || {
                         if gen.load(Ordering::SeqCst) != my_gen {
                             return;
                         }
-                        // 4.7f — при провале декода показываем ту же
-                        // заглушку, что в галерее: файл не проваливается
-                        // в чёрный экран — его видно и можно листать.
-                        let (data, w, h) = match crate::media::first_frame_rgba(&video_path) {
-                            Ok(frame) => frame,
+                        match crate::media::VideoStream::open(&video_path) {
+                            Ok(mut stream) => {
+                                let (w, h) = stream.size();
+                                log::info!("video: поток открыт {w}x{h} (проигрывание)");
+                                // Панель 4.7d: включаем; бегунок = позиция
+                                // в видео (мс), максимум уточняется по ходу
+                                // (длительность считаем из таймингов кадров).
+                                let ap = anim_playing.clone();
+                                let ui_weak_start = ui_weak.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    *lock_or_recover(&ap) = Some((idx, my_gen));
+                                    if let Some(w_ui) = ui_weak_start.upgrade() {
+                                        w_ui.set_anim_active(true);
+                                        w_ui.set_anim_total(1);
+                                        w_ui.set_anim_frame(0);
+                                        w_ui.set_anim_paused(false);
+                                    }
+                                });
+                                playback.set_total(1);
+                                playback.set_frame(0);
+                                playback.set_paused(false);
+                                // Максимальный тайминг кадра (длительность
+                                // по ходу; обновляем бегунок при росте).
+                                let mut max_ms: i32 = 1;
+                                // Начало воспроизведения (для пауз между кадрами).
+                                let mut started = std::time::Instant::now();
+                                'video: loop {
+                                    // Поколение сменилось — ушли с видео, стоп.
+                                    if gen.load(Ordering::SeqCst) != my_gen {
+                                        break 'video;
+                                    }
+                                    // Пауза (панель): крутимся на месте, кадр
+                                    // держится, время НЕ течёт (started сдвигаем).
+                                    if playback.is_paused() {
+                                        std::thread::sleep(std::time::Duration::from_millis(30));
+                                        started += std::time::Duration::from_millis(30);
+                                        continue;
+                                    }
+                                    let frame = match stream.next_frame() {
+                                        Ok(Some(f)) => f,
+                                        Ok(None) => {
+                                            // Конец видео: зацикливание —
+                                            // переоткрываем ридер; иначе стоп.
+                                            if settings.loop_animation_on() {
+                                                match crate::media::VideoStream::open(&video_path) {
+                                                    Ok(s) => {
+                                                        stream = s;
+                                                        started = std::time::Instant::now();
+                                                        playback.set_frame(0);
+                                                        continue 'video;
+                                                    }
+                                                    Err(_) => break 'video,
+                                                }
+                                            }
+                                            break 'video;
+                                        }
+                                        Err(e) => {
+                                            log::warn!("video: {e}");
+                                            break 'video;
+                                        }
+                                    };
+                                    // Длительность по ходу: новый максимум
+                                    // тайминга → обновить бегунок (UI).
+                                    let pos_ms = (frame.time_100ns / 10_000).max(0) as i32;
+                                    if pos_ms + 40 > max_ms {
+                                        max_ms = pos_ms + 40;
+                                        let ui_weak_total = ui_weak.clone();
+                                        let total_i32 = max_ms;
+                                        let _ = slint::invoke_from_event_loop(move || {
+                                            if let Some(w_ui) = ui_weak_total.upgrade() {
+                                                w_ui.set_anim_total(total_i32);
+                                            }
+                                        });
+                                        playback.set_total(total_i32 as usize);
+                                    }
+                                    // Пауза до тайминга кадра: кадр N должен
+                                    // появиться в момент time_100ns от начала.
+                                    let due = started
+                                        + std::time::Duration::from_nanos(
+                                            (frame.time_100ns.max(0) as u64) * 100,
+                                        );
+                                    let now = std::time::Instant::now();
+                                    if due > now {
+                                        std::thread::sleep(due - now);
+                                    }
+                                    // Скорость из панели (0.1–2.0): пауза
+                                    // масштабируется — время течёт быстрее/медленнее.
+                                    let speed = playback.speed_tenths();
+                                    let _ = speed; // 4.7b-2: скорость применится в 4.7b-4 (с перемоткой)
+                                    let data = frame.data;
+                                    let fw = frame.w;
+                                    let fh = frame.h;
+                                    let gen_f = gen.clone();
+                                    let ui_weak_frame = ui_weak.clone();
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        if gen_f.load(Ordering::SeqCst) != my_gen {
+                                            return;
+                                        }
+                                        if let Some(w_ui) = ui_weak_frame.upgrade() {
+                                            if w_ui.get_viewer_index() != idx {
+                                                return;
+                                            }
+                                            let mut buf =
+                                                slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
+                                                    fw, fh,
+                                                );
+                                            let pixels = buf.make_mut_slice();
+                                            for (dst, chunk) in
+                                                pixels.iter_mut().zip(data.as_chunks::<4>().0)
+                                            {
+                                                dst.r = chunk[0];
+                                                dst.g = chunk[1];
+                                                dst.b = chunk[2];
+                                                dst.a = chunk[3];
+                                            }
+                                            w_ui.set_viewer_img_w(fw as f32);
+                                            w_ui.set_viewer_img_h(fh as f32);
+                                            w_ui.set_viewer_image(slint::Image::from_rgba8(buf));
+                                            // Бегунок = позиция в видео (мс).
+                                            w_ui.set_anim_frame(pos_ms);
+                                        }
+                                    });
+                                    playback.set_frame(pos_ms.max(0) as usize);
+                                }
+                                // Освобождаем слой анимации при выходе.
+                                {
+                                    let ap = anim_playing.clone();
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        let mut g = lock_or_recover(&ap);
+                                        if *g == Some((idx, my_gen)) {
+                                            *g = None;
+                                        }
+                                    });
+                                }
+                            }
                             Err(e) => {
                                 log::warn!("video: {e}");
-                                crate::media::video_placeholder()
+                                // Провал открытия — заглушка (как 4.7f).
+                                let (data, w, h) = crate::media::video_placeholder();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    if gen.load(Ordering::SeqCst) != my_gen {
+                                        return;
+                                    }
+                                    if let Some(w_ui) = ui_weak.upgrade() {
+                                        if w_ui.get_viewer_index() != idx {
+                                            return;
+                                        }
+                                        let mut buf =
+                                            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
+                                                w, h,
+                                            );
+                                        let pixels = buf.make_mut_slice();
+                                        for (dst, chunk) in
+                                            pixels.iter_mut().zip(data.as_chunks::<4>().0)
+                                        {
+                                            dst.r = chunk[0];
+                                            dst.g = chunk[1];
+                                            dst.b = chunk[2];
+                                            dst.a = chunk[3];
+                                        }
+                                        w_ui.set_viewer_img_w(w as f32);
+                                        w_ui.set_viewer_img_h(h as f32);
+                                        w_ui.set_viewer_image(slint::Image::from_rgba8(buf));
+                                    }
+                                });
                             }
-                        };
-                        let _ = slint::invoke_from_event_loop(move || {
-                            // Двойная сверка (как у воркера).
-                            if gen.load(Ordering::SeqCst) != my_gen {
-                                return;
-                            }
-                            if let Some(w_ui) = ui_weak.upgrade() {
-                                if w_ui.get_viewer_index() != idx {
-                                    return;
-                                }
-                                let mut buf =
-                                    slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
-                                let pixels = buf.make_mut_slice();
-                                for (dst, chunk) in pixels.iter_mut().zip(data.as_chunks::<4>().0) {
-                                    dst.r = chunk[0];
-                                    dst.g = chunk[1];
-                                    dst.b = chunk[2];
-                                    dst.a = chunk[3];
-                                }
-                                w_ui.set_viewer_img_w(w as f32);
-                                w_ui.set_viewer_img_h(h as f32);
-                                w_ui.set_viewer_image(slint::Image::from_rgba8(buf));
-                            }
-                        });
+                        }
                     });
                 }
                 if matches!(ext.as_str(), "gif" | "png" | "apng" | "webp") {

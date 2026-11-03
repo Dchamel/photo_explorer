@@ -11,6 +11,10 @@
 //! Почему Source Reader, а не MediaEngine: нам нужны САМИ кадры (пишем
 //! в единый viewer-image и строим миниатюры), а MediaEngine рисует в
 //! свою поверхность.
+//!
+//! 4.7b-2 — ПОТОКОВЫЙ декодер `VideoStream`: кадры читаются по одному
+//! (ReadSample), НЕ все сразу (4K-видео целиком = гигабайты RGBA).
+//! Ридер живёт в потоке аниматора; UI получает кадр за кадром.
 
 /// Видео-расширения, которые умеет декодировать Media Foundation
 /// (совпадает со списком сканера).
@@ -119,6 +123,197 @@ fn mf_ensure_started() -> Result<(), String> {
         MFStartup(MF_SDK_VERSION, MFSTARTUP_LITE).map_err(|e| format!("video: MFStartup: {e}"))
     });
     started.clone()
+}
+
+/// 4.7b-2 — ПОТОКОВЫЙ декодер видео: ридер Media Foundation живёт в
+/// структуре, кадры читаются по одному (`next_frame`). НЕ декодирует
+/// всё видео в память (4K = гигабайты) — аниматор читает кадр за кадром
+/// и спит между ними по таймингу сэмпла.
+#[cfg(windows)]
+pub struct VideoStream {
+    reader: windows::Win32::Media::MediaFoundation::IMFSourceReader,
+    /// Ширина/высота кадра (из MF_MT_FRAME_SIZE).
+    w: u32,
+    h: u32,
+    /// Длительность в 100-наносекундных единицах.
+    duration_100ns: i64,
+}
+
+/// Один кадр видеоряда: RGBA-пиксели + позиция от начала видео
+/// (100-наносекундные единицы) — аниматор спит до этого момента.
+#[cfg(windows)]
+pub struct VideoFrame {
+    pub data: Vec<u8>,
+    pub w: u32,
+    pub h: u32,
+    pub time_100ns: i64,
+}
+
+#[cfg(windows)]
+impl VideoStream {
+    /// Открыть видео и подготовить ридер к чтению кадров (RGB32).
+    /// Видео-процессор включён (NV12→RGB32), MF уже стартовал (OnceLock).
+    pub fn open(path: &std::path::Path) -> Result<Self, String> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Media::MediaFoundation::{
+            IMFMediaType, MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL,
+            MFMediaType_Video, MFVideoFormat_RGB32, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
+            MF_MT_SUBTYPE, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+            MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+        };
+        mf_ensure_started()?;
+        let url: Vec<u16> = path
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let attrs = unsafe {
+            let mut attrs_opt: Option<windows::Win32::Media::MediaFoundation::IMFAttributes> = None;
+            MFCreateAttributes(&mut attrs_opt, 0)
+                .map_err(|e| format!("video: MFCreateAttributes: {e}"))?;
+            let attrs = attrs_opt.ok_or_else(|| "video: MFCreateAttributes: пусто".to_string())?;
+            attrs
+                .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
+                .map_err(|e| format!("video: включить видео-процессор: {e}"))?;
+            attrs
+        };
+        let reader = unsafe {
+            MFCreateSourceReaderFromURL(PCWSTR(url.as_ptr()), Some(&attrs))
+                .map_err(|e| format!("video: открыть «{}»: {e}", path.display()))?
+        };
+        // Тот же контракт, что у first_frame_rgba: RGB32 (BGRA в памяти).
+        let media_type: IMFMediaType =
+            unsafe { MFCreateMediaType().map_err(|e| format!("video: MFCreateMediaType: {e}"))? };
+        unsafe {
+            media_type
+                .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+                .map_err(|e| format!("video: major type: {e}"))?;
+            media_type
+                .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
+                .map_err(|e| format!("video: subtype RGB32: {e}"))?;
+            reader
+                .SetCurrentMediaType(
+                    MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+                    None,
+                    &media_type,
+                )
+                .map_err(|e| format!("video: SetCurrentMediaType: {e}"))?;
+        }
+        // Размеры кадра + длительность (бегунок перемотки).
+        let (w, h, duration_100ns) = unsafe {
+            let cur: IMFMediaType = reader
+                .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+                .map_err(|e| format!("video: GetCurrentMediaType: {e}"))?;
+            let packed = cur
+                .GetUINT64(&MF_MT_FRAME_SIZE)
+                .map_err(|e| format!("video: MF_MT_FRAME_SIZE: {e}"))?;
+            // Длительность: windows 0.61 не экспортирует GetDuration у
+            // ридера — считаем ПО ХОДУ (max time_100ns кадров); бегунок
+            // уточняет максимум по мере чтения (KISS, точность достаточна).
+            let duration = 0i64;
+            (
+                (packed >> 32) as u32,
+                (packed & 0xFFFF_FFFF) as u32,
+                duration,
+            )
+        };
+        if w == 0 || h == 0 {
+            return Err("video: нулевые размеры кадра".to_string());
+        }
+        Ok(Self {
+            reader,
+            w,
+            h,
+            duration_100ns,
+        })
+    }
+
+    /// Размеры кадра (для UI: пропорции, contain-fit).
+    pub fn size(&self) -> (u32, u32) {
+        (self.w, self.h)
+    }
+
+    /// Длительность видео в 100-наносекундных единицах (бегунок).
+    pub fn duration_100ns(&self) -> i64 {
+        self.duration_100ns
+    }
+
+    /// Прочитать СЛЕДУЮЩИЙ кадр. None — видео закончилось (конец потока).
+    /// Кадр: RGBA (свап B→R сделан), паддинг stride отрезан.
+    pub fn next_frame(&mut self) -> Result<Option<VideoFrame>, String> {
+        use windows::Win32::Media::MediaFoundation::{
+            MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+        };
+        loop {
+            let mut sample: Option<windows::Win32::Media::MediaFoundation::IMFSample> = None;
+            let mut flags: u32 = 0;
+            let mut timestamp: i64 = 0;
+            unsafe {
+                self.reader
+                    .ReadSample(
+                        MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+                        0,
+                        None,
+                        Some(&mut flags),
+                        Some(&mut timestamp),
+                        Some(&mut sample),
+                    )
+                    .map_err(|e| format!("video: ReadSample: {e}"))?;
+            }
+            if flags & (MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
+                return Ok(None); // конец видео
+            }
+            let Some(sample) = sample else { continue };
+            let buffer = unsafe {
+                sample
+                    .ConvertToContiguousBuffer()
+                    .map_err(|e| format!("video: буфер: {e}"))?
+            };
+            let data = unsafe {
+                let mut ptr: *mut u8 = std::ptr::null_mut();
+                let mut len: u32 = 0;
+                buffer
+                    .Lock(&mut ptr, None, Some(&mut len))
+                    .map_err(|e| format!("video: Lock: {e}"))?;
+                let owned = std::slice::from_raw_parts(ptr, len as usize).to_vec();
+                let _ = buffer.Unlock();
+                owned
+            };
+            if data.is_empty() {
+                continue;
+            }
+            // Stride: длина строки в памяти ≥ w*4 (выравнивание).
+            let stride = match unsafe {
+                self.reader
+                    .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
+            } {
+                Ok(cur) => unsafe {
+                    match cur
+                        .GetUINT32(&windows::Win32::Media::MediaFoundation::MF_MT_DEFAULT_STRIDE)
+                    {
+                        Ok(s) if s != 0 && (s as i32) > 0 => s as usize,
+                        _ => data.len() / self.h.max(1) as usize,
+                    }
+                },
+                Err(_) => data.len() / self.h.max(1) as usize,
+            };
+            let Some(mut rgba) = strip_stride(&data, stride, self.w as usize, self.h as usize)
+            else {
+                return Err("video: буфер кадра не сошёлся со stride".to_string());
+            };
+            for px in rgba.as_chunks_mut::<4>().0 {
+                px.swap(0, 2); // BGRA → RGBA
+                px[3] = 255;
+            }
+            return Ok(Some(VideoFrame {
+                data: rgba,
+                w: self.w,
+                h: self.h,
+                time_100ns: timestamp,
+            }));
+        }
+    }
 }
 
 #[cfg(windows)]
