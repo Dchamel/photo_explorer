@@ -558,15 +558,23 @@ export component GalleryScreen inherits Window {
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-            // 4.7e — панель фильтра по расширениям (точечный отбор на 10к
-            // файлов). Кнопка-тумблер раскрывает полосу галочек.
-            HorizontalLayout {
+            // 4.7e-fix — панель фильтра ПОЗИЦИОНИРУЕТСЯ явно (родитель —
+            // свободный Rectangle, НЕ layout): раньше HorizontalLayout
+            // навязывал окну min-ширину (нельзя было раздвинуть) и ложился
+            // поверх сетки. Теперь: явные координаты, ширина по родителю,
+            // полоса галочек — горизонтальный Flickable (не растёт от
+            // содержимого, min-ширины не навязывает).
+            Rectangle {
+                x: 8px;
+                y: 8px;
+                width: parent.width - 16px;
                 height: 40px;
-                padding: 4px;
-                spacing: 8px;
                 // Тумблер «Фильтр» (подсветка = панель раскрыта).
                 Rectangle {
+                    x: 0px;
+                    y: 0px;
                     width: 96px;
+                    height: 40px;
                     border-radius: 8px;
                     background: root.filter-visible ? #2a4d6f : #ffffff0d;
                     border-width: root.filter-visible ? 1px : 0px;
@@ -580,18 +588,30 @@ export component GalleryScreen inherits Window {
                         vertical-alignment: center;
                     }
                 }
-                // Раскрытая полоса: галочки + Все/Ничего.
+                // Раскрытая полоса: справа от кнопки, явные координаты
+                // (родитель — свободный Rectangle). Внутри — горизонтальный
+                // Flickable с ЯВНЫМ viewport-width: галочки не навязывают
+                // min-ширину окну (лишнее скроллится).
                 if root.filter-visible : Rectangle {
-                    horizontal-stretch: 1;
+                    x: 104px;
+                    y: 0px;
+                    width: parent.width - 104px;
+                    height: 40px;
                     border-radius: 8px;
                     background: #ffffff08;
+                    clip: true;
                     Flickable {
+                        x: 4px;
+                        y: 6px;
                         width: parent.width - 8px;
-                        height: parent.height;
+                        height: 28px;
+                        // 12 элементов × ~64px + отступы — фикс, не от
+                        // содержимого (min-ширины нет).
+                        content-width: 800px;
                         HorizontalLayout {
-                            padding: 4px;
+                            width: 800px;
+                            height: 28px;
                             spacing: 6px;
-                            alignment: center;
                             // «Все» / «Ничего» — быстрый сброс.
                             Rectangle {
                                 width: 52px;
@@ -636,7 +656,13 @@ export component GalleryScreen inherits Window {
             }
 
             // Адаптивная сетка миниатюр: карточки позиционируются по индексу.
+            // 4.7e-fix — y-отступ под панель фильтра (40px + отступы):
+            // раньше панель ложилась ПОВЕРХ первой строки карточек.
             grid := Flickable {
+                x: 0px;
+                y: 48px;
+                width: parent.width;
+                height: parent.height - 48px;
                 property <length> card-w: 180px;
                 property <length> card-h: 200px;
                 property <length> gap: 12px;
