@@ -9,6 +9,7 @@ slint::include_modules!();
 
 mod anim_cache;
 mod anim_playback;
+mod video;
 
 use anim_cache::{AnimFrame, AnimFramesCache, ANIM_CACHE_MAX_BYTES};
 use anim_playback::{effective_delay_ms, AnimPlayback};
@@ -1120,6 +1121,52 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     .and_then(|e| e.to_str())
                     .map(|e| e.to_ascii_lowercase())
                     .unwrap_or_default();
+                // 4.7b-1 — ВИДЕО: показать первый кадр как превью
+                // (проигрывание — 4.7b-2). Декод в фоне: COM MF не
+                // трогаем в UI-потоке.
+                if matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv" | "avi") {
+                    let gen = self.generation.clone();
+                    let ui_weak = self.ui_weak.clone();
+                    let idx = index;
+                    let video_path = path.clone();
+                    std::thread::spawn(move || {
+                        if gen.load(Ordering::SeqCst) != my_gen {
+                            return;
+                        }
+                        match video::first_frame_rgba(&video_path) {
+                            Ok((data, w, h)) => {
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    // Двойная сверка (как у воркера).
+                                    if gen.load(Ordering::SeqCst) != my_gen {
+                                        return;
+                                    }
+                                    if let Some(w_ui) = ui_weak.upgrade() {
+                                        if w_ui.get_viewer_index() != idx {
+                                            return;
+                                        }
+                                        let mut buf =
+                                            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
+                                                w, h,
+                                            );
+                                        let pixels = buf.make_mut_slice();
+                                        for (dst, chunk) in
+                                            pixels.iter_mut().zip(data.as_chunks::<4>().0)
+                                        {
+                                            dst.r = chunk[0];
+                                            dst.g = chunk[1];
+                                            dst.b = chunk[2];
+                                            dst.a = chunk[3];
+                                        }
+                                        w_ui.set_viewer_img_w(w as f32);
+                                        w_ui.set_viewer_img_h(h as f32);
+                                        w_ui.set_viewer_image(slint::Image::from_rgba8(buf));
+                                    }
+                                });
+                            }
+                            Err(e) => log::warn!("video: {e}"),
+                        }
+                    });
+                }
                 if matches!(ext.as_str(), "gif" | "png" | "apng" | "webp") {
                     let gen = self.generation.clone();
                     let ui_weak = self.ui_weak.clone();

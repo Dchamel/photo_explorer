@@ -12,7 +12,11 @@ use crate::core::ports::{PhotoScanner, ScanError};
 
 /// Поддерживаемые расширения изображений (в нижнем регистре, без точки).
 /// Согласовано с заказчиком для MVP.
-const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp"];
+/// 4.7b — добавлены видео-форматы (показ первого кадра через Media
+/// Foundation; проигрывание — следующие подэтапы).
+const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "bmp", "webp", "mp4", "webm", "mov", "mkv", "avi",
+];
 
 /// Возвращает `true`, если путь указывает на файл с поддерживаемым расширением.
 fn is_supported_image(path: &Path) -> bool {
