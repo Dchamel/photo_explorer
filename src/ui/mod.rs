@@ -1156,17 +1156,42 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         match crate::media::VideoStream::open(&video_path) {
                             Ok(mut stream) => {
                                 let (w, h) = stream.size();
-                                // 4.7i — длительность СРАЗУ (шкала 0..конец
-                                // фиксирована, как в плеере): через source
-                                // resolver, без чтения кадров.
-                                let duration_ms =
-                                    (crate::media::video_duration_100ns(&video_path) / 10_000)
-                                        .max(1) as i32;
-                                log::info!(
-                                    "video: поток открыт {w}x{h}, длительность {duration_ms} мс"
-                                );
+                                // 4.7i-fix — длительность НЕ блокирует старт:
+                                // мгновенная попытка из .dur-кэша; если кэша
+                                // нет — параллельный поток посчитает (прогон
+                                // кадров) и дорисует конец шкалы. Раньше прогон
+                                // шёл ДО первого кадра — клик по видео висел
+                                // 13+ секунд (лог 23:34).
+                                let duration_ms = crate::media::cached_duration_ms(&video_path);
+                                log::info!("video: поток открыт {w}x{h}, длительность {duration_ms} мс (кэш)");
+                                if duration_ms <= 1 {
+                                    // Параллельный поток: считает длительность,
+                                    // пишет .dur-кэш, обновляет максимум бегунка.
+                                    let dur_path = video_path.clone();
+                                    let dur_gen = gen.clone();
+                                    let dur_ui = ui_weak.clone();
+                                    let dur_pb = playback.clone();
+                                    std::thread::spawn(move || {
+                                        let d_100ns = crate::media::video_duration_100ns(&dur_path);
+                                        let d_ms = (d_100ns / 10_000).max(1) as i32;
+                                        // Поколение ушло — результат не нужен.
+                                        if dur_gen.load(Ordering::SeqCst) != my_gen {
+                                            return;
+                                        }
+                                        dur_pb.set_total(d_ms as usize);
+                                        let _ = slint::invoke_from_event_loop(move || {
+                                            if dur_gen.load(Ordering::SeqCst) != my_gen {
+                                                return;
+                                            }
+                                            if let Some(w_ui) = dur_ui.upgrade() {
+                                                w_ui.set_anim_total(d_ms);
+                                            }
+                                        });
+                                    });
+                                }
                                 // Панель 4.7d: включаем; бегунок = позиция
-                                // в видео (мс), максимум = длительность.
+                                // в видео (мс), максимум = длительность (из
+                                // кэша или дорисуется параллельным потоком).
                                 let ap = anim_playing.clone();
                                 let ui_weak_start = ui_weak.clone();
                                 let _ = slint::invoke_from_event_loop(move || {
@@ -1176,12 +1201,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                         // 4.7b-2-fix — режим ВИДЕО: шкала
                                         // в секундах, флаг включён.
                                         w_ui.set_anim_is_video(true);
-                                        w_ui.set_anim_total(duration_ms);
+                                        w_ui.set_anim_total(duration_ms.max(1));
                                         w_ui.set_anim_frame(0);
                                         w_ui.set_anim_paused(false);
                                     }
                                 });
-                                playback.set_total(duration_ms as usize);
+                                playback.set_total(duration_ms.max(1) as usize);
                                 playback.set_frame(0);
                                 playback.set_paused(false);
                                 // Начало воспроизведения (для пауз между кадрами).

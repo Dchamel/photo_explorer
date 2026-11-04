@@ -332,26 +332,40 @@ impl VideoStream {
     }
 }
 
+/// 4.7i — путь к кэшу длительности (.dur рядом с миниатюрами).
+/// Хэш пути — FNV-1a (стабильный, без новых зависимостей).
+#[cfg(windows)]
+fn duration_cache_file(path: &std::path::Path) -> std::path::PathBuf {
+    let cache_dir = std::env::temp_dir().join("photo_explorer_thumbs_cache");
+    let key = format!("{:?}", path.to_string_lossy());
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in key.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    cache_dir.join(format!("{h:016x}.dur"))
+}
+
+/// 4.7i-fix — длительность из КЭША (мс), без декода. 0 = кэша нет:
+/// вызывающий код запустит параллельный подсчёт (не блокируя старт).
+#[cfg(windows)]
+pub fn cached_duration_ms(path: &std::path::Path) -> i32 {
+    if let Ok(text) = std::fs::read_to_string(duration_cache_file(path)) {
+        if let Ok(v) = text.trim().parse::<i64>() {
+            return (v / 10_000).max(0) as i32;
+        }
+    }
+    0
+}
+
 /// 4.7i — длительность видео (100-наносекундные единицы). Прямого
 /// GetDuration у IMFSourceReader в windows 0.61 нет, resolver-путь
 /// капризен — считаем ПРОГОНОМ кадров (тайминг последнего), результат
-/// кэшируем рядом с миниатюрой (файл .dur): первый запуск видео
-/// посчитает один раз, дальше — мгновенно.
+/// кэшируем (.dur): первый запуск посчитает один раз, дальше — мгновенно.
+/// 4.7i-fix — вызывается в ОТДЕЛЬНОМ потоке: НЕ блокирует старт видео.
 #[cfg(windows)]
 pub fn video_duration_100ns(path: &std::path::Path) -> i64 {
-    // Кэш: файл рядом с PNG миниатюрой (тот же каталог, суффикс .dur).
-    let cache_dir = std::env::temp_dir().join("photo_explorer_thumbs_cache");
-    let key = format!("{:?}", path.to_string_lossy());
-    let hash = {
-        // Простой стабильный хэш пути (FNV-1a) — без новых зависимостей.
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in key.as_bytes() {
-            h ^= u64::from(*b);
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        format!("{h:016x}")
-    };
-    let dur_file = cache_dir.join(format!("{hash}.dur"));
+    let dur_file = duration_cache_file(path);
     if let Ok(text) = std::fs::read_to_string(&dur_file) {
         if let Ok(v) = text.trim().parse::<i64>() {
             return v;
@@ -369,7 +383,9 @@ pub fn video_duration_100ns(path: &std::path::Path) -> i64 {
         }
     }
     // Кэшируем (ошибка записи не критична).
-    let _ = std::fs::create_dir_all(&cache_dir);
+    if let Some(parent) = dur_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let _ = std::fs::write(&dur_file, max_100ns.to_string());
     max_100ns
 }
