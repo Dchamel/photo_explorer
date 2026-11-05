@@ -51,35 +51,9 @@ pub fn fingerprint_of(photos: &[Photo]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Вычисляет инкрементальную разницу между старым и новым списком фото.
-///
-/// Возвращает только НОВЫЕ фото (те, которых не было в старом списке, или у
-/// которых изменились размер/mtime). Это основа инкрементального досскана:
-/// «добавили 8 файлов в папку из 8000 — обрабатываем только эти 8».
-pub fn diff_photos(old: &[Photo], new: &[Photo]) -> Vec<Photo> {
-    use std::collections::HashSet;
-    let old_keys: HashSet<(String, u64, u64)> = old
-        .iter()
-        .map(|p| {
-            (
-                p.path.to_string_lossy().to_lowercase(),
-                p.size_bytes,
-                p.modified,
-            )
-        })
-        .collect();
-    new.iter()
-        .filter(|p| {
-            !old_keys.contains(&(
-                p.path.to_string_lossy().to_lowercase(),
-                p.size_bytes,
-                p.modified,
-            ))
-        })
-        .cloned()
-        .collect()
-}
-
+// 4.7k — diff_photos (инкрементальный досскан 4.7d) УДАЛЁН вместе с
+// автопересканом при открытии проекта: папка обновляется только кнопкой
+// «🔄 Пересканировать» (полный скан), разница больше не вычисляется.
 /// JSON-хранилище сессий поверх папки на диске.
 pub struct JsonSessionStore {
     dir: PathBuf,
@@ -256,19 +230,5 @@ mod tests {
                 photo("C:/a/3.jpg", 30, 300)
             ])
         );
-    }
-
-    #[test]
-    fn diff_returns_only_new_or_changed() {
-        let old = vec![photo("C:/a/1.jpg", 10, 100), photo("C:/a/2.jpg", 20, 200)];
-        let new = vec![
-            photo("C:/a/1.jpg", 10, 100), // не изменился
-            photo("C:/a/2.jpg", 21, 200), // изменился размер
-            photo("C:/a/3.jpg", 30, 300), // новый
-        ];
-        let diff = diff_photos(&old, &new);
-        assert_eq!(diff.len(), 2);
-        assert!(diff.iter().any(|p| p.path == *Path::new("C:/a/2.jpg")));
-        assert!(diff.iter().any(|p| p.path == *Path::new("C:/a/3.jpg")));
     }
 }

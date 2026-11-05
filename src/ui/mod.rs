@@ -2170,10 +2170,13 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     /// через invoke_from_event_loop, где берёт модель из UI и downcast'ит.
     /// 4.7e — батчи пишут в ПОЛНУЮ Slint-модель (full-thumbnails);
     /// отображаемая (thumbnails) — только прошедшие фильтр.
-    /// 4.7g — ВИДЕО НЕ БЛОКИРУЕТ галерею: в батчах видео получает
-    /// мгновенную заглушку «play» (без MF-декода), а настоящие кадры
-    /// строит отдельный фоновый проход и ПОДМЕНЯЕТ карточки по готовности
-    /// (281 видео × MF-декод в общем конвейере = 42 минуты ожидания).
+    /// 4.7k — БЫСТРЫЙ ПУТЬ: тёплый PNG-кэш читается без декода (rayon),
+    /// видео с холодным кэшем получает мгновенную заглушку «play» —
+    /// MF-декод НЕ тормозит первый показ (277 видео × сотни мс = «чёрное
+    /// окно» вместо сетки). Настоящие кадры строит видео-проход ПОСЛЕ
+    /// батчей: декод + ЗАПИСЬ в PNG-кэш — второй запуск мгновенный.
+    /// 4.7k — полоса прогресса (load-visible/load-progress/load-label)
+    /// видна от старта батчей до их завершения: заказчик видит проценты.
     fn load_thumbs_batched(
         photos: Vec<Photo>,
         thumbs: &Arc<FileSystemThumbnailProvider>,
@@ -2181,6 +2184,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         gallery_gen: &Arc<AtomicU64>,
         status_prefix: String,
     ) {
+        use rayon::prelude::*;
         const FIRST_BATCH: usize = 200;
         const BATCH: usize = 150;
         let my_gen = gallery_gen.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2189,41 +2193,79 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let ui_weak = ui_weak.clone();
         let gallery_gen = gallery_gen.clone();
         std::thread::spawn(move || {
+            // 4.7k — полоса прогресса включается СРАЗУ, до первого батча:
+            // заказчик видит «Загружаю миниатюры… 0%», а не пустое окно.
+            if total > 0 {
+                let ui_weak = ui_weak.clone();
+                let gallery_gen = gallery_gen.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if gallery_gen.load(Ordering::SeqCst) != my_gen {
+                        return;
+                    }
+                    if let Some(w) = ui_weak.upgrade() {
+                        w.set_load_visible(true);
+                        w.set_load_progress(0.0);
+                        w.set_load_label("Загружаю миниатюры… 0%".into());
+                    }
+                });
+            }
             // Первый батч 200 — сетка оживает сразу; остальные по 150.
             // ВАЖНО: срез [..200] даёт РОВНО один кусок (chunks не выйдет за
             // границу среза) — иначе фото 200+ попали бы в модель дважды.
             let rest_start = FIRST_BATCH.min(total);
             let mut done = 0usize;
+            // 4.7k — видео, получившие заглушку (глобальные индексы):
+            // их настоящие кадры построит видео-проход после батчей.
+            let mut pending_videos: Vec<usize> = Vec::new();
             for (batch_i, chunk) in photos[..rest_start]
                 .chunks(FIRST_BATCH)
                 .chain(photos[rest_start..].chunks(BATCH))
                 .enumerate()
             {
-                // Миниатюры (чистый RGBA, Send) — строим в фоне.
-                // 4.7g — видео в батчах НЕ декодируется (быстро): вместо
-                // MF-кадра — мгновенная заглушка; настоящий кадр придёт
-                // фоновым проходом ниже и подменит карточку.
-                // 4.7i — (Thumbnail, is_broken): провал декода = битый.
-                // ВИДЕО идёт тем же путём, что фото: thumbs.thumbnail()
-                // (MF-кадр → PNG-кэш). Первый скан декодирует видео ОДИН
-                // раз и кэширует; следующий запуск — мгновенно из кэша.
-                // Отдельный «видео-проход» 4.7g УДАЛЁН: он передекодировал
-                // все видео на каждом запуске (кэш не писался) — 30 секунд
-                // CPU-голода и «фото не листаются».
-                let results: Vec<(crate::core::models::Thumbnail, bool)> = chunk
-                    .iter()
-                    .map(|photo| {
-                        thumbs
-                            .thumbnail(photo)
-                            .map(|t| (t, false))
-                            .unwrap_or_else(|_| (placeholder_for(&photo.path), true))
+                let chunk_start = done;
+                // Миниатюры (чистый RGBA, Send) — строим в фоне; rayon
+                // распараллеливает чтение тёплого кэша (10k PNG).
+                // 4.7k — БЫСТРЫЙ ПУТЬ: cached_thumbnail() читает ТОЛЬКО
+                // PNG-кэш; видео с холодным кэшем получает мгновенную
+                // заглушку «play» (MF-декод в батче ЗАПРЕЩЁН — он держал
+                // первый показ десятки секунд); фото с холодным кэшем
+                // декодируется честно (thumbnail_strict) с записью кэша.
+                // Провал декода фото = битый (крест 4.7h).
+                let results: Vec<(crate::core::models::Thumbnail, bool, Option<usize>)> = chunk
+                    .par_iter()
+                    .enumerate()
+                    .map(|(in_chunk, photo)| {
+                        if let Some(t) = thumbs.cached_thumbnail(photo) {
+                            return (t, false, None);
+                        }
+                        if crate::media::is_video(&photo.path) {
+                            return (
+                                video_placeholder_for(&photo.path),
+                                false,
+                                Some(chunk_start + in_chunk),
+                            );
+                        }
+                        match thumbs.thumbnail_strict(photo) {
+                            Ok(t) => (t, false, None),
+                            Err(_) => (placeholder_for(&photo.path), true, None),
+                        }
                     })
                     .collect();
                 done += chunk.len();
+                // 4.7k — вытаскиваем видео-заглушки в очередь видео-прохода
+                // (по ссылке: results ещё нужен closure ниже для карточек).
+                for (_t, _broken, pending) in &results {
+                    if let Some(idx) = pending {
+                        pending_videos.push(*idx);
+                    }
+                }
                 let is_first = batch_i == 0;
                 let prefix = status_prefix.clone();
                 let ui_weak = ui_weak.clone();
                 let gallery_gen = gallery_gen.clone();
+                // 4.7k — прогресс для полосы (считаем здесь, в фоне).
+                let progress = done as f32 / total.max(1) as f32;
+                let percent = (done * 100 / total.max(1)) as i32;
                 let _ = slint::invoke_from_event_loop(move || {
                     // Открыли другой проект/папку — батчи старого отменяем.
                     if gallery_gen.load(Ordering::SeqCst) != my_gen {
@@ -2233,7 +2275,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         // ThumbItem (не-Send) строим ЗДЕСЬ, в UI-потоке.
                         let items: Vec<ThumbItem> = results
                             .into_iter()
-                            .map(|(t, broken)| thumb_item_from(t, broken))
+                            .map(|(t, broken, _)| thumb_item_from(t, broken))
                             .collect();
                         use slint::Model;
                         // 4.7e — первый батч: полная модель = срез,
@@ -2274,30 +2316,124 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             }
                         }
                         w.set_status_text(format!("{prefix} {done} (из {total})").into());
+                        // 4.7k — полоса прогресса двигается на каждом батче.
+                        w.set_load_progress(progress);
+                        w.set_load_label(format!("Загружаю миниатюры… {percent}%").into());
                     }
                 });
                 // Пауза между батчами: UI успевает отрисовать кадр.
                 std::thread::sleep(std::time::Duration::from_millis(30));
             }
             log::info!("gallery: батчи миниатюр завершены ({total})");
-            // 4.7i — отдельный «видео-проход» УДАЛЁН: видео теперь идёт
-            // через общий кэш в батчах (см. комментарий выше). Прежний
-            // проход передекодировал все видео на каждом запуске —
-            // CPU-голод 30 сек, «фото не листаются».
+            // 4.7k — батчи закончились: полосу прогресса прячем (только если
+            // мы всё ещё актуальное поколение — иначе погасим чужую полосу).
+            {
+                let ui_weak = ui_weak.clone();
+                let gallery_gen = gallery_gen.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if gallery_gen.load(Ordering::SeqCst) != my_gen {
+                        return;
+                    }
+                    if let Some(w) = ui_weak.upgrade() {
+                        w.set_load_visible(false);
+                    }
+                });
+            }
+            // 4.7k — ВИДЕО-ПРОХОД: настоящие кадры для заглушек «play».
+            // Запускается ТОЛЬКО после батчей (сетка уже показана): MF-декод
+            // + запись в PNG-кэш (thumbnail_strict) — следующий запуск
+            // берёт кадр из кэша мгновенно, как у фото. Прежний проход
+            // 4.7g не писал кэш и передекодировал всё на каждом запуске.
+            if !pending_videos.is_empty() {
+                let count = pending_videos.len();
+                log::info!("gallery: видео-проход — {count} файлов");
+                for (n, idx) in pending_videos.into_iter().enumerate() {
+                    // Открыли другой проект/папку — проход отменяется.
+                    if gallery_gen.load(Ordering::SeqCst) != my_gen {
+                        return;
+                    }
+                    let photo = &photos[idx];
+                    let t = match thumbs.thumbnail_strict(photo) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!(
+                                "video: кадр не декодировался «{}»: {e}",
+                                photo.path.display()
+                            );
+                            continue; // заглушка «play» остаётся в сетке
+                        }
+                    };
+                    let ui_weak = ui_weak.clone();
+                    let gallery_gen = gallery_gen.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if gallery_gen.load(Ordering::SeqCst) != my_gen {
+                            return;
+                        }
+                        let Some(w) = ui_weak.upgrade() else { return };
+                        let item = thumb_item_from(t, false);
+                        use slint::Model;
+                        // Полная модель: батчи писали строки по порядку —
+                        // индекс фото совпадает с номером строки.
+                        if let Some(full) = w
+                            .get_full_thumbnails()
+                            .as_any()
+                            .downcast_ref::<slint::VecModel<ThumbItem>>()
+                        {
+                            if idx < full.row_count() {
+                                full.set_row_data(idx, item.clone());
+                            }
+                        }
+                        // Отображаемая (отфильтрованная): ищем строку по пути.
+                        if let Some(model) = w
+                            .get_thumbnails()
+                            .as_any()
+                            .downcast_ref::<slint::VecModel<ThumbItem>>()
+                        {
+                            for row in 0..model.row_count() {
+                                let hit = model
+                                    .row_data(row)
+                                    .map(|it| it.source_path == item.source_path)
+                                    .unwrap_or(false);
+                                if hit {
+                                    model.set_row_data(row, item.clone());
+                                    break;
+                                }
+                            }
+                        }
+                        w.set_status_text(format!("Видео-кадры: {} из {count}", n + 1).into());
+                    });
+                }
+                log::info!("gallery: видео-кадры готовы ({count})");
+            }
         });
     }
 
-    /// 4.7g — заглушка для фото, чья миниатюра не построилась (битый файл):
-    /// файл не теряется из галереи. 4.7h — теперь это КРЕСТ (битое),
-    /// а не видео-треугольник: по значку видно, что файл сломан.
-    fn placeholder_for(path: &std::path::Path) -> crate::core::models::Thumbnail {
-        let (data, w, h) = crate::media::broken_placeholder();
+    /// 4.7k — собрать Thumbnail из сырых RGBA-данных заглушки (DRY: битые
+    /// и видео-заглушки отличаются только картинкой).
+    fn thumb_from_parts(
+        path: &std::path::Path,
+        parts: (Vec<u8>, u32, u32),
+    ) -> crate::core::models::Thumbnail {
+        let (data, w, h) = parts;
         crate::core::models::Thumbnail {
             source_path: path.to_path_buf(),
             width: w,
             height: h,
             data,
         }
+    }
+
+    /// 4.7g — заглушка для фото, чья миниатюра не построилась (битый файл):
+    /// файл не теряется из галереи. 4.7h — теперь это КРЕСТ (битое),
+    /// а не видео-треугольник: по значку видно, что файл сломан.
+    fn placeholder_for(path: &std::path::Path) -> crate::core::models::Thumbnail {
+        thumb_from_parts(path, crate::media::broken_placeholder())
+    }
+
+    /// 4.7k — заглушка «play» для видео с холодным кэшем: карточка видна
+    /// мгновенно, настоящий кадр принесёт видео-проход (и запишет кэш).
+    fn video_placeholder_for(path: &std::path::Path) -> crate::core::models::Thumbnail {
+        thumb_from_parts(path, crate::media::video_placeholder())
     }
 
     // 4.7i — replace_thumb_by_path удалён вместе с «видео-проходом» 4.7g:
@@ -2477,12 +2613,13 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         });
     }
     // 4.7 — открыть сессию по id (мгновенно, из хранилища).
-    // Показ мгновенно из кэша; затем ФОНОМ проверяем fingerprint (4.7d):
-    // совпал — ничего не делаем; изменился — инкрементальный досскан разницы.
+    // 4.7k — показ СТРОГО из кэша: автоперескан папки (fingerprint-сверка
+    // 4.7d) УДАЛЁН по решению заказчика — кэш существует ровно для того,
+    // чтобы НЕ сканировать диск при каждом открытии. Папка обновляется
+    // ТОЛЬКО кнопкой «🔄 Пересканировать» (явное действие пользователя).
     {
         let store = store.clone();
         let thumbs = thumbs.clone();
-        let scanner = scanner.clone();
         let ui_weak = ui.as_weak();
         let photos = photos.clone();
         let viewer_ctx = viewer_ctx.clone();
@@ -2529,12 +2666,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             let mut updated = session.clone();
             updated.last_opened = now;
 
-            // 4.4a — ФОНОВЫЙ поток: миниатюры → сохранение → fingerprint.
+            // 4.4a — ФОНОВЫЙ поток: миниатюры → сохранение.
+            // 4.7k — шаг «fingerprint-сверка» удалён (см. комментарий выше).
             let store_bg = store.clone();
             let thumbs_bg = thumbs.clone();
-            let scanner_bg = scanner.clone();
             let ui_weak_bg = ui_weak.clone();
-            let photos_bg = photos.clone();
             let gallery_gen_bg = gallery_gen.clone();
             let session_bg = updated.clone();
             std::thread::spawn(move || {
@@ -2564,50 +2700,6 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         refresh_session_list(&store_r, &thumbs_r, &ui_weak_r);
                     });
                 }
-                // 3) 4.7d — ФОНОВАЯ проверка актуальности: сканируем папку
-                // заново (метаданные, быстро) и сверяем fingerprint. Показ уже
-                // на экране — пользователь не ждёт. Совпал → ничего;
-                // изменился → досскан разницы.
-                let mode = if session_bg.mode == "recursive" {
-                    ScanMode::FolderRecursive(session_bg.folder.clone())
-                } else {
-                    ScanMode::SingleFolder(session_bg.folder.clone())
-                };
-                let fresh = match scanner_bg.scan(&mode) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log::warn!("sessions: фоновая проверка — скан не удался: {e}");
-                        return;
-                    }
-                };
-                let fresh_fp = fingerprint_of(&fresh);
-                if fresh_fp == session_bg.fingerprint {
-                    log::info!("sessions: папка не изменилась (fingerprint совпал) — кэш актуален");
-                    return;
-                }
-                // Папка изменилась: инкрементально — только новые/изменённые.
-                // Миниатюры разницы генерируются (и пишутся в дисковый кэш)
-                // вызовом thumbnails(); для показа ниже берём полный список.
-                let changed = crate::session::diff_photos(&session_bg.photos, &fresh);
-                log::info!(
-                    "sessions: папка изменилась — досскан {} из {} фото",
-                    changed.len(),
-                    fresh.len()
-                );
-                let _ = thumbs_bg.thumbnails(&changed);
-                // Обновляем сессию в хранилище (новый список + fingerprint).
-                let mut updated_session = session_bg.clone();
-                updated_session.photos = fresh.clone();
-                updated_session.fingerprint = fresh_fp;
-                if let Err(e) = store_bg.save(&updated_session) {
-                    log::error!("sessions: не удалось обновить сессию: {e}");
-                }
-                // Показываем ПОЛНЫЙ новый список — порционно (4.4b): первый
-                // батч заменит модель, остальное добавится в фоне. Список
-                // путей для viewer обновляем сразу (метаданные уже в памяти).
-                *lock_or_recover(&photos_bg) = fresh.clone();
-                let prefix = format!("Проект «{}»: обновлено, фото", updated_session.name);
-                load_thumbs_batched(fresh, &thumbs_bg, &ui_weak_bg, &gallery_gen_bg, prefix);
             });
         });
     }
@@ -2696,6 +2788,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         ui.on_show_projects(move || {
             if let Some(w) = ui_weak.upgrade() {
                 w.set_show_start(true);
+                // 4.7k — уходим на стартовый экран: полосу загрузки гасим
+                // (иначе она висела бы поверх галереи до конца батчей).
+                w.set_load_visible(false);
             }
         });
     }

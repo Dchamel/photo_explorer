@@ -260,6 +260,13 @@ export component GalleryScreen inherits Window {
     // пишут сюда, фильтр пересобирает отображаемую `thumbnails` из неё.
     in-out property <[ThumbItem]> full-thumbnails: [];
     in-out property <bool> scanning: false;
+    // 4.7k — полоса прогресса загрузки миниатюр (по центру окна):
+    // включается на время батчей (открытие проекта / скан / rescan).
+    in-out property <bool> load-visible: false;
+    // Доля загруженных миниатюр 0.0..1.0 (ведёт Rust в каждом батче).
+    in-out property <float> load-progress: 0.0;
+    // Подпись над полосой: «Загружаю миниатюры… N%».
+    in-out property <string> load-label: "";
     // --- 4.7e — фильтр галереи по расширениям (точечный отбор) ---
     // 10 групп: JPG (jpg+jpeg), PNG, GIF, BMP, WEBP, MP4, WEBM, MOV, MKV, AVI.
     // По умолчанию все ВКЛ (показываем всё). Снял галочку — тип скрылся.
@@ -747,6 +754,45 @@ export component GalleryScreen inherits Window {
                     ta := TouchArea {
                         clicked => {
                             root.open-viewer(i);
+                        }
+                    }
+                }
+            }
+
+            // 4.7k — полоса прогресса по центру окна: видна, пока батчи
+            // миниатюр наполняют сетку (открытие проекта / скан / rescan).
+            // Лежит ПОВЕРХ сетки (объявлен ПОСЛЕ ScrollView в том же
+            // Rectangle — z-порядок по объявлению). Проценты ведёт Rust.
+            if root.load-visible : Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 340px;
+                height: 104px;
+                background: Theme.panel;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: #ffffff1a;
+                VerticalLayout {
+                    padding: 18px;
+                    spacing: 14px;
+                    Text {
+                        text: root.load-label;
+                        color: Theme.text-primary;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                    }
+                    Rectangle {
+                        height: 10px;
+                        border-radius: 5px;
+                        background: #ffffff14;
+                        clip: true;
+                        Rectangle {
+                            x: 0px;
+                            y: 0px;
+                            height: parent.height;
+                            width: parent.width * min(1.0, max(0.0, root.load-progress));
+                            border-radius: 5px;
+                            background: Theme.accent;
                         }
                     }
                 }

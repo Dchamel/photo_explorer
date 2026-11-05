@@ -63,12 +63,25 @@ impl FileSystemThumbnailProvider {
         };
         cache_mtime >= source_mtime
     }
-}
 
-impl ThumbnailProvider for FileSystemThumbnailProvider {
-    fn thumbnail(&self, photo: &Photo) -> Result<Thumbnail, ThumbnailError> {
+    /// 4.7k — миниатюра ТОЛЬКО из дискового PNG-кэша, без декода исходника.
+    /// `None` — кэша нет/устарел/повреждён (нужна генерация). Быстрый путь
+    /// батчей галереи: тёплый кэш читается мгновенно, тяжёлый декод
+    /// (фото или MF-кадр видео) не запускается вовсе.
+    pub fn cached_thumbnail(&self, photo: &Photo) -> Option<Thumbnail> {
         let cache_file = self.cache_file_for(&photo.path);
+        if !Self::cache_is_valid(&cache_file, &photo.path) {
+            return None;
+        }
+        load_thumbnail_from_png(&cache_file, &photo.path).ok()
+    }
 
+    /// 4.7k — ядро [`ThumbnailProvider::thumbnail`] БЕЗ видео-заглушки:
+    /// тёплый кэш → генерация → запись в кэш. Ошибка декода — честный
+    /// `Err` (без заглушки): фоновый проход видео различает «кадр готов»
+    /// и «не декодировался» (карточка остаётся с заглушкой «play»).
+    pub fn thumbnail_strict(&self, photo: &Photo) -> Result<Thumbnail, ThumbnailError> {
+        let cache_file = self.cache_file_for(&photo.path);
         // Попытка прочитать из кэша.
         if Self::cache_is_valid(&cache_file, &photo.path) {
             if let Ok(thumb) = load_thumbnail_from_png(&cache_file, &photo.path) {
@@ -76,35 +89,37 @@ impl ThumbnailProvider for FileSystemThumbnailProvider {
             }
             // Если кэш повреждён — перегенерируем.
         }
+        let thumb = generate_thumbnail(&photo.path, self.max_size)?;
+        // Сохранение в кэш (ошибка записи кэша не ломает результат).
+        let _ = save_thumbnail_to_cache(&cache_file, &thumb);
+        Ok(thumb)
+    }
+}
 
-        // Генерация миниатюры из исходного файла.
-        // 4.7f — видео при провале декода НЕ валится ошибкой: заглушка
-        // (тёмная карточка «play») — файл остаётся в галерее, его видно
-        // и можно открыть. Заглушка НЕ пишется в кэш: следующий заход
-        // снова попробует декод (например, после установки кодека).
-        let thumb = match generate_thumbnail(&photo.path, self.max_size) {
-            Ok(thumb) => {
-                // Сохранение в кэш (ошибка записи кэша не ломает результат).
-                let _ = save_thumbnail_to_cache(&cache_file, &thumb);
-                thumb
-            }
+impl ThumbnailProvider for FileSystemThumbnailProvider {
+    fn thumbnail(&self, photo: &Photo) -> Result<Thumbnail, ThumbnailError> {
+        // 4.7k — ядро (кэш → генерация → запись) вынесено в thumbnail_strict
+        // (DRY: быстрый путь батчей и фоновый проход видео зовут его же).
+        // Здесь остался ТОЛЬКО видео-фолбэк 4.7f: при провале декода —
+        // заглушка «play», файл не теряется из галереи. Заглушка НЕ
+        // пишется в кэш: следующий заход снова попробует декод.
+        match self.thumbnail_strict(photo) {
+            Ok(t) => Ok(t),
             Err(e) if crate::media::is_video(&photo.path) => {
                 log::warn!(
                     "video: кадр не декодировался «{}»: {e}",
                     photo.path.display()
                 );
                 let (data, w, h) = crate::media::video_placeholder();
-                Thumbnail {
+                Ok(Thumbnail {
                     source_path: photo.path.clone(),
                     width: w,
                     height: h,
                     data,
-                }
+                })
             }
-            Err(e) => return Err(e),
-        };
-
-        Ok(thumb)
+            Err(e) => Err(e),
+        }
     }
 
     fn thumbnails(&self, photos: &[Photo]) -> Vec<Result<Thumbnail, ThumbnailError>> {
