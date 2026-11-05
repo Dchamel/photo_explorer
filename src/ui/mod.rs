@@ -681,10 +681,40 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // (Rectangle с фоном #000000ee на весь parent). Разворачивать всё окно
     // не нужно: заказчик хочет обычное окно + полноэкранный просмотр фото.
 
-    // Сканер и поставщик миниатюр. Кэш миниатюр — в temp.
-    let cache_dir = std::env::temp_dir().join("photo_explorer_thumbs_cache");
+    // Сканер и поставщик миниатюр.
+    // 4.7L — кэш миниатюр ПЕРЕНЕСЁН из %TEMP% в %LOCALAPPDATA%/photo_explorer/thumbs:
+    // Windows регулярно чистит TEMP (Storage Sense/перезагрузки) — кэш «остывал»,
+    // и старый проект открывался с дырявым кэшем (дикие тормоза на полном декоде).
+    // AppData система не трогает — кэш живёт вечно, старый проект = чистое чтение.
+    let cache_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("photo_explorer")
+        .join("thumbs");
     let scanner = Arc::new(FileSystemScanner::new());
     let thumbs = Arc::new(FileSystemThumbnailProvider::new(cache_dir, 160));
+    // 4.7L — старый кэш из %TEMP% не теряем: переносим файлы в новое место
+    // (одноразовая миграция при запуске; ошибки тихие — файл просто построится заново).
+    {
+        let old = std::env::temp_dir().join("photo_explorer_thumbs_cache");
+        if old.is_dir() {
+            let mut moved = 0usize;
+            if let Ok(entries) = std::fs::read_dir(&old) {
+                for entry in entries.flatten() {
+                    let from = entry.path();
+                    if from.extension().map(|e| e == "png").unwrap_or(false)
+                        && std::fs::rename(&from, thumbs.cache_dir().join(entry.file_name()))
+                            .is_ok()
+                    {
+                        moved += 1;
+                    }
+                }
+            }
+            if moved > 0 {
+                log::info!("thumbs: миграция кэша из TEMP — перенесено {moved} PNG");
+            }
+            let _ = std::fs::remove_dir(&old);
+        }
+    }
 
     // Список Photo (с путями к оригиналам) — нужен для viewer. Arc<Mutex> — доступ из потоков.
     let photos: Arc<Mutex<Vec<Photo>>> = Arc::new(Mutex::new(Vec::new()));
@@ -752,7 +782,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // к СЛЕДУЮЩЕМУ кадру без перезапуска. Хранение: %LOCALAPPDATA%.
     let global_settings: Arc<crate::settings::GlobalSettings> = Arc::new(crate::settings::load());
     let (ultra_on, ultra_threads) = global_settings.snapshot();
-    log::info!("viewer: настройки Ультра-скорости: включена={ultra_on}, ядер={ultra_threads}");
+    log::info!("viewer: настройки Ультра-скорости: включена={ultra_on}, потоков={ultra_threads}");
 
     // Максимальная сторона изображения для viewer (downscale до размера экрана).
     const VIEWER_MAX_SIZE: u32 = 2560;
@@ -1633,12 +1663,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         playback: Arc::new(AnimPlayback::new()),  // 4.7d — панель управления
     });
 
-    /// Подпись режима ресайза для логов [CONC]: «1 поток» или «ultra N ядер».
+    /// Подпись режима ресайза для логов [CONC]: «1 поток» или «ultra N потоков».
     /// Читает атомики настроек на момент вызова (без блокировок).
     fn resize_mode_label(settings: &crate::settings::GlobalSettings) -> String {
         let (on, threads) = settings.snapshot();
         if on {
-            format!("ultra {threads} ядер")
+            format!("ultra {threads} потоков")
         } else {
             "1 поток".to_string()
         }
@@ -2177,12 +2207,17 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     /// батчей: декод + ЗАПИСЬ в PNG-кэш — второй запуск мгновенный.
     /// 4.7k — полоса прогресса (load-visible/load-progress/load-label)
     /// видна от старта батчей до их завершения: заказчик видит проценты.
+    /// 4.7L — rayon-пул с числом потоков ИЗ НАСТРОЙКИ (threads): прежде
+    /// par_iter брал ВСЕ логические процессоры (12) мимо бегунка —
+    /// «жрал всё» вопреки выбору заказчика. Пул строится на каждый вызов
+    /// (паттерн resize_ultra): настройка читается при старте батчей.
     fn load_thumbs_batched(
         photos: Vec<Photo>,
         thumbs: &Arc<FileSystemThumbnailProvider>,
         ui_weak: &slint::Weak<GalleryScreen>,
         gallery_gen: &Arc<AtomicU64>,
         status_prefix: String,
+        threads: usize,
     ) {
         use rayon::prelude::*;
         const FIRST_BATCH: usize = 200;
@@ -2192,7 +2227,13 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let thumbs = thumbs.clone();
         let ui_weak = ui_weak.clone();
         let gallery_gen = gallery_gen.clone();
+        // 4.7L — пул потоков батчей: ровно столько, сколько задано в настройках
+        // (бегунок «Потоки для ускорения»), минимум 1. Не все логические ЦП.
+        let threads = threads.max(1);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build();
         std::thread::spawn(move || {
+            // 4.7L — диагностика: пул = настройка заказчика, видно в логе.
+            log::info!("gallery: батчи стартуют, пул {threads} поток(ов), {total} файлов");
             // 4.7k — полоса прогресса включается СРАЗУ, до первого батча:
             // заказчик видит «Загружаю миниатюры… 0%», а не пустое окно.
             if total > 0 {
@@ -2217,6 +2258,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             // 4.7k — видео, получившие заглушку (глобальные индексы):
             // их настоящие кадры построит видео-проход после батчей.
             let mut pending_videos: Vec<usize> = Vec::new();
+            // 4.7L — диагностика прогрева кэша (видно в логе после батчей):
+            // из кэша / декодировано заново / видео-заглушек / битых.
+            let stat_cached = std::sync::atomic::AtomicUsize::new(0);
+            let stat_decoded = std::sync::atomic::AtomicUsize::new(0);
+            let stat_video = std::sync::atomic::AtomicUsize::new(0);
+            let stat_broken = std::sync::atomic::AtomicUsize::new(0);
             for (batch_i, chunk) in photos[..rest_start]
                 .chunks(FIRST_BATCH)
                 .chain(photos[rest_start..].chunks(BATCH))
@@ -2231,14 +2278,18 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 // первый показ десятки секунд); фото с холодным кэшем
                 // декодируется честно (thumbnail_strict) с записью кэша.
                 // Провал декода фото = битый (крест 4.7h).
-                let results: Vec<(crate::core::models::Thumbnail, bool, Option<usize>)> = chunk
-                    .par_iter()
-                    .enumerate()
-                    .map(|(in_chunk, photo)| {
+                // 4.7L — сборка ОДНОЙ миниатюры (чистая функция от фото):
+                // быстрый путь кэша → видео-заглушка → честный декод фото.
+                let build =
+                    |photo: &Photo,
+                     in_chunk: usize|
+                     -> (crate::core::models::Thumbnail, bool, Option<usize>) {
                         if let Some(t) = thumbs.cached_thumbnail(photo) {
+                            stat_cached.fetch_add(1, Ordering::Relaxed);
                             return (t, false, None);
                         }
                         if crate::media::is_video(&photo.path) {
+                            stat_video.fetch_add(1, Ordering::Relaxed);
                             return (
                                 video_placeholder_for(&photo.path),
                                 false,
@@ -2246,11 +2297,35 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             );
                         }
                         match thumbs.thumbnail_strict(photo) {
-                            Ok(t) => (t, false, None),
-                            Err(_) => (placeholder_for(&photo.path), true, None),
+                            Ok(t) => {
+                                stat_decoded.fetch_add(1, Ordering::Relaxed);
+                                (t, false, None)
+                            }
+                            Err(_) => {
+                                stat_broken.fetch_add(1, Ordering::Relaxed);
+                                (placeholder_for(&photo.path), true, None)
+                            }
                         }
-                    })
-                    .collect();
+                    };
+                // 4.7L — параллельная сборка батча ВНУТРИ пула с числом
+                // потоков из настройки (install): par_iter не выпадает в
+                // глобальный rayon (все 12 логических ЦП). Пул не собрался
+                // (экзотика) → fallback в глобальный пул.
+                let results: Vec<(crate::core::models::Thumbnail, bool, Option<usize>)> =
+                    match &pool {
+                        Ok(p) => p.install(|| {
+                            chunk
+                                .par_iter()
+                                .enumerate()
+                                .map(|(in_chunk, photo)| build(photo, in_chunk))
+                                .collect()
+                        }),
+                        Err(_) => chunk
+                            .par_iter()
+                            .enumerate()
+                            .map(|(in_chunk, photo)| build(photo, in_chunk))
+                            .collect(),
+                    };
                 done += chunk.len();
                 // 4.7k — вытаскиваем видео-заглушки в очередь видео-прохода
                 // (по ссылке: results ещё нужен closure ниже для карточек).
@@ -2325,6 +2400,15 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 std::thread::sleep(std::time::Duration::from_millis(30));
             }
             log::info!("gallery: батчи миниатюр завершены ({total})");
+            // 4.7L — диагностика прогрева кэша: тёплый кэш = почти всё из
+            // PNG; холодный = много декода (видно, почему открытие медленное).
+            log::info!(
+                "gallery: кэш: из PNG={}, декодировано={}, видео-заглушек={}, битых={}",
+                stat_cached.load(Ordering::Relaxed),
+                stat_decoded.load(Ordering::Relaxed),
+                stat_video.load(Ordering::Relaxed),
+                stat_broken.load(Ordering::Relaxed)
+            );
             // 4.7k — батчи закончились: полосу прогресса прячем (только если
             // мы всё ещё актуальное поколение — иначе погасим чужую полосу).
             {
@@ -2439,6 +2523,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     // 4.7i — replace_thumb_by_path удалён вместе с «видео-проходом» 4.7g:
     // видео теперь строится и кэшируется в общих батчах миниатюр.
 
+    /// 4.7L — параметры скана для [`scan_and_show`]: режим рекурсии и
+    /// число потоков пула батчей (настройка заказчика). Структура вместо
+    /// россыпи скаляров — clippy too_many_arguments, читаемость.
+    struct ScanOpts {
+        recursive: bool,
+        threads: usize,
+    }
+
     /// Запускает выбор папки + скан + генерацию миниатюр в фоновом потоке.
     /// 4.7 — после успешного скана сохраняет сессию (recent) в хранилище:
     /// при следующем входе папка откроется мгновенно, без пересканирования.
@@ -2449,8 +2541,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         ui_weak: slint::Weak<GalleryScreen>,
         photos: Arc<Mutex<Vec<Photo>>>,
         gallery_gen: Arc<AtomicU64>,
-        recursive: bool,
+        opts: ScanOpts,
     ) {
+        let recursive = opts.recursive;
+        let threads = opts.threads;
         log::info!("scan_and_show: старт (recursive={recursive})");
         if let Some(w) = ui_weak.upgrade() {
             w.set_scanning(true);
@@ -2553,6 +2647,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             refresh_session_list(&store_for_save, &thumbs_for_refresh, &ui_weak);
                             // 4.4b — порционные миниатюры: первый батч сразу,
                             // остальное батчами по 150 в фоне (см. функцию).
+                            // 4.7L — пул потоков батчей = настройка заказчика
+                            // (параметр threads, передан из колбэка выбора папки).
                             let prefix = format!("Найдено фото: {count}");
                             load_thumbs_batched(
                                 scanned_photos,
@@ -2560,6 +2656,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                 &ui_weak,
                                 &gallery_gen_scan,
                                 prefix,
+                                threads,
                             );
                         }
                         Err(e) => {
@@ -2580,7 +2677,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let ui_weak = ui.as_weak();
         let photos = photos.clone();
         let gallery_gen = gallery_gen.clone();
+        // 4.7L — свой клон настроек для этого замыкания (threads пула батчей).
+        let global_settings = global_settings.clone();
         ui.on_pick_folder_flat(move || {
+            // 4.7L — пул потоков батчей = настройка заказчика (threads).
+            let threads = global_settings.threads.load(Ordering::Relaxed);
             scan_and_show(
                 scanner.clone(),
                 thumbs.clone(),
@@ -2588,7 +2689,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 ui_weak.clone(),
                 photos.clone(),
                 gallery_gen.clone(),
-                false,
+                ScanOpts {
+                    recursive: false,
+                    threads,
+                },
             );
         });
     }
@@ -2600,7 +2704,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let ui_weak = ui.as_weak();
         let photos = photos.clone();
         let gallery_gen = gallery_gen.clone();
+        // 4.7L — свой клон настроек для этого замыкания (threads пула батчей).
+        let global_settings = global_settings.clone();
         ui.on_pick_folder_recursive(move || {
+            // 4.7L — пул потоков батчей = настройка заказчика (threads).
+            let threads = global_settings.threads.load(Ordering::Relaxed);
             scan_and_show(
                 scanner.clone(),
                 thumbs.clone(),
@@ -2608,7 +2716,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 ui_weak.clone(),
                 photos.clone(),
                 gallery_gen.clone(),
-                true,
+                ScanOpts {
+                    recursive: true,
+                    threads,
+                },
             );
         });
     }
@@ -2622,6 +2733,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let thumbs = thumbs.clone();
         let ui_weak = ui.as_weak();
         let photos = photos.clone();
+        // 4.7L — свой клон настроек для этого замыкания (threads пула батчей).
+        let global_settings = global_settings.clone();
         let viewer_ctx = viewer_ctx.clone();
         let gallery_gen = gallery_gen.clone();
         ui.on_open_session(move |id| {
@@ -2670,6 +2783,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             // 4.7k — шаг «fingerprint-сверка» удалён (см. комментарий выше).
             let store_bg = store.clone();
             let thumbs_bg = thumbs.clone();
+            // 4.7L — настройка потоков для пула батчей.
+            let settings_bg = global_settings.clone();
             let ui_weak_bg = ui_weak.clone();
             let gallery_gen_bg = gallery_gen.clone();
             let session_bg = updated.clone();
@@ -2679,13 +2794,16 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 // UI-поток получает маленькие порции вместо одного куска на
                 // 10k карточек (раньше «тупило» 30-60 сек даже из тёплого кэша:
                 // 10k PNG декодировались + 10k карточек создавались разом).
+                // 4.7L — пул потоков батчей = настройка заказчика (threads).
                 let prefix = format!("Проект «{}»: фото", session_bg.name);
+                let threads = settings_bg.threads.load(Ordering::Relaxed);
                 load_thumbs_batched(
                     session_bg.photos.clone(),
                     &thumbs_bg,
                     &ui_weak_bg,
                     &gallery_gen_bg,
                     prefix,
+                    threads,
                 );
                 // 2) Сохраняем last_opened (диск I/O — в фоне, не в UI).
                 if let Err(e) = store_bg.save(&session_bg) {
@@ -2804,6 +2922,9 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         let ui_weak = ui.as_weak();
         let photos = photos.clone();
         let gallery_gen = gallery_gen.clone();
+        // 4.7L — свой клон настроек для этого замыкания (threads пула батчей):
+        // move-замыкание захватило бы внешний Arc целиком, а он нужен ниже.
+        let global_settings = global_settings.clone();
         ui.on_rescan_project(move || {
             // id открытого проекта; пустой = галерея из диалога, не сессия.
             let id: String = ui_weak
@@ -2831,6 +2952,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             }
             let store_bg = store.clone();
             let scanner_bg = scanner.clone();
+            // 4.7L — настройка потоков для пула батчей.
+            let settings_bg = global_settings.clone();
             let thumbs_bg = thumbs.clone();
             let ui_weak_bg = ui_weak.clone();
             let photos_bg = photos.clone();
@@ -2879,7 +3002,16 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     }
                 });
                 let prefix = format!("Проект «{}»: пересканировано, фото", updated.name);
-                load_thumbs_batched(fresh, &thumbs_bg, &ui_weak_bg, &gallery_gen_bg, prefix);
+                // 4.7L — пул потоков батчей = настройка заказчика (threads).
+                let threads = settings_bg.threads.load(Ordering::Relaxed);
+                load_thumbs_batched(
+                    fresh,
+                    &thumbs_bg,
+                    &ui_weak_bg,
+                    &gallery_gen_bg,
+                    prefix,
+                    threads,
+                );
             });
         });
     }

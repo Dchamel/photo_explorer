@@ -1562,11 +1562,13 @@ export component GalleryScreen inherits Window {
                                     Rectangle { horizontal-stretch: 1; }
                                 }
                             }
-                            // Бегунок числа ядер (виден только при включённой галке).
+                            // Бегунок числа ПОТОКОВ (виден только при включённой галке).
+                            // 4.7L — терминология: это программные потоки (= сколько
+                            // процессора отдать под фон), а НЕ физические ядра.
                             if root.ultra-speed : VerticalLayout {
                                 spacing: 4px;
                                 Text {
-                                    text: "Ядер для ускорения: " + root.ultra-threads + " из " + root.ultra-threads-max;
+                                    text: "Потоков для ускорения: " + root.ultra-threads + " из " + root.ultra-threads-max;
                                     color: Theme.text-primary;
                                     font-size: 12px;
                                 }
@@ -1592,7 +1594,7 @@ export component GalleryScreen inherits Window {
                                     }
                                 }
                                 Text {
-                                    text: "больше ядер — быстрее декод, но выше нагрузка на процессор";
+                                    text: "больше потоков — быстрее декод, но выше нагрузка на процессор";
                                     color: Theme.text-secondary;
                                     font-size: 11px;
                                 }

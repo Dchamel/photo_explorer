@@ -39,6 +39,11 @@ impl FileSystemThumbnailProvider {
         }
     }
 
+    /// 4.7L — папка кэша (для одноразовой миграции из %TEMP% при старте).
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
     /// Возвращает путь к файлу кэша для данного исходного изображения.
     fn cache_file_for(&self, source: &Path) -> PathBuf {
         let mut hasher = DefaultHasher::new();
