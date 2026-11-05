@@ -1027,6 +1027,10 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         /// битые серии (миниатюра битого не мелькает, скип не уводит на другой
         /// кадр). UI-поток — RefCell ок; растёт по ходу просмотра.
         broken: Rc<RefCell<std::collections::HashSet<i32>>>,
+        /// 4.7j — индексы, СКРЫТЫЕ фильтром расширений: навигация листает
+        /// ТОЛЬКО по видимым (отфильтровал видео → стрелки ходят строго
+        /// по видео). Пересобирается при смене галочек фильтра.
+        filtered_out: RefCell<std::collections::HashSet<i32>>,
         /// 4.7a-fix2 — (index, generation) ТЕКУЩЕЙ играющей анимации.
         /// Аниматор — ЕДИНСТВЕННЫЙ писатель viewer-image, пока играет:
         /// статичные ветки (миниатюра, кэш Photo из request_load) для ЭТОГО
@@ -1044,6 +1048,16 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     }
 
     impl ViewerCtx {
+        /// 4.7j — набор индексов, которые навигация ПРОПУСКАЕТ:
+        /// битые ∪ скрытые фильтром. Единая точка для всех режимов
+        /// листания (DRY): nav_next/nav_random_next получают его как
+        /// «skip set» — механика пропуска уже умеет обходить такие.
+        fn skip_set(&self) -> std::collections::HashSet<i32> {
+            let mut s = self.broken.borrow().clone();
+            s.extend(self.filtered_out.borrow().iter().copied());
+            s
+        }
+
         /// 4.4c — сменить режим листания. При включении random строит
         /// перемешанный список (один раз — порядок фиксируется, «назад»
         /// честный); при выключении — сбрасывает. Из on_open_session и ⚙.
@@ -1156,42 +1170,17 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         match crate::media::VideoStream::open(&video_path) {
                             Ok(mut stream) => {
                                 let (w, h) = stream.size();
-                                // 4.7i-fix — длительность НЕ блокирует старт:
-                                // мгновенная попытка из .dur-кэша; если кэша
-                                // нет — параллельный поток посчитает (прогон
-                                // кадров) и дорисует конец шкалы. Раньше прогон
-                                // шёл ДО первого кадра — клик по видео висел
-                                // 13+ секунд (лог 23:34).
-                                let duration_ms = crate::media::cached_duration_ms(&video_path);
-                                log::info!("video: поток открыт {w}x{h}, длительность {duration_ms} мс (кэш)");
-                                if duration_ms <= 1 {
-                                    // Параллельный поток: считает длительность,
-                                    // пишет .dur-кэш, обновляет максимум бегунка.
-                                    let dur_path = video_path.clone();
-                                    let dur_gen = gen.clone();
-                                    let dur_ui = ui_weak.clone();
-                                    let dur_pb = playback.clone();
-                                    std::thread::spawn(move || {
-                                        let d_100ns = crate::media::video_duration_100ns(&dur_path);
-                                        let d_ms = (d_100ns / 10_000).max(1) as i32;
-                                        // Поколение ушло — результат не нужен.
-                                        if dur_gen.load(Ordering::SeqCst) != my_gen {
-                                            return;
-                                        }
-                                        dur_pb.set_total(d_ms as usize);
-                                        let _ = slint::invoke_from_event_loop(move || {
-                                            if dur_gen.load(Ordering::SeqCst) != my_gen {
-                                                return;
-                                            }
-                                            if let Some(w_ui) = dur_ui.upgrade() {
-                                                w_ui.set_anim_total(d_ms);
-                                            }
-                                        });
-                                    });
-                                }
+                                // 4.7j — длительность МГНОВЕННАЯ (метаданные
+                                // контейнера MF_PD_DURATION, читается в open):
+                                // шкала «0:00 / полная длина» с первого кадра,
+                                // как в плеерах. Прежний путь (прогон кадров +
+                                // .dur-кэш + параллельный поток) УДАЛЁН.
+                                let duration_ms = (stream.duration_100ns() / 10_000).max(1) as i32;
+                                log::info!(
+                                    "video: поток открыт {w}x{h}, длительность {duration_ms} мс"
+                                );
                                 // Панель 4.7d: включаем; бегунок = позиция
-                                // в видео (мс), максимум = длительность (из
-                                // кэша или дорисуется параллельным потоком).
+                                // в видео (мс), максимум = длительность.
                                 let ap = anim_playing.clone();
                                 let ui_weak_start = ui_weak.clone();
                                 let _ = slint::invoke_from_event_loop(move || {
@@ -1637,6 +1626,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         shuffle_order: RefCell::new(None),              // 4.4c — строится при random
         shuffle_pos: Cell::new(0),
         broken: Rc::new(RefCell::new(std::collections::HashSet::new())), // 4.4c-3
+        filtered_out: RefCell::new(std::collections::HashSet::new()), // 4.7j — листание по фильтру
         anim_playing: Arc::new(Mutex::new(None)), // 4.7a-fix2 — аниматор владеет слоем
         settings: global_settings.clone(),        // 4.7a-fix2 — анимация из перехода
         anim_cache: Arc::new(Mutex::new(AnimFramesCache::new(ANIM_CACHE_MAX_BYTES))), // 4.7c
@@ -2818,11 +2808,27 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
     }
     // 4.7e — галочка фильтра сменилась: пересобрать отображаемую модель
     // из полной по активным расширениям (мгновенно, миниатюры не трогаем).
+    // 4.7j — заодно пересобрать filtered_out: навигация листает ТОЛЬКО
+    // по видимым (отфильтровал видео → стрелки ходят строго по видео).
     {
         let ui_weak = ui.as_weak();
+        let ctx = viewer_ctx.clone();
+        let photos_rc = photos.clone();
         ui.on_filter_changed(move || {
             if let Some(w) = ui_weak.upgrade() {
                 rebuild_filtered_thumbnails(&w);
+                // Скрытые фильтром индексы = все фото, чей путь НЕ прошёл
+                // passes_filter (битые — отдельный набор broken).
+                let mut hidden = std::collections::HashSet::new();
+                {
+                    let p = lock_or_recover(&photos_rc);
+                    for (i, ph) in p.iter().enumerate() {
+                        if !passes_filter(&w, &ph.path.to_string_lossy(), false) {
+                            hidden.insert(i as i32);
+                        }
+                    }
+                }
+                *ctx.filtered_out.borrow_mut() = hidden;
             }
         });
     }
@@ -3200,19 +3206,18 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     let Some(order) = order.as_ref() else {
                         return; // список не построен (сессия пуста) — выходим
                     };
-                    let broken = ctx.broken.borrow();
-                    let Some((np, photo)) =
-                        nav_random_next(order, ctx.shuffle_pos.get(), 1, &broken)
+                    let skip = ctx.skip_set(); // 4.7j — битые ∪ скрытые фильтром
+                    let Some((np, photo)) = nav_random_next(order, ctx.shuffle_pos.get(), 1, &skip)
                     else {
                         return; // край перемешанного списка — стоп
                     };
-                    drop(broken);
+                    drop(skip);
                     ctx.shuffle_pos.set(np);
                     photo
                 }
                 _ => {
-                    let broken = ctx.broken.borrow();
-                    let Some(idx) = nav_next(cur, count, 1, mode, &broken) else {
+                    let skip = ctx.skip_set(); // 4.7j — битые ∪ скрытые фильтром
+                    let Some(idx) = nav_next(cur, count, 1, mode, &skip) else {
                         return; // edge: дошли до края — стоп, ничего не грузим
                     };
                     idx
@@ -3248,19 +3253,19 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     let Some(order) = order.as_ref() else {
                         return;
                     };
-                    let broken = ctx.broken.borrow();
+                    let skip = ctx.skip_set(); // 4.7j — битые ∪ скрытые фильтром
                     let Some((np, photo)) =
-                        nav_random_next(order, ctx.shuffle_pos.get(), -1, &broken)
+                        nav_random_next(order, ctx.shuffle_pos.get(), -1, &skip)
                     else {
                         return; // начало перемешанного списка — стоп
                     };
-                    drop(broken);
+                    drop(skip);
                     ctx.shuffle_pos.set(np);
                     photo
                 }
                 _ => {
-                    let broken = ctx.broken.borrow();
-                    let Some(idx) = nav_next(cur, count, -1, mode, &broken) else {
+                    let skip = ctx.skip_set(); // 4.7j — битые ∪ скрытые фильтром
+                    let Some(idx) = nav_next(cur, count, -1, mode, &skip) else {
                         return; // edge: дошли до первого фото — стоп (фикс «в минус»)
                     };
                     idx
@@ -3337,8 +3342,8 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                     return;
                 };
                 let dir_list = if dir == 0 { 1 } else { dir };
-                let broken = ctx.broken.borrow();
-                match nav_random_next(order, ctx.shuffle_pos.get(), dir_list, &broken) {
+                let skip = ctx.skip_set(); // 4.7j — битые ∪ скрытые фильтром
+                match nav_random_next(order, ctx.shuffle_pos.get(), dir_list, &skip) {
                     Some((np, photo)) => {
                         ctx.shuffle_pos.set(np); // синхронизация с показанным
                         photo
@@ -3361,7 +3366,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 // next_index (= битый index + dir), повторно dir НЕ прибавляем.
                 // 4.4c-3 — если ЦЕЛЕВОЙ тоже битый (уже в broken) — шагаем
                 // дальше по направлению, пока не найдём годное (без загрузки).
-                let broken = ctx.broken.borrow();
+                let skip = ctx.skip_set(); // 4.7j — битые ∪ скрытые фильтром
                 let mut idx = next_index;
                 loop {
                     if idx < 0 || idx >= count {
@@ -3375,7 +3380,7 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                         }
                         return;
                     }
-                    if !broken.contains(&idx) {
+                    if !skip.contains(&idx) {
                         break; // годное — сюда
                     }
                     idx += dir; // битое — дальше по направлению

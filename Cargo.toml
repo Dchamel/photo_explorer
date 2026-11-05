@@ -48,6 +48,10 @@ windows = { version = "0.61", features = [
     # 4.7b — видео: Media Foundation (Source Reader — декод кадров mp4/webm)
     "Win32_Media",
     "Win32_Media_MediaFoundation",
+    # 4.7j — мгновенная длительность: GetPresentationAttribute(MF_PD_DURATION)
+    # возвращает PROPVARIANT — нужны StructuredStorage + Variant
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
 ] }
 
 [build-dependencies]

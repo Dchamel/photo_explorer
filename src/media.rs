@@ -208,10 +208,28 @@ impl VideoStream {
             let packed = cur
                 .GetUINT64(&MF_MT_FRAME_SIZE)
                 .map_err(|e| format!("video: MF_MT_FRAME_SIZE: {e}"))?;
-            // Длительность: windows 0.61 не экспортирует GetDuration у
-            // ридера — считаем ПО ХОДУ (max time_100ns кадров); бегунок
-            // уточняет максимум по мере чтения (KISS, точность достаточна).
-            let duration = 0i64;
+            // 4.7j — длительность МГНОВЕННО из метаданных контейнера:
+            // GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE,
+            // MF_PD_DURATION) → PROPVARIANT (i64, 100-наносекунды).
+            // Фичи Win32_System_Com_StructuredStorage + Win32_System_Variant
+            // включены в Cargo.toml — метод доступен.
+            let duration = {
+                use windows::Win32::Media::MediaFoundation::{
+                    MF_PD_DURATION, MF_SOURCE_READER_MEDIASOURCE,
+                };
+                reader
+                    .GetPresentationAttribute(
+                        MF_SOURCE_READER_MEDIASOURCE.0 as u32,
+                        &MF_PD_DURATION,
+                    )
+                    .ok()
+                    .and_then(|vt| {
+                        // hVal на этом уровне раскрытия — сам i64.
+                        let v = vt.Anonymous.Anonymous.Anonymous.hVal;
+                        (v > 0).then_some(v)
+                    })
+                    .unwrap_or(0)
+            };
             (
                 (packed >> 32) as u32,
                 (packed & 0xFFFF_FFFF) as u32,
@@ -332,63 +350,11 @@ impl VideoStream {
     }
 }
 
-/// 4.7i — путь к кэшу длительности (.dur рядом с миниатюрами).
-/// Хэш пути — FNV-1a (стабильный, без новых зависимостей).
-#[cfg(windows)]
-fn duration_cache_file(path: &std::path::Path) -> std::path::PathBuf {
-    let cache_dir = std::env::temp_dir().join("photo_explorer_thumbs_cache");
-    let key = format!("{:?}", path.to_string_lossy());
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in key.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    cache_dir.join(format!("{h:016x}.dur"))
-}
-
-/// 4.7i-fix — длительность из КЭША (мс), без декода. 0 = кэша нет:
-/// вызывающий код запустит параллельный подсчёт (не блокируя старт).
-#[cfg(windows)]
-pub fn cached_duration_ms(path: &std::path::Path) -> i32 {
-    if let Ok(text) = std::fs::read_to_string(duration_cache_file(path)) {
-        if let Ok(v) = text.trim().parse::<i64>() {
-            return (v / 10_000).max(0) as i32;
-        }
-    }
-    0
-}
-
-/// 4.7i — длительность видео (100-наносекундные единицы). Прямого
-/// GetDuration у IMFSourceReader в windows 0.61 нет, resolver-путь
-/// капризен — считаем ПРОГОНОМ кадров (тайминг последнего), результат
-/// кэшируем (.dur): первый запуск посчитает один раз, дальше — мгновенно.
-/// 4.7i-fix — вызывается в ОТДЕЛЬНОМ потоке: НЕ блокирует старт видео.
-#[cfg(windows)]
-pub fn video_duration_100ns(path: &std::path::Path) -> i64 {
-    let dur_file = duration_cache_file(path);
-    if let Ok(text) = std::fs::read_to_string(&dur_file) {
-        if let Ok(v) = text.trim().parse::<i64>() {
-            return v;
-        }
-    }
-    // Прогон: читаем кадры до конца, берём максимальный тайминг.
-    let mut max_100ns: i64 = 0;
-    let mut stream = match VideoStream::open(path) {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
-    while let Ok(Some(f)) = stream.next_frame() {
-        if f.time_100ns > max_100ns {
-            max_100ns = f.time_100ns;
-        }
-    }
-    // Кэшируем (ошибка записи не критична).
-    if let Some(parent) = dur_file.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&dur_file, max_100ns.to_string());
-    max_100ns
-}
+// 4.7j — старый путь длительности (прогон кадров + кэш .dur) УДАЛЁН:
+// GetPresentationAttribute(MF_PD_DURATION) читает длительность из
+// метаданных контейнера МГНОВЕННО (как все плееры), без декода.
+// Прежний прогон либо блокировал старт (13 сек), либо не успевал
+// параллельно — «0:00 в конце шкалы».
 
 #[cfg(windows)]
 pub fn first_frame_rgba(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), String> {
