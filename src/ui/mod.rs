@@ -1230,26 +1230,110 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                 playback.set_paused(false);
                                 // Начало воспроизведения (для пауз между кадрами).
                                 let mut started = std::time::Instant::now();
+                                // 4.7b-4 — показ кадра в UI (DRY: обычный показ и
+                                // freeze-frame перемотки на паузе — один путь).
+                                let show_frame = {
+                                    let gen = gen.clone();
+                                    let ui_weak = ui_weak.clone();
+                                    let playback = playback.clone();
+                                    move |f: crate::media::VideoFrame| {
+                                        let pos_ms = (f.time_100ns / 10_000).max(0) as i32;
+                                        let (data, fw, fh) = (f.data, f.w, f.h);
+                                        let gen_f = gen.clone();
+                                        let ui_weak_frame = ui_weak.clone();
+                                        let _ = slint::invoke_from_event_loop(move || {
+                                            if gen_f.load(Ordering::SeqCst) != my_gen {
+                                                return;
+                                            }
+                                            if let Some(w_ui) = ui_weak_frame.upgrade() {
+                                                if w_ui.get_viewer_index() != idx {
+                                                    return;
+                                                }
+                                                let mut buf = slint::SharedPixelBuffer::<
+                                                    slint::Rgba8Pixel,
+                                                >::new(
+                                                    fw, fh
+                                                );
+                                                let pixels = buf.make_mut_slice();
+                                                for (dst, chunk) in
+                                                    pixels.iter_mut().zip(data.as_chunks::<4>().0)
+                                                {
+                                                    dst.r = chunk[0];
+                                                    dst.g = chunk[1];
+                                                    dst.b = chunk[2];
+                                                    dst.a = chunk[3];
+                                                }
+                                                w_ui.set_viewer_img_w(fw as f32);
+                                                w_ui.set_viewer_img_h(fh as f32);
+                                                w_ui.set_viewer_image(slint::Image::from_rgba8(
+                                                    buf,
+                                                ));
+                                                // Бегунок = позиция в видео (мс).
+                                                w_ui.set_anim_frame(pos_ms);
+                                            }
+                                        });
+                                        playback.set_frame(pos_ms.max(0) as usize);
+                                    }
+                                };
+                                // 4.7b-4 — цель активной перемотки (100-нс): MF
+                                // встаёт на keyframe ≤ цели, кадры ДО цели
+                                // проматываются без показа, кадр на цели —
+                                // немедленно. None = перемотки нет.
+                                let mut seek_target_100ns: Option<i64> = None;
+                                // 4.7b-4 — предохранитель frame-drop: если декод
+                                // СТАБИЛЬНО медленнее реального времени, безлимитный
+                                // пропуск не показал бы вообще ничего. После
+                                // MAX_DROPS пропущенных подряд — показ принудительно
+                                // + пересинхронизация часов (видео чуть дёргано,
+                                // но идёт в реальном времени, не «слоумоушен»).
+                                const MAX_DROPS: u32 = 15;
+                                let mut dropped_in_a_row: u32 = 0;
                                 'video: loop {
                                     // Поколение сменилось — ушли с видео, стоп.
                                     if gen.load(Ordering::SeqCst) != my_gen {
                                         break 'video;
                                     }
-                                    // 4.7b-2-fix — ПЕРЕМОТКА: бегунок прислал
-                                    // позицию (мс) — прыгаем (промоткой ридера
-                                    // до нужного тайминга) и сбрасываем отсчёт.
+                                    // 4.7b-4 — ПЕРЕМОТКА: бегунок прислал позицию
+                                    // (мс) — SetCurrentPosition прыгает к ближайшему
+                                    // ключевому кадру мгновенно, в ЛЮБУЮ сторону
+                                    // (прежде промотка вперёд декодировала все
+                                    // промежуточные кадры — секунды заморозки,
+                                    // назад не работало вовсе). Отсчёт времени
+                                    // сдвигаем на позицию прыжка.
                                     if let Some(seek_ms) = playback.take_seek() {
-                                        let target_100ns = i64::from(seek_ms) * 10_000;
+                                        let target_100ns = i64::from(seek_ms).max(0) * 10_000;
                                         if stream.seek_100ns(target_100ns).is_ok() {
                                             started = std::time::Instant::now()
                                                 - std::time::Duration::from_nanos(
-                                                    (target_100ns.max(0) as u64) * 100,
+                                                    (target_100ns as u64) * 100,
                                                 );
+                                            seek_target_100ns = Some(target_100ns);
+                                            dropped_in_a_row = 0;
                                         }
                                     }
                                     // Пауза (панель): крутимся на месте, кадр
                                     // держится, время НЕ течёт (started сдвигаем).
                                     if playback.is_paused() {
+                                        // 4.7b-4 — перемотка НА ПАУЗЕ: прыжок сделан
+                                        // выше (seek проверяется до паузы). Декодируем
+                                        // ДО ТОЧНОЙ ЦЕЛИ (кадры между keyframe и
+                                        // целью — мимо) и показываем freeze-frame
+                                        // на новой позиции, как в нормальных плеерах.
+                                        if let Some(target) = seek_target_100ns.take() {
+                                            loop {
+                                                match stream.next_frame() {
+                                                    Ok(Some(f)) if f.time_100ns < target => {
+                                                        continue; // до цели — мимо
+                                                    }
+                                                    Ok(Some(f)) => {
+                                                        show_frame(f);
+                                                        break;
+                                                    }
+                                                    _ => break, // конец/ошибка — стоим
+                                                }
+                                            }
+                                            continue;
+                                        }
                                         std::thread::sleep(std::time::Duration::from_millis(30));
                                         started += std::time::Duration::from_millis(30);
                                         continue;
@@ -1265,6 +1349,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                                         stream = s;
                                                         started = std::time::Instant::now();
                                                         playback.set_frame(0);
+                                                        // 4.7b-4 — рестарт с нуля:
+                                                        // хвостовая перемотка и счётчик
+                                                        // пропусков больше не актуальны.
+                                                        seek_target_100ns = None;
+                                                        dropped_in_a_row = 0;
                                                         continue 'video;
                                                     }
                                                     Err(_) => break 'video,
@@ -1277,56 +1366,45 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                             break 'video;
                                         }
                                     };
-                                    // Текущая позиция (мс) — бегунок.
-                                    let pos_ms = (frame.time_100ns / 10_000).max(0) as i32;
-                                    // Пауза до тайминга кадра: кадр N должен
-                                    // появиться в момент time_100ns от начала,
-                                    // МАСШТАБИРОВАННЫЙ скоростью (×0.5 — вдвое
-                                    // медленнее: время кадра растягивается).
+                                    // 4.7b-4 — ТАЙМИНГ + FRAME-DROP:
+                                    // • кадры ДО цели перемотки — мимо, без сна
+                                    //   (MF встал на keyframe ≤ цели — добегаем до
+                                    //   точной позиции мгновенно, без показа);
+                                    // • кадр на цели — показ НЕМЕДЛЕННО, часы
+                                    //   ставятся на этот кадр (иначе при скорости
+                                    //   ≠ 1× ждали бы его «due»);
+                                    // • просроченный кадр (due в прошлом — декод
+                                    //   отстал) — пропуск: видео идёт в реальном
+                                    //   времени, а не «слоумоушеном»;
+                                    // • предохранитель MAX_DROPS: декод стабильно
+                                    //   медленнее → принудительный показ +
+                                    //   пересинхронизация часов на этот кадр.
                                     let speed = playback.speed_tenths();
-                                    let due = started
-                                        + std::time::Duration::from_nanos(
-                                            (frame.time_100ns.max(0) as u64) * 100 * 10
-                                                / u64::from(speed),
-                                        );
+                                    let frame_offset = std::time::Duration::from_nanos(
+                                        (frame.time_100ns.max(0) as u64) * 100 * 10
+                                            / u64::from(speed),
+                                    );
                                     let now = std::time::Instant::now();
+                                    if let Some(target) = seek_target_100ns {
+                                        if frame.time_100ns < target {
+                                            continue; // до цели перемотки — мимо
+                                        }
+                                        seek_target_100ns = None; // цель достигнута
+                                        dropped_in_a_row = 0;
+                                        started = now - frame_offset;
+                                    } else if started + frame_offset < now {
+                                        if dropped_in_a_row < MAX_DROPS {
+                                            dropped_in_a_row += 1;
+                                            continue; // просрочен — пропускаем
+                                        }
+                                        started = now - frame_offset; // пересинхронизация
+                                        dropped_in_a_row = 0;
+                                    }
+                                    let due = started + frame_offset;
                                     if due > now {
                                         std::thread::sleep(due - now);
                                     }
-                                    let data = frame.data;
-                                    let fw = frame.w;
-                                    let fh = frame.h;
-                                    let gen_f = gen.clone();
-                                    let ui_weak_frame = ui_weak.clone();
-                                    let _ = slint::invoke_from_event_loop(move || {
-                                        if gen_f.load(Ordering::SeqCst) != my_gen {
-                                            return;
-                                        }
-                                        if let Some(w_ui) = ui_weak_frame.upgrade() {
-                                            if w_ui.get_viewer_index() != idx {
-                                                return;
-                                            }
-                                            let mut buf =
-                                                slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
-                                                    fw, fh,
-                                                );
-                                            let pixels = buf.make_mut_slice();
-                                            for (dst, chunk) in
-                                                pixels.iter_mut().zip(data.as_chunks::<4>().0)
-                                            {
-                                                dst.r = chunk[0];
-                                                dst.g = chunk[1];
-                                                dst.b = chunk[2];
-                                                dst.a = chunk[3];
-                                            }
-                                            w_ui.set_viewer_img_w(fw as f32);
-                                            w_ui.set_viewer_img_h(fh as f32);
-                                            w_ui.set_viewer_image(slint::Image::from_rgba8(buf));
-                                            // Бегунок = позиция в видео (мс).
-                                            w_ui.set_anim_frame(pos_ms);
-                                        }
-                                    });
-                                    playback.set_frame(pos_ms.max(0) as usize);
+                                    show_frame(frame);
                                 }
                                 // Освобождаем слой анимации при выходе.
                                 {
