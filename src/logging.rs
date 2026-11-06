@@ -110,14 +110,50 @@ impl Log for FileLogger {
     }
 }
 
+/// 4.7L-2c — смещение локальной зоны в секундах (Москва = +10800).
+///
+/// Раньше лог писался в UTC — заказчик видел «12:57», когда на часах
+/// было 15:57 (−3 часа), и время в логе приходилось сверять в уме.
+/// Смещение берётся у ОС через GetTimeZoneInformation (bias с учётом
+/// действующего летнего времени) ОДИН РАЗ на процесс (OnceLock) —
+/// вызов на каждую строку лога не нужен. Вне Windows (тесты на CI) —
+/// 0: лог в UTC лучше, чем паника на несуществующем API.
+#[cfg(windows)]
+fn local_zone_offset_secs() -> i64 {
+    use std::sync::OnceLock;
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+    *OFFSET.get_or_init(|| unsafe {
+        use windows::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+        let mut tz = TIME_ZONE_INFORMATION::default();
+        // GetTimeZoneInformation возвращает TIME_ZONE_ID_* (u32):
+        // 0=UNKNOWN, 1=STANDARD, 2=DAYLIGHT. Bias — минуты, на которые
+        // UTC опережает локальное время (UTC = local + bias) →
+        // смещение локали = -bias (в секундах). STANDARD/DAYLIGHT —
+        // прибавляем соответствующий bias (учёт зимнего/летнего времени).
+        match GetTimeZoneInformation(&mut tz) {
+            0 => -(tz.Bias as i64) * 60,                     // TIME_ZONE_ID_UNKNOWN
+            1 => -((tz.Bias + tz.StandardBias) as i64) * 60, // TIME_ZONE_ID_STANDARD
+            2 => -((tz.Bias + tz.DaylightBias) as i64) * 60, // TIME_ZONE_ID_DAYLIGHT
+            _ => 0,                                          // exotic — UTC
+        }
+    })
+}
+
+/// Вне Windows смещения нет — лог в UTC (KISS: тесты не зависят от зоны).
+#[cfg(not(windows))]
+fn local_zone_offset_secs() -> i64 {
+    0
+}
+
 /// Простейшая «человекочитаемая» метка времени без зависимости на chrono.
 /// Формат YYYY-MM-DDThh:mm:ss.mmm (локальное время, точность до мс).
+/// 4.7L-2c — прибавляется смещение зоны: лог живёт в часах заказчика.
 fn chrono_like_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = now.as_secs() as i64;
+    let secs = now.as_secs() as i64 + local_zone_offset_secs();
     let millis = now.subsec_millis();
     // Перевод секунд эпохи в дату — локально, без внешних крейтов.
     let (y, mo, d, h, mi, s) = epoch_to_local(secs);

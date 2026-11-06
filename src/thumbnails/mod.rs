@@ -162,8 +162,8 @@ fn generate_thumbnail(source: &Path, max_size: u32) -> Result<Thumbnail, Thumbna
     // 4.7L-2b — декод ПО СИГНАТУРЕ (не по расширению): webp, названный
     // .jpg, раньше получал JPEG-декодер и падал — 2117 целых файлов
     // числились «битыми». with_guessed_format читает магические байты.
-    let img = crate::media::decode_image_by_signature(source)
-        .map_err(ThumbnailError::DecodeFailed)?;
+    let img =
+        crate::media::decode_image_by_signature(source).map_err(ThumbnailError::DecodeFailed)?;
     let resized = img.resize(max_size, max_size, image::imageops::FilterType::Lanczos3);
     let rgba = resized.to_rgba8();
     let (width, height) = rgba.dimensions();
