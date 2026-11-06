@@ -1294,6 +1294,17 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                 let mut fps_window_start = std::time::Instant::now();
                                 let mut fps_shown: u32 = 0;
                                 let mut fps_decode_sum_ms: u64 = 0;
+                                // 4.7b-5-fix — ТРОТТЛИНГ доставки в UI: не слать
+                                // кадры чаще 30/сек (33 мс). Декод мелких видео
+                                // давал 50–58 кадр/сек — UI-поток захлёбывался
+                                // (буфер + текстура + перерисовка сцены на КАЖДЫЙ
+                                // кадр), отсюда «рывки» даже при быстром декоде.
+                                // 30 fps — потолок для видео; лишние кадры
+                                // декодируются, но не гонятся в UI.
+                                const UI_FRAME_INTERVAL: std::time::Duration =
+                                    std::time::Duration::from_millis(33);
+                                let mut last_ui_frame =
+                                    std::time::Instant::now() - UI_FRAME_INTERVAL; // первый кадр — сразу
                                 'video: loop {
                                     // Поколение сменилось — ушли с видео, стоп.
                                     if gen.load(Ordering::SeqCst) != my_gen {
@@ -1410,6 +1421,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                     if due > now {
                                         std::thread::sleep(due - now);
                                     }
+                                    // 4.7b-5-fix — троттлинг: кадр не чаще 30/сек.
+                                    // Кадр, пришедший раньше интервала, НЕ
+                                    // отправляется в UI (skip) — следующий due
+                                    // тайминга всё равно приведёт нужный кадр.
+                                    if last_ui_frame.elapsed() < UI_FRAME_INTERVAL {
+                                        continue;
+                                    }
+                                    last_ui_frame = std::time::Instant::now();
                                     // 4.7b-5 — статистика показа (до show_frame,
                                     // чтобы замер не влиял на тайминг).
                                     fps_shown += 1;

@@ -288,6 +288,20 @@ fn d3d_device_manager() -> Option<windows::core::IUnknown> {
                     )
                     .map_err(|e| format!("D3D11CreateDevice: {e}"))?;
                     let device = device.ok_or("D3D11CreateDevice: пусто")?;
+                    // 4.7b-5-fix — MULTITHREAD PROTECTION: MF обращается к
+                    // устройству из СВОИХ рабочих потоков; без защиты
+                    // ResetDevice/декод падают с E_INVALIDARG (0x80070057 —
+                    // ровно то, что видели в логе на первом заходе DXVA).
+                    {
+                        use windows::core::Interface;
+                        use windows::Win32::Graphics::Direct3D11::ID3D11Multithread;
+                        let mt: ID3D11Multithread = device
+                            .cast()
+                            .map_err(|e| format!("cast Multithread: {e}"))?;
+                        // Внешний unsafe-блок уже покрывает вызов; BOOL-результат
+                        // (была ли защита включена ДО) не нужен.
+                        let _ = mt.SetMultithreadProtected(true);
+                    }
                     // MF-менеджер устройства: ResetDevice AddRef'ит девайс
                     // внутри — девайс живёт, пока жив менеджер. Токен 1
                     // произвольный (должен совпадать с GetDevice, не меняем).
