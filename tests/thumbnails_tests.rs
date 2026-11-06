@@ -158,3 +158,37 @@ fn returns_error_for_nonexistent_source() {
 
     fs::remove_dir_all(dir).ok();
 }
+
+/// 4.7L-2b — webp, названный `.jpg` (враньё расширения), должен строить
+/// миниатюру: декодер выбирается ПО СИГНАТУРЕ (with_guessed_format), а не
+/// по расширению. Раньше image::open звал JPEG-декодер и файл числился
+/// «битым» — 2117 целых webp в проекте заказчика. Регресс на фикс.
+#[test]
+fn webp_with_jpg_extension_still_decodes() {
+    let dir = unique_temp_dir("webp_jpg");
+    fs::create_dir_all(&dir).unwrap();
+    let cache_dir = dir.join("cache");
+
+    // Настоящий webp-файл: save выбирает формат ПО РАСШИРЕНИЮ, поэтому
+    // сначала пишем .webp, затем копируем байты в файл с расширением .jpg —
+    // расширение врёт о содержимом (ровно кейс заказчика).
+    let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(400, 300, |x, y| {
+        Rgba([(x % 255) as u8, (y % 255) as u8, 90, 255])
+    });
+    let real_webp = dir.join("real.webp");
+    img.save(&real_webp).expect("не удалось сохранить webp");
+    let source = dir.join("actually_webp.jpg");
+    fs::copy(&real_webp, &source).expect("не удалось скопировать webp в .jpg");
+
+    let photo = make_photo(&source);
+    let provider = FileSystemThumbnailProvider::new(cache_dir, 160);
+    let thumb = provider
+        .thumbnail(&photo)
+        .expect("webp с чужим расширением должен декодироваться по сигнатуре");
+
+    // 400x300 → вписывание в 160x160 с сохранением пропорций = 160x120.
+    assert_eq!(thumb.width, 160);
+    assert_eq!(thumb.height, 120);
+
+    fs::remove_dir_all(dir).ok();
+}

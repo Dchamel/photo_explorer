@@ -28,6 +28,134 @@ pub fn is_video(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 4.7L-2b — декодирование картинки ПО СИГНАТУРЕ, не по расширению.
+///
+/// `image::open` выбирает декодер по расширению файла: webp, названный
+/// `.jpg`, получал JPEG-декодер и падал («Illegal start bytes:5249») —
+/// 2117 целых файлов в проекте заказчика числились «битыми». Здесь
+/// `with_guessed_format()` читает магические байты и ставит ПРАВИЛЬНЫЙ
+/// декодер независимо от расширения (webp-в-jpg, png-в-jpg и т.п.).
+///
+/// Единая точка правды для миниатюр и просмотрщика (DRY): оба зовут
+/// этот хелпер. Ошибки — строкой (стиль модуля).
+pub fn decode_image_by_signature(path: &std::path::Path) -> Result<image::DynamicImage, String> {
+    let reader = image::ImageReader::open(path).map_err(|e| e.to_string())?;
+    let reader = reader.with_guessed_format().map_err(|e| e.to_string())?;
+    reader.decode().map_err(|e| e.to_string())
+}
+
+/// 4.7L-2-diag — классификация «битых» ПО СИГНАТУРЕ (первые байты файла),
+/// НЕ по расширению: расширение часто врёт (.jpg с webp внутри давал
+/// ложных «битых»). Ярлык — НЕ приговор «файл сломан»: неподдержанные,
+/// но ЦЕЛЫЕ форматы (tiff/raw/avif/ico/…) — кандидаты в будущую стадию
+/// «доп. форматы»; «неизвестно» — вот это реально повреждённые или мусор.
+///
+/// Корзины: jpeg/png/gif/bmp (image обязан уметь — упали = повреждены
+/// внутри), webp (image умеет — чинится декодом по сигнатуре),
+/// видео-контейнеры (avi/mp4/mov/mkv/webm — путь Media Foundation),
+/// tiff/raw (TIFF-магия II*/MM0* — и обычный tiff, и большинство RAW:
+/// CR2/NEF/ARW/DNG/ORF/PEF…; плюс ftyp+crx = CR3, FUJIFILMCCD = RAF),
+/// avif/heic, ico, psd, jxl, wav, «неизвестно».
+pub fn sniff_format_label(path: &std::path::Path) -> &'static str {
+    let mut head = [0u8; 16];
+    match std::fs::File::open(path) {
+        Ok(mut f) => {
+            use std::io::Read;
+            let n = f.read(&mut head).unwrap_or(0);
+            sniff_bytes(&head[..n])
+        }
+        // Файл не открывается вовсе (удалён/права) — отдельная корзина,
+        // не путать с «неизвестно» (открылся, но сигнатура не опознана).
+        Err(_) => "не читается",
+    }
+}
+
+/// Чистая часть [`sniff_format_label`]: ярлык по первым байтам буфера.
+/// Отдельная функция — тестируется без файлов (KISS).
+fn sniff_bytes(head: &[u8]) -> &'static str {
+    // Картинки, которые image обязан уметь: декод на них упал —
+    // файл повреждён ВНУТРИ (сигнатура целая, данные нет).
+    if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "jpeg";
+    }
+    if head.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return "png";
+    }
+    if head.starts_with(b"GIF8") {
+        return "gif";
+    }
+    if head.starts_with(b"BM") {
+        return "bmp";
+    }
+    // RIFF-контейнер: подтип в байтах 8..12 (WEBP — картинка, AVI — видео).
+    if head.starts_with(b"RIFF") {
+        if head.len() >= 12 {
+            let sub = &head[8..12];
+            if sub == b"WEBP" {
+                return "webp";
+            }
+            if sub == b"AVI " {
+                return "видео (avi)";
+            }
+            if sub == b"WAVE" {
+                return "wav";
+            }
+        }
+        return "riff-иное";
+    }
+    // EBML — контейнер mkv/webm.
+    if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return "видео (mkv/webm)";
+    }
+    // ISO-BMFF: байты 4..8 = "ftyp", байты 8..12 — бренд.
+    if head.len() >= 12 && &head[4..8] == b"ftyp" {
+        let brand = &head[8..12];
+        if brand == b"crx " {
+            return "raw (cr3)"; // Canon CR3 — RAW на контейнере BMFF
+        }
+        if brand == b"avif" || brand == b"avis" {
+            return "avif";
+        }
+        if brand == b"heic"
+            || brand == b"heix"
+            || brand == b"hevc"
+            || brand == b"hevx"
+            || brand == b"heim"
+            || brand == b"heis"
+            || brand == b"mif1"
+            || brand == b"msf1"
+        {
+            return "heic";
+        }
+        if brand == b"qt  " {
+            return "видео (mov)";
+        }
+        return "видео (mp4)"; // isom/iso2/mp41/mp42/avc1/… — mp4-семейство
+    }
+    // TIFF-магия: и обычный tiff, и ПОДАВЛЯЮЩЕЕ большинство RAW
+    // (CR2/NEF/NRW/ARW/DNG/ORF/PEF/RW2/SRW построены на TIFF).
+    if head.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || head.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
+        return "tiff/raw";
+    }
+    if head.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        return "ico";
+    }
+    if head.starts_with(b"8BPS") {
+        return "psd";
+    }
+    // JPEG XL: контейнер (…JXL ) или чистый codestream FF 0A.
+    if head.starts_with(&[0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' '])
+        || head.starts_with(&[0xFF, 0x0A])
+    {
+        return "jxl";
+    }
+    // Fujifilm RAF — собственная магия (не TIFF).
+    if head.starts_with(b"FUJIFILMCCD-RAW") {
+        return "raw (raf)";
+    }
+    "неизвестно"
+}
+
 /// 4.7f — убрать паддинг строк кадра: Media Foundation отдаёт строку
 /// длиной stride ≥ w*4 (выравнивание по границе). Копируем ровно w*4
 /// байт с каждой строки — иначе w*h*4 != len буфера и миниатюра падает
@@ -612,6 +740,78 @@ mod tests {
         assert_ne!(
             (data[48 * 96 * 4 + 48 * 4], data[48 * 96 * 4 + 48 * 4 + 1]),
             (vdata[vi], vdata[vi + 1])
+        );
+    }
+
+    /// 4.7L-2-diag — сигнатуры картинок, которые image обязан уметь:
+    /// jpeg/png/gif/bmp (упал декод на них — файл повреждён внутри).
+    #[test]
+    fn sniff_known_image_signatures() {
+        assert_eq!(super::sniff_bytes(&[0xFF, 0xD8, 0xFF, 0xE0]), "jpeg");
+        assert_eq!(super::sniff_bytes(&[0x89, b'P', b'N', b'G', 0x0D]), "png");
+        assert_eq!(super::sniff_bytes(b"GIF89a"), "gif");
+        assert_eq!(super::sniff_bytes(b"BM\x36\x00"), "bmp");
+    }
+
+    /// 4.7L-2-diag — RIFF-подтипы по байтам 8..12: webp (картинка) и
+    /// avi (видео) различаются ТОЛЬКО ими — по первым байтам не отличить.
+    #[test]
+    fn sniff_riff_subtypes() {
+        let webp = b"RIFF\x24\x00\x00\x00WEBPVP8 ";
+        assert_eq!(super::sniff_bytes(webp), "webp");
+        let avi = b"RIFF\x24\x00\x00\x00AVI LIST";
+        assert_eq!(super::sniff_bytes(avi), "видео (avi)");
+        let wav = b"RIFF\x24\x00\x00\x00WAVEfmt";
+        assert_eq!(super::sniff_bytes(wav), "wav");
+        // Обрезанный RIFF (короче 12 байт) — не гадаем о подтипе.
+        assert_eq!(super::sniff_bytes(b"RIFF"), "riff-иное");
+    }
+
+    /// 4.7L-2-diag — видео-контейнеры: EBML (mkv/webm) и ISO-BMFF
+    /// (mp4/mov/cr3/avif/heic — бренд в байтах 8..12).
+    #[test]
+    fn sniff_video_containers() {
+        assert_eq!(
+            super::sniff_bytes(&[0x1A, 0x45, 0xDF, 0xA3, 0x9F]),
+            "видео (mkv/webm)"
+        );
+        let mp4 = b"\x00\x00\x00\x20ftypisom";
+        assert_eq!(super::sniff_bytes(mp4), "видео (mp4)");
+        let mov = b"\x00\x00\x00\x20ftypqt  ";
+        assert_eq!(super::sniff_bytes(mov), "видео (mov)");
+        let cr3 = b"\x00\x00\x00\x20ftypcrx ";
+        assert_eq!(super::sniff_bytes(cr3), "raw (cr3)");
+        let avif = b"\x00\x00\x00\x20ftypavif";
+        assert_eq!(super::sniff_bytes(avif), "avif");
+        let heic = b"\x00\x00\x00\x20ftypheic";
+        assert_eq!(super::sniff_bytes(heic), "heic");
+    }
+
+    /// 4.7L-2-diag — TIFF-магия II*/MM0* — это и обычный tiff, и
+    /// большинство RAW (CR2/NEF/ARW/DNG/…); RAF и ICO/PSD/JXL — свои.
+    #[test]
+    fn sniff_tiff_raw_and_misc() {
+        assert_eq!(super::sniff_bytes(&[0x49, 0x49, 0x2A, 0x00]), "tiff/raw");
+        assert_eq!(super::sniff_bytes(&[0x4D, 0x4D, 0x00, 0x2A]), "tiff/raw");
+        assert_eq!(super::sniff_bytes(b"FUJIFILMCCD-RAW \x02\x00"), "raw (raf)");
+        assert_eq!(super::sniff_bytes(&[0x00, 0x00, 0x01, 0x00]), "ico");
+        assert_eq!(super::sniff_bytes(b"8BPS\x00\x01"), "psd");
+        assert_eq!(
+            super::sniff_bytes(&[0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ']),
+            "jxl"
+        );
+        assert_eq!(super::sniff_bytes(&[0xFF, 0x0A]), "jxl");
+    }
+
+    /// 4.7L-2-diag — мусор и пустой буфер = «неизвестно» (реально битые);
+    /// файл, который не открывается, — отдельная корзина «не читается».
+    #[test]
+    fn sniff_unknown_and_unreadable() {
+        assert_eq!(super::sniff_bytes(&[0x00, 0x01, 0x02, 0x03]), "неизвестно");
+        assert_eq!(super::sniff_bytes(&[]), "неизвестно");
+        assert_eq!(
+            super::sniff_format_label(std::path::Path::new("Z:/definitely/not/existing/file.bin")),
+            "не читается"
         );
     }
 }

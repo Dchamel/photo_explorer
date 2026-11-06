@@ -1698,10 +1698,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
         }
         log::debug!("load_full_image: мимо кэша, декодирую «{}»", path.display());
         let start = std::time::Instant::now();
-        // Декодирование в панико-безопасной обёртке. image::open может паниковать
+        // Декодирование в панико-безопасной обёртке. Декодер может паниковать
         // на некоторых файлах; ловим панику, чтобы не отравить мьютекс.
+        // 4.7L-2b — декод ПО СИГНАТУРЕ (decode_image_by_signature): webp,
+        // названный .jpg, раньше получал JPEG-декодер и падал; теперь
+        // формат выбирается по магическим байтам, расширение не важно.
         let decode = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            image::open(&path).map_err(|e| format!("Ошибка загрузки: {e}"))
+            crate::media::decode_image_by_signature(&path)
+                .map_err(|e| format!("Ошибка загрузки: {e}"))
         }))
         .map_err(|_| format!("Паника при декодировании: {}", path.display()))?;
         let img = decode?;
@@ -2264,6 +2268,14 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
             let stat_decoded = std::sync::atomic::AtomicUsize::new(0);
             let stat_video = std::sync::atomic::AtomicUsize::new(0);
             let stat_broken = std::sync::atomic::AtomicUsize::new(0);
+            // 4.7L-2-diag — ЧЕСТНАЯ классификация провалившихся декодов ПО
+            // СИГНАТУРЕ (не по расширению): расширение часто врёт (.jpg с
+            // webp внутри = ложный «битый»). Ярлык — не приговор: webp/tiff/
+            // raw/avif/… — ЦЕЛЫЕ файлы неподдержанных форматов, кандидаты в
+            // будущую стадию «доп. форматы»; «неизвестно» — реально битые.
+            // Mutex<BTreeMap> — порядок ключей стабилен, лог читаем.
+            let stat_sniffed: std::sync::Mutex<std::collections::BTreeMap<&'static str, usize>> =
+                std::sync::Mutex::new(std::collections::BTreeMap::new());
             for (batch_i, chunk) in photos[..rest_start]
                 .chunks(FIRST_BATCH)
                 .chain(photos[rest_start..].chunks(BATCH))
@@ -2303,6 +2315,11 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                             }
                             Err(_) => {
                                 stat_broken.fetch_add(1, Ordering::Relaxed);
+                                // 4.7L-2-diag — провал декода: читаем 16 байт
+                                // и классифицируем по сигнатуре. Один файл =
+                                // один инкремент; мьютекс короткоживущий.
+                                let label = crate::media::sniff_format_label(&photo.path);
+                                *lock_or_recover(&stat_sniffed).entry(label).or_insert(0) += 1;
                                 (placeholder_for(&photo.path), true, None)
                             }
                         }
@@ -2409,6 +2426,23 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                 stat_video.load(Ordering::Relaxed),
                 stat_broken.load(Ordering::Relaxed)
             );
+            // 4.7L-2-diag — сводка «битых» ПО СИГНАТУРЕ: видно, что это —
+            // webp с чужим расширением (чинится декодом по сигнатуре),
+            // видео-контейнер (путь MF) или tiff/raw/avif (кандидаты в
+            // «доп. форматы»). Только «неизвестно» = реально повреждённые.
+            {
+                let sniffed = lock_or_recover(&stat_sniffed);
+                if !sniffed.is_empty() {
+                    let parts: Vec<String> = sniffed
+                        .iter()
+                        .map(|(label, n)| format!("{label}={n}"))
+                        .collect();
+                    log::info!(
+                        "gallery: провалы декода по сигнатуре — {}",
+                        parts.join(", ")
+                    );
+                }
+            }
             // 4.7k — батчи закончились: полосу прогресса прячем (только если
             // мы всё ещё актуальное поколение — иначе погасим чужую полосу).
             {
