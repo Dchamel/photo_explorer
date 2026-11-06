@@ -1288,6 +1288,12 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                 // но идёт в реальном времени, не «слоумоушен»).
                                 const MAX_DROPS: u32 = 15;
                                 let mut dropped_in_a_row: u32 = 0;
+                                // 4.7b-5 — замер производительности (INFO раз в
+                                // секунду): сколько кадров ПОКАЗАНО и средний декод.
+                                // Видно по логу, тянет ли DXVA реальный fps.
+                                let mut fps_window_start = std::time::Instant::now();
+                                let mut fps_shown: u32 = 0;
+                                let mut fps_decode_sum_ms: u64 = 0;
                                 'video: loop {
                                     // Поколение сменилось — ушли с видео, стоп.
                                     if gen.load(Ordering::SeqCst) != my_gen {
@@ -1403,6 +1409,25 @@ pub fn run_gallery() -> Result<(), slint::PlatformError> {
                                     let due = started + frame_offset;
                                     if due > now {
                                         std::thread::sleep(due - now);
+                                    }
+                                    // 4.7b-5 — статистика показа (до show_frame,
+                                    // чтобы замер не влиял на тайминг).
+                                    fps_shown += 1;
+                                    fps_decode_sum_ms += u64::from(frame.decode_ms);
+                                    let fps_elapsed = fps_window_start.elapsed();
+                                    if fps_elapsed >= std::time::Duration::from_secs(1) {
+                                        log::info!(
+                                            "video: {} кадр/сек, декод ~{} мс/кадр",
+                                            fps_shown,
+                                            if fps_shown > 0 {
+                                                fps_decode_sum_ms / u64::from(fps_shown)
+                                            } else {
+                                                0
+                                            }
+                                        );
+                                        fps_window_start = std::time::Instant::now();
+                                        fps_shown = 0;
+                                        fps_decode_sum_ms = 0;
                                     }
                                     show_frame(frame);
                                 }

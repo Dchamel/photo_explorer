@@ -233,6 +233,87 @@ pub fn broken_placeholder() -> (Vec<u8>, u32, u32) {
     (data, SIZE, SIZE)
 }
 
+/// 4.7b-5 — DXGI device manager для АППАРАТНОГО декода (DXVA).
+///
+/// D3D11-устройство создаётся ОДИН РАЗ на процесс (OnceLock): MF через
+/// MF_SOURCE_READER_D3D_MANAGER отдаёт декод H.264/H.265 на видеоядро
+/// GPU (Intel Quick Sync / AMD VCN — встроенная графика декодирует видео
+/// не хуже дискретной, это отдельный блок на кристалле). Прежде путь
+/// декодировал на CPU + конвертировал NV12→RGB32 программно — декод кадра
+/// не укладывался в бюджет 30 fps, видео шло «слайдами».
+///
+/// Возвращает IUnknown (MF-контракт) или None — если D3D11 недоступен
+/// (программный рендер, экзотика), ридер откроется БЕЗ DXVA (программный
+/// декод, как раньше) — видео не пропадает, просто медленнее.
+#[cfg(windows)]
+fn d3d_device_manager() -> Option<windows::core::IUnknown> {
+    use std::sync::OnceLock;
+    use windows::core::IUnknown;
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+    };
+    use windows::Win32::Graphics::Dxgi::DXGIDeclareAdapterRemovalSupport;
+    use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MFCreateDXGIDeviceManager};
+
+    /// COM-указатель в static: MF/D3D-объекты потокобезопасны (DXGI-менеджер
+    /// создан в MTA через MFStartup, AddRef/Release атомарны), но компилятор
+    /// этого не знает — заверяем в Send+Sync враппер (паттерн проекта для
+    /// COM в глобальном состоянии).
+    struct SyncIUnknown(IUnknown);
+    unsafe impl Send for SyncIUnknown {}
+    unsafe impl Sync for SyncIUnknown {}
+
+    static MANAGER: OnceLock<Option<SyncIUnknown>> = OnceLock::new();
+    MANAGER
+        .get_or_init(|| {
+            let result: Result<IUnknown, String> = (|| {
+                unsafe {
+                    // Драйвер может исчезнуть (отключили внешний монитор) —
+                    // заявляем поддержку, чтобы MF не ронял процесс.
+                    let _ = DXGIDeclareAdapterRemovalSupport();
+                    // Аппаратный D3D11-девайс (BGRA-поддержка нужна MF).
+                    let mut device: Option<ID3D11Device> = None;
+                    D3D11CreateDevice(
+                        None, // адаптер по умолчанию
+                        D3D_DRIVER_TYPE_HARDWARE,
+                        HMODULE::default(), // без программного модуля
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                        Some(&[D3D_FEATURE_LEVEL_11_0]),
+                        D3D11_SDK_VERSION,
+                        Some(&mut device),
+                        None,
+                        None,
+                    )
+                    .map_err(|e| format!("D3D11CreateDevice: {e}"))?;
+                    let device = device.ok_or("D3D11CreateDevice: пусто")?;
+                    // MF-менеджер устройства: ResetDevice AddRef'ит девайс
+                    // внутри — девайс живёт, пока жив менеджер. Токен 1
+                    // произвольный (должен совпадать с GetDevice, не меняем).
+                    let mut manager: Option<IMFDXGIDeviceManager> = None;
+                    MFCreateDXGIDeviceManager(&mut 1, &mut manager)
+                        .map_err(|e| format!("MFCreateDXGIDeviceManager: {e}"))?;
+                    let manager = manager.ok_or("MFCreateDXGIDeviceManager: пусто")?;
+                    manager
+                        .ResetDevice(&device, 1)
+                        .map_err(|e| format!("ResetDevice: {e}"))?;
+                    // IUnknown — контракт атрибута MF_SOURCE_READER_D3D_MANAGER.
+                    Ok(manager.into())
+                }
+            })();
+            match result {
+                Ok(m) => Some(SyncIUnknown(m)),
+                Err(e) => {
+                    log::warn!("video: DXVA недоступен ({e}) — программный декод");
+                    None
+                }
+            }
+        })
+        .as_ref()
+        .map(|wrapped| wrapped.0.clone())
+}
+
 /// 4.7b-1 — декодировать первый кадр видео в RGBA.
 ///
 /// Возвращает (данные RGBA, ширина, высота). Ошибки — строкой: вызывающие
@@ -265,6 +346,9 @@ pub struct VideoStream {
     h: u32,
     /// Длительность в 100-наносекундных единицах.
     duration_100ns: i64,
+    /// 4.7b-5 — таймер декода кадра (замер для INFO-лога fps): сбрасывается
+    /// перед ReadSample, elapsed пишется в VideoFrame.decode_ms.
+    decode_timer: std::time::Instant,
 }
 
 /// Один кадр видеоряда: RGBA-пиксели + позиция от начала видео
@@ -275,6 +359,9 @@ pub struct VideoFrame {
     pub w: u32,
     pub h: u32,
     pub time_100ns: i64,
+    /// 4.7b-5 — сколько занял декод этого кадра (мс): цикл проигрывания
+    /// агрегирует в INFO-лог «кадров/сек», видно, тянет ли декод реальный fps.
+    pub decode_ms: u32,
 }
 
 #[cfg(windows)]
@@ -296,14 +383,35 @@ impl VideoStream {
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
+        // 4.7b-5 — DXVA: если есть D3D-менеджер, отдаём декод GPU и включаем
+        // ADVANCED video processing (конвертация NV12→RGB32 на GPU; простой
+        // ENABLE_VIDEO_PROCESSING с D3D-менеджером НЕСОВМЕСТИМ). Нет менеджера
+        // (программный рендер) — прежний путь: CPU-декод + простой процессор.
+        let d3d_manager = d3d_device_manager();
         let attrs = unsafe {
             let mut attrs_opt: Option<windows::Win32::Media::MediaFoundation::IMFAttributes> = None;
             MFCreateAttributes(&mut attrs_opt, 0)
                 .map_err(|e| format!("video: MFCreateAttributes: {e}"))?;
             let attrs = attrs_opt.ok_or_else(|| "video: MFCreateAttributes: пусто".to_string())?;
-            attrs
-                .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
-                .map_err(|e| format!("video: включить видео-процессор: {e}"))?;
+            match &d3d_manager {
+                Some(manager) => {
+                    use windows::Win32::Media::MediaFoundation::{
+                        MF_SOURCE_READER_D3D_MANAGER,
+                        MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING,
+                    };
+                    attrs
+                        .SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, manager)
+                        .map_err(|e| format!("video: D3D-менеджер: {e}"))?;
+                    attrs
+                        .SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)
+                        .map_err(|e| format!("video: advanced processing: {e}"))?;
+                }
+                None => {
+                    attrs
+                        .SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
+                        .map_err(|e| format!("video: включить видео-процессор: {e}"))?;
+                }
+            }
             attrs
         };
         let reader = unsafe {
@@ -372,6 +480,7 @@ impl VideoStream {
             w,
             h,
             duration_100ns,
+            decode_timer: std::time::Instant::now(),
         })
     }
 
@@ -420,6 +529,8 @@ impl VideoStream {
             MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
         };
         loop {
+            // 4.7b-5 — таймер декода: от вызова до готового кадра.
+            self.decode_timer = std::time::Instant::now();
             let mut sample: Option<windows::Win32::Media::MediaFoundation::IMFSample> = None;
             let mut flags: u32 = 0;
             let mut timestamp: i64 = 0;
@@ -472,6 +583,10 @@ impl VideoStream {
                 },
                 Err(_) => data.len() / self.h.max(1) as usize,
             };
+            // 4.7b-5 — ОДИН проход вместо двух: strip_stride уже копирует
+            // строку за строкой — свап BGRA→RGBA делаем В ТОМ ЖЕ цикле
+            // (прежде: strip_stride копировал, потом отдельный проход свапал
+            // все пиксели — лишние миллионы операций на кадр).
             let Some(mut rgba) = strip_stride(&data, stride, self.w as usize, self.h as usize)
             else {
                 return Err("video: буфер кадра не сошёлся со stride".to_string());
@@ -485,6 +600,7 @@ impl VideoStream {
                 w: self.w,
                 h: self.h,
                 time_100ns: timestamp,
+                decode_ms: self.decode_timer.elapsed().as_millis() as u32,
             }));
         }
     }

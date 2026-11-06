@@ -47,6 +47,10 @@ windows = { version = "0.61", features = [
     "Win32_System_Threading",
     # 4.7L-2c — локальное время в логах: GetTimeZoneInformation (bias зоны)
     "Win32_System_Time",
+    # 4.7b-5 — аппаратный декод видео (DXVA): D3D11-устройство + DXGI-менеджер
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
     # 4.7b — видео: Media Foundation (Source Reader — декод кадров mp4/webm)
     "Win32_Media",
     "Win32_Media_MediaFoundation",
